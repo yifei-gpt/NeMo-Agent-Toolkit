@@ -881,9 +881,9 @@ assert exporter1.session is exporter2.session  # Same session
 - Database connections
 - Logger instances
 
- **Example with Common Patterns:**
+**Example with Common Patterns:**
 
- ```python
+```python
 from collections import deque
 
 import aiohttp
