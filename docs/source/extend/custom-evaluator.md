@@ -40,6 +40,7 @@ The evaluator configuration defines the evaluator name and any evaluator-specifi
 
 The following example shows how to define and register a custom evaluator. The code is added to a new `evaluator_register.py` file in the simple example directory for testing purposes.
 
+<!-- path-check-skip-next-line -->
 `examples/getting_started/simple_web_query/src/aiq_simple_web_query/evaluator_register.py`:
 ```python
 from pydantic import Field
@@ -109,6 +110,7 @@ To create a custom evaluator, subclass `BaseEvaluator` and implement the `evalua
 The following example defines a SimilarityEvaluator that computes the cosine similarity between a generated output and an expected reference using TF-IDF embeddings. This is useful for evaluating natural language generation tasks such as Q&A, summarization, or text rewriting.
 
 We define the evaluator in the `similarity_evaluator.py` file:
+<!-- path-check-skip-next-line -->
 `examples/getting_started/simple_web_query/src/aiq_simple_web_query/similarity_evaluator.py`:
 ```python
 from typing import override
@@ -153,7 +155,7 @@ This will now display the custom evaluator `similarity` in the list of evaluator
 
 ### Evaluation configuration
 Add the evaluator to the workflow configuration file in the `eval.evaluators` section. The following is an example of the similarity evaluator configuration:
-`examples/getting_started/simple_web_query/configs/eval_config.yml`:
+`examples/evaluation_and_profiling/simple_web_query_eval/configs/eval_config.yml`:
 ```yaml
 eval:
   evaluators:
@@ -166,12 +168,12 @@ The `_type` field specifies the evaluator name. The keyword `similarity_eval` ca
 ### Evaluating the workflow
 Run and evaluate the workflow using the following command:
 ```bash
-aiq eval --config_file=examples/getting_started/simple_web_query/configs/eval_config.yml
+aiq eval --config_file=examples/evaluation_and_profiling/simple_web_query_eval/configs/eval_config.yml
 ```
 
 ### Evaluation results
 The evaluation results are stored in the output directory specified in the workflow configuration file.
-`examples/getting_started/simple_web_query/configs/eval_config.yml`:
+`examples/evaluation_and_profiling/simple_web_query_eval/configs/eval_config.yml`:
 ```yaml
 eval:
   general:

@@ -36,7 +36,7 @@ NVIDIA NeMo Agent toolkit is a flexible, lightweight, and unifying library that 
 
 - [**Profiling:**](./docs/source/workflows/profiler.md) Use the profiler to profile entire workflows down to the tool and agent level, track input/output tokens and timings, and identify bottlenecks. While we encourage you to wrap (decorate) every tool and agent to get the most out of the profiler, you have the freedom to integrate your tools, agents, and workflows to whatever level you want. You start small and go to where you believe you'll see the most value and expand from there.
 
-- [**Observability:**](./docs/source/workflows/observe/index.md) Monitor and debug your workflows with any OpenTelemetry-compatible observability tool, with examples using [Phoenix](./docs/source/workflows/observe/observe-workflow-with-phoenix.md) and [W&B Weave](./docs/source/workflows/observe/observe-workflow-with-weave.md).
+- [**Observability:**](./docs/source/workflows/observe/index.md) Monitor and debug your workflows with dedicated integrations for popular observability platforms such as Phoenix, Weave, and Langfuse, plus compatibility with OpenTelemetry-based observability platforms. Track performance, trace execution flows, and gain insights into your agent behaviors.
 
 - [**Evaluation System:**](./docs/source/workflows/evaluate.md) Validate and maintain accuracy of agentic workflows with built-in evaluation tools.
 
@@ -70,7 +70,7 @@ Before you begin using NeMo Agent toolkit, ensure that you meet the following so
 
 - Install [Git](https://git-scm.com/)
 - Install [Git Large File Storage](https://git-lfs.github.com/) (LFS)
-- Install [uv](https://docs.astral.sh/uv/getting-started/installation/)
+- Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (version 0.5.4 or later, latest version is recommended)
 - Install [Python (3.11 or 3.12)](https://www.python.org/downloads/)
 
 ### Install From Source

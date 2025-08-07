@@ -60,7 +60,7 @@ If you have not already done so, follow the instructions in the [Install Guide](
 
 From the root directory of the NeMo Agent toolkit library, run the following commands:
 ```bash
-uv pip install -e examples/RAG/simple_rag
+uv pip install -e examples/advanced_agents/alert_triage_agent
 ```
 
 ### Set Up API Keys
@@ -109,40 +109,40 @@ An agentic design powered by LLMs provides key benefits over traditional rule-ba
 ## How It Works
 Here's a step-by-step breakdown of the workflow:
 
-![Alert Triage Agent Architecture](./src/aiq_alert_triage_agent/data/ata_diagram.png)
+![Alert Triage Agent Architecture](src/aiq_alert_triage_agent/data/ata_diagram.png)
 
 #### 1. Alert Received
 - A new alert is triggered by a monitoring system, containing details like `host_id` and `timestamp`
 - Initiates the investigation process by passing a JSON-formatted alert message
 
 #### 2. Maintenance Check
-- Before deeper investigation, a [Maintenance Check](./src/aiq_alert_triage_agent/maintenance_check.py) tool queries a maintenance database to see if the alert coincides with scheduled maintenance
+- Before deeper investigation, a [Maintenance Check](src/aiq_alert_triage_agent/maintenance_check.py) tool queries a maintenance database to see if the alert coincides with scheduled maintenance
 - If maintenance is ongoing, a summary report is generated explaining the maintenance context
 - If no maintenance is found, the response NO_ONGOING_MAINTENANCE_STR allows for further agentic investigation
 
 #### 3. Alert Triage Agent
-- If not under maintenance, the [Alert Triage Agent](./src/aiq_alert_triage_agent/register.py#L34) orchestrates the investigation
+- If not under maintenance, the [Alert Triage Agent](src/aiq_alert_triage_agent/register.py#L34) orchestrates the investigation
 - It analyzes the alert JSON to identify the alert type and affected host
 - Based on this analysis, it dynamically selects appropriate diagnostic tools
 
 #### 4. Dynamic Tool Invocation
 The triage agent may call one or more of the following tools based on the alert context:
-- [Telemetry Metrics Analysis Agent](./src/aiq_alert_triage_agent/telemetry_metrics_analysis_agent.py)
+- [Telemetry Metrics Analysis Agent](src/aiq_alert_triage_agent/telemetry_metrics_analysis_agent.py)
   - Collects and analyzes host-level telemetry data:
-    - [Host Performance Check](./src/aiq_alert_triage_agent/telemetry_metrics_host_performance_check_tool.py): Pulls and analyzes CPU usage patterns
-    - [Host Heartbeat Check](./src/aiq_alert_triage_agent/telemetry_metrics_host_heartbeat_check_tool.py): Monitors host's heartbeat signals
-- [Network Connectivity Check](./src/aiq_alert_triage_agent/network_connectivity_check_tool.py)
+    - [Host Performance Check](src/aiq_alert_triage_agent/telemetry_metrics_host_performance_check_tool.py): Pulls and analyzes CPU usage patterns
+    - [Host Heartbeat Check](src/aiq_alert_triage_agent/telemetry_metrics_host_heartbeat_check_tool.py): Monitors host's heartbeat signals
+- [Network Connectivity Check](src/aiq_alert_triage_agent/network_connectivity_check_tool.py)
   - Verifies if the host is reachable over the network.
-- [Monitoring Process Check](./src/aiq_alert_triage_agent/monitoring_process_check_tool.py)
+- [Monitoring Process Check](src/aiq_alert_triage_agent/monitoring_process_check_tool.py)
   - Connects to the host to verify monitoring service status (e.g. `telegraf`)
   - Checks if monitoring processes are running as expected
-- [Host Performance Check](./src/aiq_alert_triage_agent/host_performance_check_tool.py)
+- [Host Performance Check](src/aiq_alert_triage_agent/host_performance_check_tool.py)
   - Retrieves system performance metrics like:
     - CPU utilization
     - Memory usage
     - System load
   - Analyzes metrics in relation to the alert context
-- [Hardware Check](./src/aiq_alert_triage_agent/hardware_check_tool.py)
+- [Hardware Check](src/aiq_alert_triage_agent/hardware_check_tool.py)
   - Interfaces with IPMI for hardware-level diagnostics
   - Monitors environmental metrics:
     - Temperature readings
@@ -151,8 +151,8 @@ The triage agent may call one or more of the following tools based on the alert 
 
 #### 5. Root Cause Categorization
 - The agent correlates data gathered from all diagnostic tools
-- The [Categorizer](./src/aiq_alert_triage_agent/categorizer.py) uses LLM reasoning capabilities to determine the most likely root cause
-- Classifies the issue into predefined categories (see the [categorizer prompt](./src/aiq_alert_triage_agent/prompts.py#L44)):
+- The [Categorizer](src/aiq_alert_triage_agent/categorizer.py) uses LLM reasoning capabilities to determine the most likely root cause
+- Classifies the issue into predefined categories (see the [categorizer prompt](src/aiq_alert_triage_agent/prompts.py#L44)):
   - `software`: Malfunctioning or inactive monitoring services
   - `network_connectivity`: Host unreachable or connection issues
   - `hardware`: Hardware failures or degradation
@@ -216,8 +216,8 @@ workflow:
     - telemetry_metrics_analysis_agent
   llm_name: ata_agent_llm
   offline_mode: true
-  offline_data_path: examples/advanced/alert_triage_agent/data/offline_data.csv
-  benign_fallback_data_path: examples/advanced/alert_triage_agent/data/benign_fallback_offline_data.json
+  offline_data_path: examples/advanced_agents/alert_triage_agent/data/offline_data.csv
+  benign_fallback_data_path: examples/advanced_agents/alert_triage_agent/data/benign_fallback_offline_data.json
 ```
 
 * `_type`: The name of the agent (matching the agent's name in `register.py`).
@@ -447,7 +447,7 @@ To run in offline mode:
    ```bash
    aiq run --config_file=examples/advanced_agents/alert_triage_agent/configs/config_offline_mode.yml --input "{your_alert_in_json_format}"
    ```
-   
+
    **Example:** To run the agent with a test question, use the following command:
 
    ```bash
@@ -465,7 +465,7 @@ To run in offline mode:
    ```
 
    **Expected Workflow Output**
-   
+
    ```console
    <snipped for brevity>
    ## Step 1: Analyze the Alert
@@ -516,7 +516,7 @@ To run in offline mode:
    ```
 
    To evaluate the agent, use the following command:
-   
+
    ```bash
    aiq eval --config_file=examples/advanced_agents/alert_triage_agent/configs/config_offline_mode.yml
    ```
@@ -529,8 +529,7 @@ To run in offline mode:
    - Save the pipeline output along with the evaluation results to the path specified by `eval.output_dir`
 
 4. **Understanding the output**
-
-   The output file will contain a new column named `output`, which includes the markdown report generated by the agent for each data point (i.e., each row in the CSV). Navigate to that rightmost `output` column to view the report for each test entry.
+    The output file will be located in the `eval.output_dir` directory and will include a `workflow_output.json` file as part of the evaluation run (alongside other results from each evaluator). This file contains a list of JSON objects, each representing the result for a single data point. Each entry includes the original alert (`question`), the ground truth root cause classification from the dataset (`answer`), the detailed diagnostic report generated by the agentic system (`generated_answer`), and a trace of the agent’s internal reasoning and tool usage (`intermediate_steps`).
 
    **Sample Workflow Result**
 ```

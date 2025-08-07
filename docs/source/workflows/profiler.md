@@ -43,19 +43,19 @@ uv pip install -e .[profiling]
 The NeMo Agent toolkit Profiler can be broken into the following components:
 
 ### Profiler Decorators and Callbacks
-- **profiler/decorators.py** defines decorators that can wrap each workflow or LLM framework context manager to inject usage-collection callbacks.
-- **profiler/callbacks** directory implements callback handlers. These handlers track usage statistics (tokens, time, inputs/outputs) and push them to the NeMo Agent toolkit usage stats queue. We currently support callback handlers for LangChain,
+- `src/aiq/profiler/decorators` directory defines decorators that can wrap each workflow or LLM framework context manager to inject usage-collection callbacks.
+- `src/aiq/profiler/callbacks` directory implements callback handlers. These handlers track usage statistics (tokens, time, inputs/outputs) and push them to the NeMo Agent toolkit usage stats queue. We currently support callback handlers for LangChain,
 LLama Index, CrewAI, and Semantic Kernel.
 
 ### Profiler Runner
 
-- **profiler/profile_runner.py** is the main orchestration class. It collects workflow run statistics from the NeMo Agent toolkit Eval module, computed workflow-specific metrics, and optionally forecasts usage metrics using the Profiler module.
+- `src/aiq/profiler/profile_runner.py` is the main orchestration class. It collects workflow run statistics from the NeMo Agent toolkit Eval module, computed workflow-specific metrics, and optionally forecasts usage metrics using the Profiler module.
 
-- **Under profiler/forecasting**, the code trains scikit-learn style models on the usage data.
+- Under `src/aiq/profiler/forecasting`, the code trains scikit-learn style models on the usage data.
 model_trainer.py can train a LinearModel or a RandomForestModel on the aggregated usage data (the raw statistics collected).
 base_model.py, linear_model.py, and random_forest_regressor.py define the abstract base and specific scikit-learn wrappers.
 
-- **Under profiler/inference_optimization** we have several metrics that can be computed out evaluation traces of your workflow including workflow latency, commonly used prompt prefixes for caching, identifying workflow bottlenecks, and concurrency analysis.
+- Under `src/aiq/profiler/inference_optimization` we have several metrics that can be computed out evaluation traces of your workflow including workflow latency, commonly used prompt prefixes for caching, identifying workflow bottlenecks, and concurrency analysis.
 
 ### CLI Integrations
 Native integrations with `aiq eval` to allow for running of the profiler through a unified evaluation interface. Configurability is exposed through a workflow YAML configuration file consistent with evaluation configurations.
@@ -127,7 +127,7 @@ eval:
     output_dir: ./.tmp/aiq/examples/getting_started/simple_web_query/
     dataset:
       _type: json
-      file_path: examples/getting_started/simple_web_query/data/langsmith.json
+      file_path: examples/evaluation_and_profiling/simple_web_query_eval/data/langsmith.json
     profiler:
       # Compute inter query token uniqueness
       token_uniqueness_forecast: true
@@ -180,7 +180,7 @@ Please also note the `output_dir` parameter which specifies the directory where 
 To run the profiler, simply run the `aiq eval` command with the workflow configuration file. The profiler will collect usage statistics and store them in the output directory specified in the configuration file.
 
 ```bash
-aiq eval --config_file examples/getting_started/simple_web_query/configs/eval_config.yml
+aiq eval --config_file examples/evaluation_and_profiling/simple_web_query_eval/configs/eval_config.yml
 ```
 
 This will, based on the above configuration, produce the following files in the `output_dir` specified in the configuration file:

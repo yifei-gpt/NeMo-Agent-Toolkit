@@ -44,7 +44,10 @@ else
    echo -e "\n\n>>>> FAILED: documentation check\n\n"
 fi
 
-if [[ ${PRE_COMMIT_RETVAL} -ne 0 || ${PY_CHECKS_RETVAL} -ne 0 || ${COPYRIGHT_RETVAL} -ne 0 || ${DOCUMENTATION_RETVAL} -ne 0 ]]; then
+${SCRIPT_DIR}/path_checks.sh
+PATH_CHECKS_RETVAL=$?
+
+if [[ ${PRE_COMMIT_RETVAL} -ne 0 || ${PY_CHECKS_RETVAL} -ne 0 || ${COPYRIGHT_RETVAL} -ne 0 || ${DOCUMENTATION_RETVAL} -ne 0 || ${PATH_CHECKS_RETVAL} -ne 0 ]]; then
    echo ">>>> FAILED: checks"
    exit 1
 fi

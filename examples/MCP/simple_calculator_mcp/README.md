@@ -34,7 +34,7 @@ This example demonstrates how to integrate the NVIDIA NeMo Agent toolkit with Mo
 
 ## Key Features
 
-- **MCP Client Integration:** Demonstrates how to use NeMo Agent toolkit as an MCP client to connect to remote MCP servers and access distributed tools like date/time services and advanced mathematical operations.
+- **MCP Client Integration:** Demonstrates how to use NeMo Agent toolkit as an MCP client to connect to remote MCP servers and access distributed tools like advanced mathematical operations as well as date and time services.
 - **MCP Server Publishing:** Shows how to publish NeMo Agent toolkit functions as MCP services using the `aiq mcp` command, making calculator tools available to other AI systems through the standardized MCP protocol.
 - **Distributed AI Tool Networks:** Enables building networks of interconnected AI tools where different capabilities can be hosted on separate systems and accessed remotely through MCP.
 - **Cross-System Interoperability:** Demonstrates integration with the broader MCP ecosystem, allowing NeMo Agent toolkit workflows to both consume and provide tools in a standardized manner.
@@ -89,8 +89,27 @@ You can publish the simple calculator tools via MCP using the `aiq mcp` command.
 | `config-mcp-math.yml` | Math Server | Advanced mathematical operations |
 | `config-combined.yml` | Multiple Servers | Combined demonstration |
 
-**Note**: To run the `config-combined.yml` example successfully, you need to keep both MCP servers running:
-- **Docker container MCP server**: Follow the setup instructions in `deploy_external_mcp/README.md` to start the containerized time server on port 8080
-- **NeMo Agent Toolkit MCP server**: Use `aiq mcp --config_file examples/getting_started/simple_calculator/configs/config.yml` to serve calculator tools on port 9901
+### Running the Workflows
 
-Both servers must be active simultaneously for the combined workflow to access all the required tools.
+**Date Server Example:**
+1. **Start the MCP server**: Follow the setup instructions in [README](./deploy_external_mcp/README.md) to start the containerized time server on port 8080
+2. **Run the workflow**:
+   ```bash
+   aiq run --config_file examples/MCP/simple_calculator_mcp/configs/config-mcp-date.yml --input "What is the current hour of the day?"
+   ```
+
+**Math Server Example:**
+1. **Start the MCP server**: Use `aiq mcp --config_file ./examples/getting_started/simple_calculator/configs/config.yml` to serve calculator tools on port 9901
+2. **Run the workflow**:
+   ```bash
+   aiq run --config_file examples/MCP/simple_calculator_mcp/configs/config-mcp-math.yml --input "What is the product of 2 * 4?"
+   ```
+
+**Combined Example:**
+1. **Start both MCP servers**: Keep both servers running simultaneously:
+   - **Docker container MCP server**: Follow the setup instructions in [README](./deploy_external_mcp/README.md) to start the containerized time server on port 8080
+   - **NeMo Agent Toolkit MCP server**: Use `aiq mcp --config_file examples/getting_started/simple_calculator/configs/config.yml` to serve calculator tools on port 9901
+2. **Run the workflow**:
+   ```bash
+   aiq run --config_file examples/MCP/simple_calculator_mcp/configs/config-combined.yml --input "Is the product of 2 * 4 greater than the current hour of the day?"
+   ```
