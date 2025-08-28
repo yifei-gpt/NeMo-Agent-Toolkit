@@ -129,12 +129,8 @@ class ReActAgentGraph(DualNodeAgent):
         try:
             return self.tools_dict.get(tool_name)
         except Exception as ex:
-            logger.exception("%s Unable to find tool with the name %s\n%s",
-                             AGENT_LOG_PREFIX,
-                             tool_name,
-                             ex,
-                             exc_info=True)
-            raise ex
+            logger.error("%s Unable to find tool with the name %s\n%s", AGENT_LOG_PREFIX, tool_name, ex)
+            raise
 
     async def agent_node(self, state: ReActGraphState):
         try:
@@ -238,8 +234,8 @@ class ReActAgentGraph(DualNodeAgent):
                     working_state.append(output_message)
                     working_state.append(HumanMessage(content=str(ex.observation)))
         except Exception as ex:
-            logger.exception("%s Failed to call agent_node: %s", AGENT_LOG_PREFIX, ex, exc_info=True)
-            raise ex
+            logger.error("%s Failed to call agent_node: %s", AGENT_LOG_PREFIX, ex)
+            raise
 
     async def conditional_edge(self, state: ReActGraphState):
         try:
@@ -257,7 +253,7 @@ class ReActAgentGraph(DualNodeAgent):
                          agent_output.tool_input)
             return AgentDecision.TOOL
         except Exception as ex:
-            logger.exception("Failed to determine whether agent is calling a tool: %s", ex, exc_info=True)
+            logger.exception("Failed to determine whether agent is calling a tool: %s", ex)
             logger.warning("%s Ending graph traversal", AGENT_LOG_PREFIX)
             return AgentDecision.END
 
@@ -334,8 +330,8 @@ class ReActAgentGraph(DualNodeAgent):
             logger.debug("%s ReAct Graph built and compiled successfully", AGENT_LOG_PREFIX)
             return self.graph
         except Exception as ex:
-            logger.exception("%s Failed to build ReAct Graph: %s", AGENT_LOG_PREFIX, ex, exc_info=ex)
-            raise ex
+            logger.error("%s Failed to build ReAct Graph: %s", AGENT_LOG_PREFIX, ex)
+            raise
 
     @staticmethod
     def validate_system_prompt(system_prompt: str) -> bool:
@@ -351,7 +347,7 @@ class ReActAgentGraph(DualNodeAgent):
                 errors.append(error_message)
         if errors:
             error_text = "\n".join(errors)
-            logger.exception("%s %s", AGENT_LOG_PREFIX, error_text)
+            logger.error("%s %s", AGENT_LOG_PREFIX, error_text)
             raise ValueError(error_text)
         return True
 
@@ -378,7 +374,7 @@ def create_react_agent_prompt(config: "ReActAgentWorkflowConfig") -> ChatPromptT
 
     valid_prompt = ReActAgentGraph.validate_system_prompt(prompt_str)
     if not valid_prompt:
-        logger.exception("%s Invalid system_prompt", AGENT_LOG_PREFIX)
+        logger.error("%s Invalid system_prompt", AGENT_LOG_PREFIX)
         raise ValueError("Invalid system_prompt")
     prompt = ChatPromptTemplate([("system", prompt_str), ("user", USER_PROMPT),
                                  MessagesPlaceholder(variable_name='agent_scratchpad', optional=True)])
