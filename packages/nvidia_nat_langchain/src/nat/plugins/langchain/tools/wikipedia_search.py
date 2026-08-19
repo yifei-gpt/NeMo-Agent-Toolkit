@@ -19,6 +19,10 @@ from nat.builder.function_info import FunctionInfo
 from nat.cli.register_workflow import register_function
 from nat.data_models.function import FunctionBaseConfig
 
+# The `wikipedia` package's hardcoded User-Agent now gets HTTP 403 from Wikipedia, which
+# surfaces as a JSON decode error. See https://meta.wikimedia.org/wiki/User-Agent_policy
+DEFAULT_WIKIPEDIA_USER_AGENT = "nvidia-nat (https://github.com/NVIDIA/NeMo-Agent-Toolkit)"
+
 
 # Wikipedia Search tool
 class WikiSearchToolConfig(FunctionBaseConfig, name="wiki_search"):
@@ -26,12 +30,17 @@ class WikiSearchToolConfig(FunctionBaseConfig, name="wiki_search"):
     Tool that retrieves relevant contexts from wikipedia search for the given question.
     """
     max_results: int = 2
+    user_agent: str = DEFAULT_WIKIPEDIA_USER_AGENT
 
 
 # Wiki search
 @register_function(config_type=WikiSearchToolConfig, framework_wrappers=[LLMFrameworkEnum.LANGCHAIN])
 async def wiki_search(tool_config: WikiSearchToolConfig, builder: Builder):
+    import wikipedia.wikipedia as wikipedia_module
     from langchain_community.document_loaders import WikipediaLoader
+
+    # The `wikipedia` package reads this module global on every API request.
+    wikipedia_module.USER_AGENT = tool_config.user_agent
 
     async def _wiki_search(question: str) -> str:
         # Search the web and get the requested amount of results

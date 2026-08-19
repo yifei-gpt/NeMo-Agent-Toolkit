@@ -1,0 +1,30 @@
+# ReWOO agent against the local vLLM fleet (./vllm_server.sh start -> :8001)
+#
+# Tavily -> wiki_search (no API key); haystack_chitchat_agent dropped (cloud-NIM only).
+# ReWOO plans all calls up front, so cross-step args must be the literal `#E<n>` token.
+llms:
+  local_llm:
+    _type: openai
+    base_url: http://localhost:8001/v1
+    model_name: Qwen3.6-35B-A3B-FP8
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 4096
+
+function_groups:
+  calculator:
+    _type: calculator
+
+functions:
+  wikipedia_search:
+    _type: wiki_search
+    max_results: 3
+  current_datetime:
+    _type: current_datetime
+
+workflow:
+  _type: rewoo_agent
+  tool_names: [calculator, wikipedia_search, current_datetime]
+  llm_name: local_llm
+  verbose: true
+  tool_call_max_retries: 3

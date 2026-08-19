@@ -19,6 +19,7 @@ import threading
 import time
 from collections.abc import Callable
 from typing import Any
+from uuid import uuid4
 
 import litellm
 from crewai.tools import tool_usage
@@ -88,6 +89,9 @@ class CrewAIProfilerHandler(BaseProfilerCallback):
             """
             now = time.time()
             tool_name = ""
+            # START and END must carry one id or the manager cannot pair them.
+            uuid = str(uuid4())
+            step_manager = self.step_manager
 
             try:
                 tool_info = kwargs.get("tool", "")
@@ -102,13 +106,14 @@ class CrewAIProfilerHandler(BaseProfilerCallback):
                 stats = IntermediateStepPayload(event_type=IntermediateStepType.TOOL_START,
                                                 framework=LLMFrameworkEnum.CREWAI,
                                                 name=tool_name,
+                                                UUID=uuid,
                                                 data=StreamEventData(),
                                                 metadata=TraceMetadata(tool_inputs={
                                                     "args": args, "kwargs": dict(kwargs)
                                                 }),
                                                 usage_info=UsageInfo(token_usage=TokenUsageBaseModel()))
 
-                self.step_manager.push_intermediate_step(stats)
+                step_manager.push_intermediate_step(stats)
 
                 self.last_call_ts = now
 
@@ -121,6 +126,7 @@ class CrewAIProfilerHandler(BaseProfilerCallback):
                     span_event_timestamp=now,
                     framework=LLMFrameworkEnum.CREWAI,
                     name=tool_name,
+                    UUID=uuid,
                     data=StreamEventData(input={
                         "args": args, "kwargs": dict(kwargs)
                     }, output=str(result)),
@@ -128,7 +134,7 @@ class CrewAIProfilerHandler(BaseProfilerCallback):
                     usage_info=UsageInfo(token_usage=TokenUsageBaseModel()),
                 )
 
-                self.step_manager.push_intermediate_step(usage_stat)
+                step_manager.push_intermediate_step(usage_stat)
 
                 return result
 
@@ -153,6 +159,9 @@ class CrewAIProfilerHandler(BaseProfilerCallback):
             now = time.time()
             seconds_between_calls = int(now - self.last_call_ts)
             model_name = kwargs.get('model', "")
+            # START and END must carry one id or the manager cannot pair them.
+            uuid = str(uuid4())
+            step_manager = self.step_manager
 
             model_input = []
             try:
@@ -169,13 +178,14 @@ class CrewAIProfilerHandler(BaseProfilerCallback):
                 event_type=IntermediateStepType.LLM_START,
                 framework=LLMFrameworkEnum.CREWAI,
                 name=model_name,
+                UUID=uuid,
                 data=StreamEventData(input=model_input),
                 metadata=TraceMetadata(chat_inputs=copy.deepcopy(kwargs.get('messages', []))),
                 usage_info=UsageInfo(token_usage=TokenUsageBaseModel(),
                                      num_llm_calls=1,
                                      seconds_between_calls=seconds_between_calls))
 
-            self.step_manager.push_intermediate_step(input_stats)
+            step_manager.push_intermediate_step(input_stats)
 
             # Call the original litellm.completion(...)
             output = original_func(*args, **kwargs)
@@ -203,13 +213,14 @@ class CrewAIProfilerHandler(BaseProfilerCallback):
                 span_event_timestamp=now,
                 framework=LLMFrameworkEnum.CREWAI,
                 name=model_name,
+                UUID=uuid,
                 data=StreamEventData(input=model_input, output=model_output),
                 metadata=TraceMetadata(chat_responses=output.choices[0].model_dump()),
                 usage_info=UsageInfo(token_usage=TokenUsageBaseModel(**output.model_extra['usage'].model_dump()),
                                      num_llm_calls=1,
                                      seconds_between_calls=seconds_between_calls))
 
-            self.step_manager.push_intermediate_step(output_stats)
+            step_manager.push_intermediate_step(output_stats)
 
             # (Note: the original code did NOT update self.last_call_ts here)
             return output

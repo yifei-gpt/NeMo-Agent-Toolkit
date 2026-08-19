@@ -47,7 +47,7 @@ workflow:
 eval:
   general:
     max_concurrency: 1
-    output_dir: .tmp/nat/examples/simple_calculator/eval
+    output_dir: ${MARKAGENTX_RUNS}/examples/simple_calculator/eval
     dataset:
       _type: custom
       file_path: examples/evaluation_and_profiling/simple_calculator_eval/data/simple_calculator_nested.json

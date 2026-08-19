@@ -100,12 +100,13 @@ async def semantic_kernel_travel_planning_workflow(config: SKTravelPlanningWorkf
                                         instructions=summarize_agent_instructions,
                                         function_choice_behavior=FunctionChoiceBehavior.Auto())
 
-    chat = AgentGroupChat(
-        agents=[agent_itinerary, agent_budget, agent_summary],
-        termination_strategy=CostOptimizationStrategy(agents=[agent_summary], maximum_iterations=5),
-    )
-
     async def _response_fn(input_message: str) -> str:
+        # AgentGroupChat is stateful and single-active-agent, so a shared instance rejects
+        # concurrent requests and leaks history between them; build one per request.
+        chat = AgentGroupChat(
+            agents=[agent_itinerary, agent_budget, agent_summary],
+            termination_strategy=CostOptimizationStrategy(agents=[agent_summary], maximum_iterations=5),
+        )
         await chat.add_chat_message(ChatMessageContent(role=AuthorRole.USER, content=input_message))
         responses = []
         async for content in chat.invoke():

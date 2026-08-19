@@ -1,0 +1,31 @@
+# Google ADK demo against the local vLLM fleet (./vllm_server.sh start -> :8001)
+general:
+  front_end:
+    _type: console
+
+functions:
+  weather_update_tool:
+    _type: nat_adk_demo/weather_update
+    description: "Get the current weather for a specified city"
+  get_city_time_tool:
+    _type: nat_adk_demo/get_city_time_tool
+
+llms:
+  local_llm:
+    _type: openai
+    base_url: http://localhost:8001/v1
+    # ADK routes `openai` through LiteLlm, which needs the provider prefix.
+    model_name: openai/Qwen3.6-35B-A3B-FP8
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 2048
+
+workflow:
+  _type: adk
+  name: adk_demo
+  llm: local_llm
+  tool_names: [weather_update_tool, get_city_time_tool]
+  description: "To get the current weather and time in a specific city"
+  prompt: >
+    You are a helpful agent who can answer user questions about weather in a city.
+    You also have a sub-agent that can answer questions about the time in a city.

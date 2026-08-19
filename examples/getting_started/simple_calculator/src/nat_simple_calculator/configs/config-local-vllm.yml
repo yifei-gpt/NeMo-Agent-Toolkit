@@ -1,0 +1,41 @@
+# Local vLLM variant of configs/config.yml
+#
+# Points the ReAct agent at the local vLLM fleet instead of NVIDIA NIM, so no
+# NVIDIA_API_KEY is required.
+#
+# Start the backing server with the repo launcher:
+#   ./vllm_server.sh start          # local only  -> :8001
+#   ./vllm_server.sh fleet          # local + remote + pool -> :8000
+#
+# For the pool, change base_url below to http://localhost:8000/v1.
+#
+# Then run:
+#   nat run --config_file examples/getting_started/simple_calculator/configs/config-local-vllm.yml \
+#           --input "Is 4 * 4 greater than 10?"
+
+function_groups:
+  calculator:
+    _type: calculator
+
+functions:
+  current_datetime:
+    _type: current_datetime
+
+llms:
+  local_llm:
+    _type: openai
+    base_url: http://localhost:8001/v1
+    model_name: Qwen3.6-35B-A3B-FP8
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 1024
+    # Thinking is already disabled server-side by the launcher.
+
+workflow:
+  # The server runs with --enable-auto-tool-choice --tool-call-parser qwen3_coder, so
+  # `tool_calling_agent` also works; react_agent is used here to match the upstream example.
+  _type: react_agent
+  tool_names: [calculator, current_datetime]
+  llm_name: local_llm
+  verbose: true
+  parse_agent_response_max_retries: 3
