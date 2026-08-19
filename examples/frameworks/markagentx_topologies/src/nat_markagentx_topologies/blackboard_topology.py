@@ -46,7 +46,26 @@ except ImportError:  # the topology runs unmarked when MarkAgentX is not install
     def decision_point(step_type, *, native, **_):   # **_ so it cannot drift from the real signature
         return native
 
+WORKSPACE_TOOLS = ["workspace_list", "workspace_read", "workspace_write", "workspace_search"]
+
+# The roles a planner may staff. Research and workspace roles sit in one library so a single
+# blackboard serves either kind of task; a role whose tools are all missing is simply not eligible.
 ROLE_LIBRARY: dict[str, dict] = {
+    "workspace_surveyor": {
+        "tools": WORKSPACE_TOOLS,
+        "brief": "Survey the files the task gives you and record what each one holds.",
+        "max_iterations": 45,
+    },
+    "workspace_author": {
+        "tools": WORKSPACE_TOOLS,
+        "brief": "Write the deliverable the task names, under exactly that filename.",
+        "max_iterations": 45,
+    },
+    "workspace_auditor": {
+        "tools": WORKSPACE_TOOLS,
+        "brief": "Read the deliverable back and rewrite it if a requirement or the format is missed.",
+        "max_iterations": 45,
+    },
     "entity_researcher": {
         "tools": ["wikipedia_search"],
         "brief": "Look up the entities the question names and record their dates, figures and relations.",
@@ -120,6 +139,11 @@ async def blackboard_topology(config: BlackboardTopologyConfig,
 
     llm = await builder.get_llm(config.llm_name, wrapper_type=LLMFrameworkEnum.LANGCHAIN)
     available = {str(t) for t in config.tool_names}
+    # A tool set this library names nothing from -- APEX's MCP tools, say -- leaves nobody eligible,
+    # and the staffing choice would then be made over an empty menu and the run silently unmarked.
+    generic = not any(x in available for s in ROLE_LIBRARY.values() for x in s["tools"])
+    if generic:
+        logger.warning("No role names any of the %d offered tools; staffing on briefs alone", len(available))
     catalogue = "\n".join(f"- {name}: {spec['brief']}" for name, spec in ROLE_LIBRARY.items())
     built: dict[str, object] = {}
     # Questions are evaluated concurrently, so every add_function call is serialised.
@@ -132,9 +156,12 @@ async def blackboard_topology(config: BlackboardTopologyConfig,
         if spec is None:
             logger.warning("Ignoring unknown role %r", role)
             return None
-        tools = [t for t in spec["tools"] if t in available]
+        tools = [t for t in spec["tools"] if t in available] or (sorted(available) if generic else [])
         if not tools:
             return None
+        # A role's iteration cap was tuned for the tools it names; on a tool set it does not name,
+        # the library's own longest cap is the only honest choice.
+        iters = max(s["max_iterations"] for s in ROLE_LIBRARY.values()) if generic else spec["max_iterations"]
         async with build_lock:
             if role not in built:
                 built[role] = await builder.add_function(
@@ -142,7 +169,7 @@ async def blackboard_topology(config: BlackboardTopologyConfig,
                     ToolCallAgentWorkflowConfig(tool_names=tools,
                                                 llm_name=config.llm_name,
                                                 verbose=config.verbose,
-                                                max_iterations=spec["max_iterations"],
+                                                max_iterations=iters,
                                                 handle_tool_errors=True,
                                                 description=f"Specialist: {role}"))
                 logger.info("Built specialist %s with tools %s", role, tools)
@@ -154,7 +181,8 @@ async def blackboard_topology(config: BlackboardTopologyConfig,
         roles = _parse_roles(getattr(plan, "content", str(plan)), config.max_roles)
         # Staffing is the widest choice this workflow makes, so it is offered for marking;
         # with nothing marking, decision_point returns the planner's own pick.
-        eligible = [n for n, s in ROLE_LIBRARY.items() if any(x in available for x in s["tools"])]
+        eligible = [n for n, s in ROLE_LIBRARY.items() if any(x in available for x in s["tools"])] \
+            or list(ROLE_LIBRARY)
         prompt = PLANNER_PROMPT.format(roles=catalogue, question=inputs, limit=config.max_roles)
         roles = list(dict.fromkeys(decision_point("role_selection", candidates=eligible, native=r,
                                                   context=[{"role": "user", "content": prompt}])

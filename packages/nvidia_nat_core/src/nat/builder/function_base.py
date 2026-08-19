@@ -26,6 +26,7 @@ from collections.abc import Callable
 from types import NoneType
 
 from pydantic import BaseModel
+from pydantic import ValidationError
 
 from nat.utils.type_converter import TypeConverter
 from nat.utils.type_utils import DecomposedType
@@ -36,6 +37,10 @@ StreamingOutputT = typing.TypeVar("StreamingOutputT")
 SingleOutputT = typing.TypeVar("SingleOutputT")
 
 logger = logging.getLogger(__name__)
+
+# Names of the functions already reported as taking flat arguments, so the repair is
+# announced once per function instead of once per call.
+_flat_input_logged: set[str] = set()
 
 
 class FunctionBase(typing.Generic[InputT, StreamingOutputT, SingleOutputT], ABC):
@@ -356,7 +361,13 @@ class FunctionBase(typing.Generic[InputT, StreamingOutputT, SingleOutputT], ABC)
 
         # No converter, try to convert to the input schema
         if (isinstance(value, dict)):
-            value = self.input_schema.model_validate(value)
+            try:
+                value = self.input_schema.model_validate(value)
+            except ValidationError as e:
+                value = wrap_flat_input(self.input_schema,
+                                        value,
+                                        e,
+                                        getattr(self, "instance_name", self.input_schema.__name__))
 
             if (self.input_type == self.input_schema):
                 return value
@@ -378,3 +389,53 @@ class FunctionBase(typing.Generic[InputT, StreamingOutputT, SingleOutputT], ABC)
         except ValueError as e:
             # Input parsing should yield a TypeError instead of a ValueError
             raise TypeError from e
+
+
+def wrap_flat_input(schema: type[BaseModel], value: dict, error: ValidationError, name: str) -> BaseModel:
+    """
+    Validate arguments which were supplied without the wrapper object their schema asks for.
+
+    A caller which sends the inner fields of a single-object schema directly has left off the
+    wrapper rather than supplied the wrong arguments.
+
+    Parameters
+    ----------
+    schema : type[BaseModel]
+        The schema the arguments failed to validate against.
+    value : dict
+        The arguments which failed to validate.
+    error : ValidationError
+        The original failure, raised again whenever wrapping does not apply or does not help.
+    name : str
+        The function or tool the arguments were meant for, used to report the repair once.
+
+    Returns
+    -------
+    BaseModel
+        The schema holding the wrapped arguments.
+    """
+    wrappers = [
+        field_name for field_name, field in schema.model_fields.items()
+        if field.is_required() and isinstance(field.annotation, type) and issubclass(field.annotation, BaseModel)
+    ]
+
+    # Nothing to wrap the arguments into, or a choice of fields to guess between: either way
+    # the error the caller already has beats a guess.
+    if (len(wrappers) != 1):
+        raise error
+
+    # Only a missing wrapper is repaired; any other complaint can come from a call which already
+    # ran, and running that a second time would not be safe.
+    if (not any(detail["type"] == "missing" and detail["loc"] == (wrappers[0], ) for detail in error.errors())):
+        raise error
+
+    try:
+        wrapped = schema.model_validate({wrappers[0]: value})
+    except ValidationError:
+        raise error from None
+
+    if (name not in _flat_input_logged):
+        _flat_input_logged.add(name)
+        logger.info("'%s' was called with the fields of '%s' supplied flat; wrapping them.", name, wrappers[0])
+
+    return wrapped

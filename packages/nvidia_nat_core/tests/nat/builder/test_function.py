@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import typing
 from collections.abc import AsyncGenerator
 from types import NoneType
 
 import pytest
 from pydantic import BaseModel
+from pydantic import ValidationError
 
 from nat.builder.builder import Builder
 from nat.builder.function import Function
@@ -746,3 +748,103 @@ async def test_workflow_instance_name_equals_constant():
     async with WorkflowBuilder() as builder:
         workflow_fn = await builder.set_workflow(config=LambdaFnConfig())
         assert workflow_fn.instance_name == WORKFLOW_COMPONENT_NAME
+
+
+class NestedRequestConfig(FunctionBaseConfig, name="test_nested_request"):
+    pass
+
+
+class TwoNestedRequestsConfig(FunctionBaseConfig, name="test_two_nested_requests"):
+    pass
+
+
+class NestedRequest(BaseModel):
+    action: str
+    ticker: str | None = None
+
+
+class NestedInput(BaseModel):
+    request: NestedRequest
+
+
+class TwoNestedInput(BaseModel):
+    request: NestedRequest
+    fallback: NestedRequest
+
+
+@pytest.fixture(scope="module", autouse=True)
+async def _register_nested_request_fns():
+    """Register two MCP shaped functions: one nested request object, and one with two of them."""
+
+    async def _inner(tool_input: BaseModel | None = None, **kwargs) -> str:
+        return kwargs["request"].action
+
+    @register_function(config_type=NestedRequestConfig)
+    async def register_one(config: NestedRequestConfig, b: Builder):
+
+        yield FunctionInfo.create(single_fn=_inner, input_schema=NestedInput)
+
+    @register_function(config_type=TwoNestedRequestsConfig)
+    async def register_two(config: TwoNestedRequestsConfig, b: Builder):
+
+        yield FunctionInfo.create(single_fn=_inner, input_schema=TwoNestedInput)
+
+
+async def test_nested_request_wrapped_input():
+    """A correctly wrapped dict is unaffected by the repair."""
+
+    async with WorkflowBuilder() as builder:
+
+        fn_obj = await builder.add_function(name="test_wrapped", config=NestedRequestConfig())
+
+        assert await fn_obj.ainvoke({"request": {"action": "cik", "ticker": "KVUE"}}, to_type=str) == "cik"
+
+
+async def test_nested_request_flat_input(caplog):
+    """The inner fields supplied directly are wrapped back up, and reported once per function."""
+
+    async with WorkflowBuilder() as builder:
+
+        fn_obj = await builder.add_function(name="test_flat", config=NestedRequestConfig())
+
+        with caplog.at_level(logging.INFO, logger="nat.builder.function_base"):
+            assert await fn_obj.ainvoke({"action": "cik", "ticker": "KVUE"}, to_type=str) == "cik"
+            assert await fn_obj.ainvoke({"action": "submissions"}, to_type=str) == "submissions"
+
+        assert len([r for r in caplog.records if "test_flat" in r.getMessage()]) == 1
+
+
+async def test_nested_request_flat_input_matching_nothing():
+    """Arguments which fit nothing leave the original error in place."""
+
+    async with WorkflowBuilder() as builder:
+
+        fn_obj = await builder.add_function(name="test_no_match", config=NestedRequestConfig())
+
+        with pytest.raises(ValidationError) as exc_info:
+            await fn_obj.ainvoke({"nonsense": "KVUE"}, to_type=str)
+
+        assert "validation error for NestedInput" in str(exc_info.value)
+        assert "request" in str(exc_info.value)
+        assert "Field required" in str(exc_info.value)
+
+
+async def test_nested_request_two_wrappers_are_not_guessed():
+    """Two fields could hold the arguments, so the original error stands."""
+
+    async with WorkflowBuilder() as builder:
+
+        fn_obj = await builder.add_function(name="test_ambiguous", config=TwoNestedRequestsConfig())
+
+        assert await fn_obj.ainvoke({
+            "request": {
+                "action": "cik"
+            }, "fallback": {
+                "action": "help"
+            }
+        }, to_type=str) == "cik"
+
+        with pytest.raises(ValidationError) as exc_info:
+            await fn_obj.ainvoke({"action": "cik", "ticker": "KVUE"}, to_type=str)
+
+        assert "2 validation errors for TwoNestedInput" in str(exc_info.value)

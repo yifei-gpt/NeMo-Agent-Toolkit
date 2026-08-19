@@ -15,9 +15,13 @@
 
 import logging
 
+from pydantic import BaseModel
+from pydantic import ValidationError
+
 from nat.builder.builder import Builder
 from nat.builder.framework_enum import LLMFrameworkEnum
 from nat.builder.function import Function
+from nat.builder.function_base import wrap_flat_input
 from nat.cli.register_workflow import register_tool_wrapper
 
 logger = logging.getLogger(__name__)
@@ -70,7 +74,20 @@ def langchain_tool_wrapper(name: str, fn: Function, builder: Builder):
                     elif isinstance(messages, list):
                         tool_input = {**tool_input, "messages": _normalize_messages(messages)}
 
-            return typing.cast(str | dict, super()._parse_input(tool_input, tool_call_id))
+            try:
+                return typing.cast(str | dict, super()._parse_input(tool_input, tool_call_id))
+            except ValidationError as e:
+                schema = self.args_schema
+
+                if (not isinstance(tool_input, dict) or not isinstance(schema, type)
+                        or not issubclass(schema, BaseModel)):
+                    raise
+
+                # LangChain validates against the tool's schema here, so a missing wrapper is
+                # refused before the NAT function which could repair it is ever reached.
+                wrapped = wrap_flat_input(schema, tool_input, e, self.name)
+
+                return typing.cast(str | dict, super()._parse_input(wrapped.model_dump(), tool_call_id))
 
     loop = asyncio.get_running_loop()
 
