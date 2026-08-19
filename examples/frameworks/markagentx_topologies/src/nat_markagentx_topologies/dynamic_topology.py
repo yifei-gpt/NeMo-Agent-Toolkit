@@ -119,8 +119,8 @@ ROLE_LIBRARY: dict[str, dict] = {
 PLANNER_PROMPT = ("You are routing a question to specialists. The available roles are:\n"
                   "{roles}\n\n"
                   "Question: {question}\n\n"
-                  "Reply with only a JSON array of the role names needed, most important first, "
-                  "at most {limit}. Example: [\"entity_researcher\", \"calculator_specialist\"]")
+                  "Reply with only a JSON array of exactly {limit} role names, most important "
+                  "first. Name only roles from the list above.")
 
 
 class DynamicTopologyConfig(FunctionBaseConfig, name="dynamic_topology"):
@@ -131,6 +131,7 @@ class DynamicTopologyConfig(FunctionBaseConfig, name="dynamic_topology"):
                                           description="Tools the specialists may be given; names must match "
                                           "the role library")
     max_roles: int = Field(default=3, ge=1, description="Most specialists to build for one question")
+    brief: str = Field(default="", description="What the task set asks of any agent working it")
     coordinator_max_iterations: int = Field(default=12, description="Cap on the coordinator's delegation loop")
     role_middleware: list[str] = Field(default_factory=list,
                                        description="Middleware applied to every runtime-built role and to the "
@@ -154,10 +155,10 @@ def _parse_roles(text: str, limit: int, eligible: list[str]) -> list[str]:
     # The planner sometimes repeats a role; a duplicate adds a turn without adding coverage.
     kept = list(dict.fromkeys(n for n in names if n in eligible))
     kept = kept[:limit] or eligible[:1]
-    # A one-specialist plan is the degenerate case this topology exists to avoid, and it leaves the
-    # coordinator a menu of one. Where the cap allows a second, take one; limit=1 stays single by design.
+    # Staffed to the cap, not merely off one: the coordinator's menu IS the staffed list, and a
+    # short team leaves every turn of it too narrow to carry anything.
     for role in eligible:
-        if len(kept) >= min(2, limit):
+        if len(kept) >= min(limit, len(eligible)):
             break
         if role not in kept:
             kept.append(role)
@@ -201,7 +202,8 @@ async def dynamic_topology(config: DynamicTopologyConfig, builder: Builder) -> A
         iters = max(s["max_iterations"] for s in ROLE_LIBRARY.values()) if generic else spec["max_iterations"]
         # A brief names the tools and hand-off files of the tool set it was written for; on any other
         # one those do not exist. Said plainly beats editing the brief, which loses its referents.
-        brief = spec["instructions"] + (GENERIC_NOTE if generic else "")
+        brief = " ".join(x for x in (config.brief, spec["instructions"]) if x) \
+            + (GENERIC_NOTE if generic else "")
         if not tools:
             return None
         async with build_lock:

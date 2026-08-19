@@ -42,6 +42,7 @@ class AdkTeamConfig(FunctionBaseConfig, name="adk_team_probe"):
     """Two Google ADK agents in sequence: one gathers facts, the other answers from them."""
 
     llm_name: LLMRef = Field(description="Model to use via the ADK wrapper")
+    brief: str = Field(default="", description="What the task set asks of any agent working it")
     tool_names: list[FunctionRef] = Field(default_factory=list,
                                           description="NAT tools exposed to both agents")
 
@@ -60,9 +61,15 @@ async def adk_team_probe(config: AdkTeamConfig, builder: Builder) -> AsyncGenera
     llm = await builder.get_llm(config.llm_name, wrapper_type=LLMFrameworkEnum.ADK)
     tools = await builder.get_tools(config.tool_names, wrapper_type=LLMFrameworkEnum.ADK)
 
-    researcher = Agent(name="researcher", model=llm, description="Gathers facts.", instruction=RESEARCH_ROLE,
+    def _with_brief(role):
+        # What the task set asks of anyone, then what this seat is for.
+        return " ".join(x for x in (config.brief, role) if x)
+
+    researcher = Agent(name="researcher", model=llm, description="Gathers facts.",
+                       instruction=_with_brief(RESEARCH_ROLE),
                        tools=tools)
-    analyst = Agent(name="analyst", model=llm, description="Writes the answer.", instruction=ANSWER_ROLE)
+    analyst = Agent(name="analyst", model=llm, description="Writes the answer.",
+                    instruction=_with_brief(ANSWER_ROLE))
     team = SequentialAgent(name="research_then_answer", sub_agents=[researcher, analyst])
 
     session_service = InMemorySessionService()

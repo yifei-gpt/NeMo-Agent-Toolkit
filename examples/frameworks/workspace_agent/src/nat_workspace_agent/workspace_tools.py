@@ -3,7 +3,10 @@
 
 """Workspace file tools for benchmarks that hand an agent a directory and a brief."""
 
+import logging
 import os
+import subprocess
+import sys
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -37,6 +40,28 @@ def _resolve(rel: str) -> Path:
     return p
 
 
+logger = logging.getLogger(__name__)
+
+# Extraction runs out of process: one malformed PDF in a real workspace can hang pdfminer for
+# minutes or crash the interpreter, and neither is catchable where the tool call happens.
+_PDF_CHILD = ("import sys, pdfplumber\n"
+              "with pdfplumber.open(sys.argv[1]) as pdf:\n"
+              "    sys.stdout.write('\\n'.join((p.extract_text() or '') for p in pdf.pages[:40]))\n")
+
+
+def _pdf_text(p: Path) -> str | None:
+    try:
+        done = subprocess.run([sys.executable, "-c", _PDF_CHILD, str(p)],
+                              capture_output=True, timeout=60, check=False)
+    except subprocess.TimeoutExpired:
+        logger.warning("PDF %s took over 60s to parse and was skipped", p.name)
+        return None
+    if done.returncode != 0:
+        logger.warning("PDF %s could not be parsed (exit %s)", p.name, done.returncode)
+        return None
+    return done.stdout.decode("utf-8", "ignore").strip() or None
+
+
 def _extract(p: Path) -> str | None:
     """Text from a workspace file; None when the bytes carry no readable text.
 
@@ -59,12 +84,7 @@ def _extract(p: Path) -> str | None:
         except Exception:  # noqa: BLE001
             return None
     if suffix == ".pdf":
-        try:
-            import pdfplumber
-            with pdfplumber.open(p) as pdf:
-                return "\n".join((pg.extract_text() or "") for pg in pdf.pages[:40]).strip() or None
-        except Exception:  # noqa: BLE001
-            return None
+        return _pdf_text(p)
     # A binary whose first bytes happen to be ASCII still reads as mojibake, so the
     # extension decides rather than a null-byte probe alone.
     if suffix in {".doc", ".xls", ".ppt", ".png", ".jpg", ".jpeg", ".gif", ".zip", ".bin", ".so"}:
