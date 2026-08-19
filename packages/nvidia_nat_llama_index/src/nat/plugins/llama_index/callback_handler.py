@@ -143,11 +143,12 @@ class LlamaIndexProfilerHandler(BaseCallbackHandler, BaseProfilerCallback):
             elif EventPayload.MESSAGES in payload:
                 prompts_or_messages = [str(msg) for msg in payload[EventPayload.MESSAGES]]
 
-            model_name = ""
-            try:
-                model_name = payload.get(EventPayload.SERIALIZED)['model']
-            except Exception as e:
-                logger.exception("Error getting model name: %s", e)
+            # LLM classes disagree on the serialized model key ("model" vs "model_name") and
+            # some omit it; a miss is routine and must not raise.
+            serialized = payload.get(EventPayload.SERIALIZED) or {}
+            model_name = serialized.get("model") or serialized.get("model_name") or ""
+            if not model_name:
+                logger.debug("No model name in the serialized LLM payload; keys=%s", sorted(serialized))
 
             llm_text_input = " ".join(prompts_or_messages) if prompts_or_messages else ""
 
@@ -209,8 +210,10 @@ class LlamaIndexProfilerHandler(BaseCallbackHandler, BaseProfilerCallback):
                 llm_text_output = ""
 
                 try:
+                    # A response can carry non-text blocks such as ToolCallBlock, which
+                    # legitimately have no `text`; skipping them is not an error.
                     for block in response.message.blocks:
-                        llm_text_output += block.text
+                        llm_text_output += getattr(block, "text", None) or ""
                 except Exception as e:
                     logger.exception("Error getting LLM text output: %s", e)
 

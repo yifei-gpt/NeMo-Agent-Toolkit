@@ -1,0 +1,23 @@
+# Agno personal-finance demo against the local vLLM fleet (./vllm_server.sh start -> :8001)
+#
+# Differs from configs/config.yml: the SerpAPI web search tool is replaced with
+# `wiki_search`, which needs no API key. The two-agent Agno workflow is unchanged.
+functions:
+  web_search_tool:
+    _type: wiki_search
+    max_results: 3
+
+llms:
+  local_llm:
+    _type: openai
+    base_url: http://localhost:8001/v1
+    model_name: Qwen3.6-35B-A3B-FP8
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 8192
+
+workflow:
+  _type: agno_personal_finance
+  llm_name: local_llm
+  tools: [web_search_tool]
+  parse_agent_response_max_retries: 3

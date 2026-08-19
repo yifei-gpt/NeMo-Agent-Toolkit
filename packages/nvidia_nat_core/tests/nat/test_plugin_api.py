@@ -408,9 +408,10 @@ def test_plugin_authoring_docs_prefer_public_api_imports():
 
     files: list[Path] = []
     for path in paths:
+        # Skip missing paths so the check still covers whatever docs the tree actually has.
         if path.is_dir():
             files.extend(path.rglob("*.md"))
-        else:
+        elif path.is_file():
             files.append(path)
 
     violations = []

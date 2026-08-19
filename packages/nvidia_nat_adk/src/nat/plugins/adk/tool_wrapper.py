@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Tool Wrapper file"""
+import json
 import logging
 import types
 from collections.abc import AsyncIterator
 from collections.abc import Callable
 from dataclasses import is_dataclass
 from typing import Any
+from typing import Union
 from typing import get_args
 from typing import get_origin
 
@@ -42,13 +44,52 @@ def resolve_type(t: Any) -> Any:
     Returns:
         Any: The resolved type.
     """
+    # `typing.Union[...]` as well as `X | Y`: pydantic builds the former from a JSON Schema
+    # `anyOf`, and ADK raises rather than degrading when a union reaches its declaration parser.
     origin = get_origin(t)
-    if origin is types.UnionType:
-        for arg in get_args(t):
-            if arg is not type(None):
-                return arg
-        return t
+    if origin is types.UnionType or origin is Union:
+        members = [arg for arg in get_args(t) if arg is not type(None)]
+        if len(members) == 1:
+            return members[0]
+        # A real sum type has no declaration ADK can express, and naming one member would
+        # advertise a schema the tool rejects, so it is passed as a plain object instead.
+        return dict[str, Any] if members else t
     return t
+
+
+def _shape_text(input_schema: Any, names: list[str]) -> str:
+    """The JSON Schema of the parameters ADK had to flatten, small enough to sit in a docstring."""
+    try:
+        schema = input_schema.model_json_schema()
+    except Exception:  # noqa: BLE001
+        return ""
+    props = {n: schema.get("properties", {}).get(n) for n in names}
+    body = {"properties": {k: v for k, v in props.items() if v}, "$defs": schema.get("$defs", {})}
+    text = json.dumps(body, separators=(",", ":"))
+    return f"Argument shape (one of these variants must match exactly): {text[:4000]}"
+
+
+def _expressible(annotation: Any, func_name: str) -> Any:
+    """ADK refuses a declaration it cannot express and takes the whole tool down with it, so the
+    type it rejects becomes a plain object -- the function validates its own arguments anyway."""
+    import inspect as _inspect
+
+    from google.adk.tools import _function_parameter_parse_util as _parse
+    from google.adk.utils.variant_utils import get_google_llm_variant
+    try:
+        _parse._parse_schema_from_parameter(
+            get_google_llm_variant(),
+            _inspect.Parameter("x", _inspect.Parameter.POSITIONAL_OR_KEYWORD, annotation=annotation),
+            func_name)
+        return annotation
+    except (ValueError, TypeError) as refusal:
+        # ADK phrases every refusal as one of these. Anything else means its private parser moved,
+        # and reading that as "not expressible" would flatten every tool in the fleet in silence.
+        if "parameter" not in str(refusal) and "supported" not in str(refusal):
+            logger.warning("ADK's declaration parser did not answer as expected (%s); %s is being "
+                           "passed as a plain object", refusal, annotation)
+        logger.debug("ADK cannot declare %s for %s; passing it as an object", annotation, func_name)
+        return dict[str, Any]
 
 
 @register_tool_wrapper(wrapper_type=LLMFrameworkEnum.ADK)
@@ -68,6 +109,22 @@ def google_adk_tool_wrapper(
     """
     import inspect
 
+    def _decoded(kwargs: dict[str, Any]) -> dict[str, Any]:
+        """ADK hands a structured argument through as the JSON text the model emitted, and the
+        function's own schema then rejects it, so it is decoded back before the call."""
+        fields = getattr(fn.input_schema, "model_fields", {}) or {}
+        out = dict(kwargs)
+        for key, value in kwargs.items():
+            if not isinstance(value, str) or key not in fields:
+                continue
+            if not value.lstrip()[:1] in ("{", "["):
+                continue
+            try:
+                out[key] = json.loads(value)
+            except json.JSONDecodeError:
+                pass                      # a string that merely looks like JSON stays a string
+        return out
+
     async def callable_ainvoke(*args: Any, **kwargs: Any) -> Any:
         """Async function to invoke the NAT function.
 
@@ -77,7 +134,7 @@ def google_adk_tool_wrapper(
         Returns:
             Any: The result of invoking the NAT function.
         """
-        return await fn.acall_invoke(*args, **kwargs)
+        return await fn.acall_invoke(*args, **_decoded(kwargs))
 
     async def callable_astream(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
         """Async generator to stream results from the NAT function.
@@ -88,7 +145,7 @@ def google_adk_tool_wrapper(
         Yields:
             Any: Streamed items from the NAT function.
         """
-        async for item in fn.acall_stream(*args, **kwargs):
+        async for item in fn.acall_stream(*args, **_decoded(kwargs)):
             yield item
 
     def nat_function(
@@ -129,15 +186,28 @@ def google_adk_tool_wrapper(
 
             # Set signature only if input_schema is provided
             params: list[inspect.Parameter] = []
+            degraded: list[str] = []
             if input_schema is not None:
                 annotations = getattr(input_schema, "__annotations__", {}) or {}
                 for param_name, param_annotation in annotations.items():
+                    usable = _expressible(resolve_type(param_annotation), name)
+                    # Compared by value, not identity: `resolve_type` builds its own permissive
+                    # object for a union, and an identity test would miss that one silently.
+                    if usable == dict[str, Any] and param_annotation != dict[str, Any]:
+                        degraded.append(param_name)
                     params.append(
                         inspect.Parameter(
                             param_name,
                             inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                            annotation=resolve_type(param_annotation),
+                            annotation=usable,
                         ))
+            # A parameter passed as a bare object tells the model nothing about which fields go
+            # together, and the server still rejects the wrong combination. The declaration cannot
+            # carry a union, but the description can, so the shape goes there instead.
+            if degraded:
+                shape = _shape_text(input_schema, degraded)
+                if shape:
+                    func_to_wrap.__doc__ = f"{func_to_wrap.__doc__ or ''}\n\n{shape}".strip()
             setattr(func_to_wrap, "__signature__", inspect.Signature(parameters=params))
 
             return func_to_wrap

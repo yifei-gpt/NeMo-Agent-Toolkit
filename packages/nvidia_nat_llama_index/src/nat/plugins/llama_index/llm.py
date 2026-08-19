@@ -170,10 +170,28 @@ async def openai_llama_index(llm_config: OpenAIModelConfig, _builder: Builder):
     if llm_config.request_timeout is not None:
         config_dict["timeout"] = llm_config.request_timeout
 
+    # OpenAI rejects model names outside its hardcoded table, which breaks OpenAI-compatible
+    # servers. OpenAILike reads model metadata from config instead.
+    use_openai_like = False
+    if base_url and llm_config.api_type != APITypeEnum.RESPONSES:
+        from llama_index.llms.openai.utils import openai_modelname_to_contextsize
+        try:
+            openai_modelname_to_contextsize(llm_config.model_name)
+        except ValueError:
+            use_openai_like = True
+
     async with http_clients(llm_config) as http_clients_dict:
         config_dict.update(http_clients_dict)
         if llm_config.api_type == APITypeEnum.RESPONSES:
             llm = OpenAIResponses(**config_dict)
+        elif use_openai_like:
+            from llama_index.llms.openai_like import OpenAILike
+
+            # OpenAILike defaults to non-chat, non-tool-calling, 3900 token context.
+            # Override via extra config fields (e.g. context_window) in the YAML.
+            config_dict.setdefault("is_chat_model", True)
+            config_dict.setdefault("is_function_calling_model", True)
+            llm = OpenAILike(**config_dict)
         else:
             llm = OpenAI(**config_dict)
 

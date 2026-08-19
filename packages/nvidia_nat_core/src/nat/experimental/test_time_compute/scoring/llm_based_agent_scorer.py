@@ -69,10 +69,14 @@ class LLMBasedAgentScorer(StrategyBase):
             raise ImportError("langchain-core is not installed. Please install it to use SingleShotMultiPlanPlanner.\n"
                               "This error can be resolved by installing nvidia-nat-langchain.")
 
-        if not isinstance(self.llm_bound, BaseChatModel):
-            raise ValueError("The `scoring_llm` must be an instance of `BaseChatModel`.")
+        # NAT's LangChain client returns the model wrapped by configurable_fields, so what
+        # arrives here is a Runnable rather than a BaseChatModel; ainvoke is all this needs.
+        from langchain_core.runnables import Runnable
 
-        model: BaseChatModel = self.llm_bound
+        if not isinstance(self.llm_bound, (BaseChatModel, Runnable)):
+            raise ValueError("The `scoring_llm` must be a chat model or Runnable.")
+
+        model = self.llm_bound
 
         prompt_template = PromptTemplate(
             template=self.config.scoring_template,

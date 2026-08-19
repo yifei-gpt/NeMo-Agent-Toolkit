@@ -1,0 +1,45 @@
+# Semantic Kernel travel-planning demo against the local vLLM fleet (./vllm_server.sh start -> :8001)
+#
+# mem0 memory and its two tools are dropped (needs MEM0_API_KEY);
+# the three-agent group chat is unchanged.
+general:
+  front_end:
+    _type: console
+
+functions:
+  hotel_price:
+    _type: hotel_price
+  local_events:
+    _type: local_events
+
+llms:
+  local_llm:
+    _type: openai
+    base_url: http://localhost:8001/v1
+    model_name: Qwen3.6-35B-A3B-FP8
+    api_key: EMPTY
+    temperature: 0.0
+    max_tokens: 4096
+
+workflow:
+  _type: semantic_kernel
+  tool_names: [hotel_price, local_events]
+  llm_name: local_llm
+  verbose: true
+  itinerary_expert_name: ItineraryExpert
+  itinerary_expert_instructions: |
+    You are an itinerary expert specializing in creating detailed travel plans.
+    Focus on the attractions, best times to visit, and other important logistics.
+    Avoid discussing costs or budgets; leave that to the Budget Advisor.
+  budget_advisor_name: BudgetAdvisor
+  budget_advisor_instructions: |
+    You are a budget advisor skilled at estimating costs for travel plans.
+    Your job is to provide detailed pricing estimates, optimize for cost-effectiveness,
+    and ensure all travel costs fit within a reasonable budget.
+    Avoid giving travel advice or suggesting activities.
+  summarize_agent_name: Summarizer
+  summarize_agent_instructions: |
+    You will summarize and create the final plan and format the output.
+    If the total cost is not within a provided budget, provide options or ask for more information
+    Compile information into a clear, well-structured, user-friendly travel plan. Include sections for the itinerary,
+    cost breakdown, and any notes from the budget advisor. Avoid duplicating information.

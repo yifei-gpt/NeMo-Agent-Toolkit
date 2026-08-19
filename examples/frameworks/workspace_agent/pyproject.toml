@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nat-workspace-agent"
+version = "0.1.0"
+description = "Workspace file tools so NAT topologies can drive file-deliverable benchmarks"
+requires-python = ">=3.11"
+dependencies = ["nvidia-nat"]
+
+[project.entry-points."nat.components"]
+nat_workspace_agent = "nat_workspace_agent.register"
+
+[tool.setuptools.packages.find]
+where = ["src"]

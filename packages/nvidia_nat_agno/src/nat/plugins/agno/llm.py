@@ -143,6 +143,8 @@ async def openai_agno(llm_config: OpenAIModelConfig, _builder: Builder):
             config_obj["api_key"] = api_key
         if (base_url := llm_config.base_url or os.getenv("OPENAI_BASE_URL")):
             config_obj["base_url"] = base_url
+            # Agno maps system -> "developer", which non-OpenAI servers reject.
+            config_obj.setdefault("role_map", {**OpenAIChat.default_role_map, "system": "system"})
         if llm_config.request_timeout is not None:
             config_obj["timeout"] = llm_config.request_timeout
 
@@ -161,22 +163,21 @@ async def litellm_agno(llm_config: LiteLlmModelConfig, _builder: Builder):
 
     validate_no_responses_api(llm_config, LLMFrameworkEnum.AGNO)
 
-    async with async_http_client(llm_config) as http_client:
-        client = LiteLLM(
-            **llm_config.model_dump(
-                exclude={
-                    "api_type",
-                    "model_name",
-                    "thinking",
-                    "type",
-                    "verify_ssl",
-                },
-                by_alias=True,
-                exclude_none=True,
-                exclude_unset=True,
-            ),
-            http_client=http_client,
-            id=llm_config.model_name,
-        )
+    # agno's LiteLLM takes no http_client; passing one made every build raise TypeError.
+    client = LiteLLM(
+        **llm_config.model_dump(
+            exclude={
+                "api_type",
+                "model_name",
+                "thinking",
+                "type",
+                "verify_ssl",
+            },
+            by_alias=True,
+            exclude_none=True,
+            exclude_unset=True,
+        ),
+        id=llm_config.model_name,
+    )
 
-        yield _patch_llm_based_on_config(client, llm_config)
+    yield _patch_llm_based_on_config(client, llm_config)
