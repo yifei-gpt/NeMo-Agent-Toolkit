@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 # One instance is shared by every function that names it and lives for the whole eval, so the
 # per-run tables have to evict instead of keeping a question's history forever.
-_MAX_RUNS = 16
+_MAX_RUNS = 64
 _MAX_KEYS_PER_RUN = 128
 _MAX_CACHED_CHARS = 8000
 
@@ -62,6 +62,10 @@ class OutputLimitConfig(FunctionMiddlewareBaseConfig, name="tool_output_limit"):
                                    description="Total characters of tool output per run; 0 disables")
     notice: str = Field(default="\n...[output truncated; narrow your query to see more]",
                         description="Appended when output is truncated")
+    spent_notice: str = Field(default=("[This run has read as much tool output as it is allowed. "
+                                       "Reading more will return nothing, however the query is "
+                                       "written. Answer now with what you already have.]"),
+                              description="Returned instead once the run's whole budget is spent")
 
 
 class RepeatBreakerConfig(FunctionMiddlewareBaseConfig, name="repeat_call_breaker"):
@@ -82,9 +86,12 @@ class RepeatBreakerConfig(FunctionMiddlewareBaseConfig, name="repeat_call_breake
                                     description="Raise once calls exceed this multiple of the budget")
 
 
-def _evict(table: OrderedDict, limit: int) -> None:
+def _evict(table: OrderedDict, limit: int, what: str = "") -> None:
     while len(table) > limit:
-        table.popitem(last=False)
+        dropped, _ = table.popitem(last=False)
+        if what:
+            # Evicting a run that is still going hands it a fresh budget, so it must not be silent.
+            logger.warning("dropped %s for run %s past %d live runs; its budget restarts", what, dropped, limit)
 
 
 def _stable(value: Any) -> Any:
@@ -102,6 +109,10 @@ def _stable(value: Any) -> Any:
         return value
     fields = getattr(value, "__dict__", None)
     return (type(value).__name__, _stable(fields) if fields else repr(value))
+
+
+# Not a function name, so it cannot collide with one in the same counter.
+_RUN_TOTAL = "<run>"
 
 
 class _RunState:
@@ -131,7 +142,7 @@ class OutputLimitMiddleware(FunctionMiddleware):
         # Charge what the caller will actually see, not what it asked for, or a run spends its
         # budget on characters that were truncated away.
         self._spent[run_id] = spent + min(taken, room)
-        _evict(self._spent, _MAX_RUNS)
+        _evict(self._spent, _MAX_RUNS, "the output budget")
         return room
 
     async def post_invoke(self, context: InvocationContext) -> InvocationContext | None:
@@ -144,7 +155,10 @@ class OutputLimitMiddleware(FunctionMiddleware):
                     context.function_context.name,
                     len(text),
                     room)
-        context.output = text[:room] + self._config.notice
+        # 'Narrow your query' is the wrong advice once the budget is gone -- no query returns
+        # anything -- and it is what kept the agent searching until its iterations ran out.
+        context.output = (self._config.spent_notice if room <= 0
+                          else text[:room] + self._config.notice)
         return context
 
     async def function_middleware_stream(self, *args: Any, call_next: CallNextStream,
@@ -157,7 +171,8 @@ class OutputLimitMiddleware(FunctionMiddleware):
             text = chunk if isinstance(chunk, str) else str(chunk)
             if len(text) > remaining:
                 logger.info("Truncated %s stream at its remaining budget", context.name)
-                yield text[:remaining] + self._config.notice
+                yield (self._config.spent_notice if remaining <= 0
+                       else text[:remaining] + self._config.notice)
                 return
             remaining -= len(text)
             yield chunk
@@ -175,7 +190,7 @@ class RepeatBreakerMiddleware(FunctionMiddleware):
         run_id = Context.get().workflow_run_id or "no-run"
         state = self._runs.pop(run_id, None) or _RunState()
         self._runs[run_id] = state
-        _evict(self._runs, _MAX_RUNS)
+        _evict(self._runs, _MAX_RUNS, "the tool budget")
         return state
 
     def _key(self, name: str | None, args: tuple, kwargs: dict) -> str:
@@ -186,15 +201,17 @@ class RepeatBreakerMiddleware(FunctionMiddleware):
         # slip past exact-match dedup and would otherwise run to the graph recursion limit.
         if not self._config.max_calls_per_run:
             return None
-        # Counted per function because one instance serves every function it is attached to,
-        # and counted before dedup so an agent spamming one identical call still hard-stops.
+        # Counted before dedup, so an agent spamming one identical call still hard-stops. The run
+        # total is what bounds a run: per function alone, N tools bought N budgets.
         state.totals[name] += 1
-        total = state.totals[name]
-        if total > self._config.max_calls_per_run * self._config.hard_stop_multiple:
-            raise RuntimeError(f"Tool budget exceeded {self._config.hard_stop_multiple}x on {name} "
-                               f"({total} calls); the agent ignored the budget notice.")
-        if total > self._config.max_calls_per_run:
-            logger.info("Tool budget spent on %s (%d calls)", name, total)
+        state.totals[_RUN_TOTAL] += 1
+        run_total = state.totals[_RUN_TOTAL]
+        if run_total > self._config.max_calls_per_run * self._config.hard_stop_multiple:
+            raise RuntimeError(f"Tool budget exceeded {self._config.hard_stop_multiple}x "
+                               f"({run_total} calls this run, {state.totals[name]} of them on {name}); "
+                               f"the agent ignored the budget notice.")
+        if run_total > self._config.max_calls_per_run:
+            logger.info("Tool budget spent (%d calls this run, %d on %s)", run_total, state.totals[name], name)
             return self._config.budget_notice
         return None
 
