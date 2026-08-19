@@ -53,6 +53,10 @@ class OutputLimitConfig(FunctionMiddlewareBaseConfig, name="tool_output_limit"):
     """Truncates tool output so a long transcript cannot exceed the context window."""
 
     max_chars: int = Field(default=8000, gt=0, description="Maximum characters returned by an intercepted call")
+    # Per call, the cap says nothing about the transcript: a budget of 80 calls at 20k chars is
+    # 1.6M, well past a 256k-token window, and the run dies mid-way with nothing to show.
+    max_chars_per_run: int = Field(default=600_000, ge=0,
+                                   description="Total characters of tool output per run; 0 disables")
     notice: str = Field(default="\n...[output truncated; narrow your query to see more]",
                         description="Appended when output is truncated")
 
@@ -103,6 +107,7 @@ class _RunState:
         self.seen: OrderedDict[str, int] = OrderedDict()
         self.results: OrderedDict[str, Any] = OrderedDict()
         self.totals: dict[str, int] = defaultdict(int)
+        self.last_key: str | None = None
 
 
 class OutputLimitMiddleware(FunctionMiddleware):
@@ -110,17 +115,33 @@ class OutputLimitMiddleware(FunctionMiddleware):
     def __init__(self, config: OutputLimitConfig) -> None:
         super().__init__()
         self._config = config
+        self._spent: OrderedDict[str, int] = OrderedDict()
+
+    def _room(self, taken: int) -> int:
+        """Characters this call may return, once the run's own transcript budget is counted."""
+        cap = self._config.max_chars
+        if not self._config.max_chars_per_run:
+            return cap
+        run_id = Context.get().workflow_run_id or "no-run"
+        spent = self._spent.pop(run_id, 0)
+        room = max(0, min(cap, self._config.max_chars_per_run - spent))
+        # Charge what the caller will actually see, not what it asked for, or a run spends its
+        # budget on characters that were truncated away.
+        self._spent[run_id] = spent + min(taken, room)
+        _evict(self._spent, _MAX_RUNS)
+        return room
 
     async def post_invoke(self, context: InvocationContext) -> InvocationContext | None:
         # A dict or model output fills the transcript just as fast as a long string does.
         text = context.output if isinstance(context.output, str) else str(context.output)
-        if len(text) <= self._config.max_chars:
+        room = self._room(len(text))
+        if len(text) <= room:
             return None
         logger.info("Truncated %s output from %d to %d chars",
                     context.function_context.name,
                     len(text),
-                    self._config.max_chars)
-        context.output = text[:self._config.max_chars] + self._config.notice
+                    room)
+        context.output = text[:room] + self._config.notice
         return context
 
     async def function_middleware_stream(self, *args: Any, call_next: CallNextStream,
@@ -128,11 +149,11 @@ class OutputLimitMiddleware(FunctionMiddleware):
                                          **kwargs: Any) -> AsyncIterator[Any]:
         # The inherited stream path runs post_invoke per chunk, which caps each chunk instead
         # of the call, so the remaining budget is tracked across the whole stream here.
-        remaining = self._config.max_chars
+        remaining = self._room(self._config.max_chars)
         async for chunk in call_next(*args, **kwargs):
             text = chunk if isinstance(chunk, str) else str(chunk)
             if len(text) > remaining:
-                logger.info("Truncated %s stream at %d chars", context.name, self._config.max_chars)
+                logger.info("Truncated %s stream at its remaining budget", context.name)
                 yield text[:remaining] + self._config.notice
                 return
             remaining -= len(text)
@@ -175,8 +196,12 @@ class RepeatBreakerMiddleware(FunctionMiddleware):
         return None
 
     def _repeated(self, state: _RunState, key: str) -> bool:
+        # Only back-to-back repeats are loops. An identical call with a different one in between may
+        # see state that call changed -- listing a directory after writing to it -- and answering
+        # that from cache serves the pre-write world as if it were current.
+        consecutive, state.last_key = state.last_key == key, key
         # Re-inserting keeps a hot repeat loop at the young end, so eviction never resets it.
-        count = state.seen.pop(key, 0) + 1
+        count = (state.seen.pop(key, 0) + 1) if consecutive else 1
         state.seen[key] = count
         _evict(state.seen, _MAX_KEYS_PER_RUN)
         return count > self._config.max_repeats
