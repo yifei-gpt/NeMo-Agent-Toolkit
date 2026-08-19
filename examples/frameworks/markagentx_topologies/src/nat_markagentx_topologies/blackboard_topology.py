@@ -66,23 +66,42 @@ ROLE_LIBRARY: dict[str, dict] = {
         "brief": "Read the deliverable back and rewrite it if a requirement or the format is missed.",
         "max_iterations": 45,
     },
+    # The same draft-critique-finalise trio dynamic_topology staffs, on the tools the task sets now
+    # define; without them a file task offered three roles and the staffing choice carried no mark.
+    "drafter": {
+        "tools": ["write_draft"],
+        "brief": "Draft the answer with write_draft and record it.",
+        "max_iterations": 12,
+    },
+    "critic": {
+        "tools": ["list_defects"],
+        "brief": "Send the recorded draft to list_defects and record only the defects it names.",
+        "max_iterations": 12,
+    },
+    "finalizer": {
+        "tools": ["emit_final"],
+        "brief": "Send the draft and any criticism to emit_final and record its answer.",
+        "max_iterations": 12,
+    },
     "entity_researcher": {
-        "tools": ["wikipedia_search"],
+        # All three, as dynamic_topology already learned: a single tool leaves a
+        # specialist re-searching until the budget goes, and records no choice at all.
+        "tools": ["wikipedia_search", "calculator", "current_datetime"],
         "brief": "Look up the entities the question names and record their dates, figures and relations.",
         "max_iterations": 8,
     },
     "date_resolver": {
-        "tools": ["wikipedia_search", "current_datetime"],
+        "tools": ["wikipedia_search", "calculator", "current_datetime"],
         "brief": "Pin down the dates or intervals the question depends on.",
         "max_iterations": 5,
     },
     "calculator_specialist": {
-        "tools": ["calculator"],
+        "tools": ["wikipedia_search", "calculator", "current_datetime"],
         "brief": "Do the arithmetic the question needs, using figures already on the record.",
         "max_iterations": 4,
     },
     "comparison_analyst": {
-        "tools": ["wikipedia_search", "calculator"],
+        "tools": ["wikipedia_search", "calculator", "current_datetime"],
         "brief": "Compare the quantities in question, filling any gap the record leaves.",
         "max_iterations": 8,
     },
@@ -90,13 +109,14 @@ ROLE_LIBRARY: dict[str, dict] = {
 
 PLANNER_PROMPT = ("You are staffing a team for one question. Roles available:\n{roles}\n\n"
                   "Question: {question}\n\n"
-                  "Reply with only a JSON array of role names, in the order they should work, "
-                  "at most {limit}.")
+                  "Reply with only a JSON array of exactly {limit} role names, in the order they "
+                  "should work. Name only roles from the list above.")
 
 TURN_PROMPT = ("Question: {question}\n\n"
                "Shared record so far:\n{record}\n\n"
                "You are the {role}. {brief} Add only what is missing; do not repeat what is "
-               "already recorded. Reply with your findings in one short paragraph.")
+               "already recorded. Use your tools to establish what you report -- never answer "
+               "from the task text alone -- then give your findings in one short paragraph.")
 
 COMPOSE_PROMPT = ("Question: {question}\n\n"
                   "Shared record from the team:\n{record}\n\n"
@@ -109,11 +129,12 @@ class BlackboardTopologyConfig(FunctionBaseConfig, name="blackboard_topology"):
     llm_name: LLMRef = Field(description="Model for the planner, the specialists and the composer")
     tool_names: list[FunctionRef] = Field(default_factory=list, description="Tools the specialists may use")
     max_roles: int = Field(default=3, ge=1, description="Most specialists to staff for one question")
+    brief: str = Field(default="", description="What the task set asks of any agent working it")
     max_record_chars: int = Field(default=6000, description="Cap on the shared record handed to each turn")
     verbose: bool = Field(default=False, description="Verbose agent logging")
 
 
-def _parse_roles(text: str, limit: int) -> list[str]:
+def _parse_roles(text: str, limit: int, eligible: list[str]) -> list[str]:
     """Reads the planner's ordered role list, falling back to a name scan."""
     match = re.search(r"\[.*?\]", text or "", re.DOTALL)
     names: list[str] = []
@@ -125,9 +146,16 @@ def _parse_roles(text: str, limit: int) -> list[str]:
         except json.JSONDecodeError:
             names = []
     if not names:
-        names = [role for role in ROLE_LIBRARY if role in (text or "")]
-    kept = [n for n in names if n in ROLE_LIBRARY]
-    return kept[:limit] or ["entity_researcher"]
+        names = [role for role in eligible if role in (text or "")]
+    # Against what this tool set can staff, never the whole library: a role it cannot staff is
+    # dropped later, and a run that drops them all composes its answer from an empty record.
+    kept = list(dict.fromkeys(n for n in names if n in eligible))[:limit] or eligible[:1]
+    for role in eligible:
+        if len(kept) >= min(limit, len(eligible)):
+            break
+        if role not in kept:
+            kept.append(role)
+    return kept
 
 
 @register_function(config_type=BlackboardTopologyConfig, framework_wrappers=[LLMFrameworkEnum.LANGCHAIN])
@@ -144,7 +172,11 @@ async def blackboard_topology(config: BlackboardTopologyConfig,
     generic = not any(x in available for s in ROLE_LIBRARY.values() for x in s["tools"])
     if generic:
         logger.warning("No role names any of the %d offered tools; staffing on briefs alone", len(available))
-    catalogue = "\n".join(f"- {name}: {spec['brief']}" for name, spec in ROLE_LIBRARY.items())
+    # Only roles this tool set can actually staff: offering the rest spends a slot on a specialist
+    # that _specialist drops, which cost every JobBench run one of its three.
+    eligible = [n for n, s in ROLE_LIBRARY.items() if any(x in available for x in s["tools"])] \
+        or list(ROLE_LIBRARY)
+    catalogue = "\n".join(f"- {name}: {ROLE_LIBRARY[name]['brief']}" for name in eligible)
     built: dict[str, object] = {}
     # Questions are evaluated concurrently, so every add_function call is serialised.
     build_lock = asyncio.Lock()
@@ -171,6 +203,10 @@ async def blackboard_topology(config: BlackboardTopologyConfig,
                                                 verbose=config.verbose,
                                                 max_iterations=iters,
                                                 handle_tool_errors=True,
+                                                # What the task set asks of anyone, then what this
+                                                # role is for: dynamic_topology already does both.
+                                                additional_instructions=" ".join(
+                                                    x for x in (config.brief, spec["brief"]) if x),
                                                 description=f"Specialist: {role}"))
                 logger.info("Built specialist %s with tools %s", role, tools)
         return built[role]
@@ -178,11 +214,9 @@ async def blackboard_topology(config: BlackboardTopologyConfig,
     async def _run(inputs: str) -> str:
         plan = await llm.ainvoke(
             [HumanMessage(content=PLANNER_PROMPT.format(roles=catalogue, question=inputs, limit=config.max_roles))])
-        roles = _parse_roles(getattr(plan, "content", str(plan)), config.max_roles)
+        roles = _parse_roles(getattr(plan, "content", str(plan)), config.max_roles, eligible)
         # Staffing is the widest choice this workflow makes, so it is offered for marking;
         # with nothing marking, decision_point returns the planner's own pick.
-        eligible = [n for n, s in ROLE_LIBRARY.items() if any(x in available for x in s["tools"])] \
-            or list(ROLE_LIBRARY)
         prompt = PLANNER_PROMPT.format(roles=catalogue, question=inputs, limit=config.max_roles)
         roles = list(dict.fromkeys(decision_point("role_selection", candidates=eligible, native=r,
                                                   context=[{"role": "user", "content": prompt}])

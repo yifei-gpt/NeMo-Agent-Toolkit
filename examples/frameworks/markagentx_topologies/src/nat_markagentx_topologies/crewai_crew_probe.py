@@ -40,6 +40,7 @@ class CrewAICrewProbeConfig(FunctionBaseConfig, name="crewai_crew_probe"):
     llm_name: LLMRef = Field(description="Model to use via the CrewAI wrapper")
     tool_names: list[FunctionRef] = Field(default_factory=list, description="NAT tools exposed to the researcher")
     process: str = Field(default="sequential", description="CrewAI process: 'sequential' or 'hierarchical'")
+    brief: str = Field(default="", description="What the task set asks of any agent working it")
     verbose: bool = Field(default=False, description="Verbose CrewAI logging")
     max_iter: int = Field(default=15, description="Hard cap on each agent's reasoning iterations")
 
@@ -57,7 +58,8 @@ async def crewai_crew_probe(config: CrewAICrewProbeConfig, builder: Builder) -> 
 
     async def _run(inputs: str) -> str:
         researcher = Agent(role="Researcher",
-                           goal="Find every fact the question depends on, using the tools rather than memory",
+                           goal=" ".join(x for x in (config.brief,
+                          "Find every fact the question depends on, using the tools rather than memory") if x),
                            backstory="You gather evidence and quote the exact figures and dates you find.",
                            llm=llm,
                            tools=tools,
@@ -65,7 +67,8 @@ async def crewai_crew_probe(config: CrewAICrewProbeConfig, builder: Builder) -> 
                            allow_delegation=False,
                            max_iter=config.max_iter)
         analyst = Agent(role="Analyst",
-                        goal="Combine the gathered facts into the final answer",
+                        goal=" ".join(x for x in (config.brief,
+                          "Combine the gathered facts into the final answer") if x),
                         backstory="You reason over evidence someone else collected and commit to one answer.",
                         llm=llm,
                         tools=tools,

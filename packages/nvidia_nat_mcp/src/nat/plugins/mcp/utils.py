@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import json
+import typing
 from enum import Enum
 from functools import cache
 from typing import Annotated
@@ -23,6 +24,7 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from pydantic import create_model
+from pydantic import model_validator
 
 _ORDER_INSENSITIVE_SCHEMA_ARRAY_KEYS = frozenset({"enum", "required"})
 
@@ -79,6 +81,26 @@ def truncate_session_id(session_id: str, max_length: int = 10) -> str:
     if len(session_id) > max_length:
         return session_id[:max_length] + "..."
     return session_id
+
+
+def _accepts_str(annotation) -> bool:
+    """A field that can hold a string keeps it: decoding there would corrupt a genuine payload."""
+    return annotation is str or any(a is str for a in typing.get_args(annotation))
+
+
+def _decode_json_text(cls, data):
+    # Models routinely hand a nested argument back as its JSON text. The call is well formed apart
+    # from the encoding, so decoding it beats rejecting the tool call outright.
+    if not isinstance(data, dict):
+        return data
+    for key, value in list(data.items()):
+        field = cls.model_fields.get(key)
+        if isinstance(value, str) and value[:1] in ("{", "[") and field and not _accepts_str(field.annotation):
+            try:
+                data[key] = json.loads(value)
+            except ValueError:
+                pass        # not JSON after all; let validation report the real problem
+    return data
 
 
 def model_from_mcp_schema(name: str, mcp_input_schema: dict) -> type[BaseModel]:
@@ -324,4 +346,6 @@ def _model_from_mcp_schema(name: str, mcp_input_schema_json: str) -> type[BaseMo
     elif mcp_input_schema.get("additionalProperties") is True:
         model_config = ConfigDict(extra="allow")
 
-    return create_model(f"{_generate_valid_classname(name)}InputSchema", __config__=model_config, **schema_dict)
+    return create_model(f"{_generate_valid_classname(name)}InputSchema", __config__=model_config,
+                        __validators__={"_decode_json_text": model_validator(mode="before")(
+                            classmethod(_decode_json_text))}, **schema_dict)
