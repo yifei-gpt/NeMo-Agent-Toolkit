@@ -22,10 +22,15 @@ from unittest.mock import Mock
 from unittest.mock import patch
 
 import pytest
+from autogen_core import CancellationToken
 from pydantic import BaseModel
+from pydantic import ValidationError
 
 from nat.builder.builder import Builder
 from nat.builder.function import Function
+from nat.builder.function import LambdaFunction
+from nat.builder.function_info import FunctionInfo
+from nat.data_models.function import EmptyFunctionConfig
 from nat.plugins.autogen.tool_wrapper import autogen_tool_wrapper
 from nat.plugins.autogen.tool_wrapper import resolve_type
 
@@ -107,7 +112,7 @@ class TestAutoGenToolWrapper:
 
     def test_autogen_tool_wrapper_basic(self, mock_function, mock_builder):
         """Test basic tool wrapper functionality."""
-        with patch('nat.plugins.autogen.tool_wrapper.FunctionTool') as mock_function_tool:
+        with patch('nat.plugins.autogen.tool_wrapper.NATFunctionTool') as mock_function_tool:
             mock_tool = Mock()
             mock_function_tool.return_value = mock_tool
 
@@ -125,7 +130,7 @@ class TestAutoGenToolWrapper:
         mock_function.has_streaming_output = True
         mock_function.has_single_output = False
 
-        with patch('nat.plugins.autogen.tool_wrapper.FunctionTool') as mock_function_tool:
+        with patch('nat.plugins.autogen.tool_wrapper.NATFunctionTool') as mock_function_tool:
             mock_tool = Mock()
             mock_function_tool.return_value = mock_tool
 
@@ -140,7 +145,7 @@ class TestAutoGenToolWrapper:
         _ = mock_builder  # Unused in this test
         mock_function.description = None
 
-        with patch('nat.plugins.autogen.tool_wrapper.FunctionTool') as mock_function_tool:
+        with patch('nat.plugins.autogen.tool_wrapper.NATFunctionTool') as mock_function_tool:
             mock_tool = Mock()
             mock_function_tool.return_value = mock_tool
 
@@ -150,7 +155,7 @@ class TestAutoGenToolWrapper:
 
     async def test_callable_ainvoke(self, mock_function, mock_builder):
         """Test the async invoke callable."""
-        with patch('nat.plugins.autogen.tool_wrapper.FunctionTool'):
+        with patch('nat.plugins.autogen.tool_wrapper.NATFunctionTool'):
             autogen_tool_wrapper("test_tool", mock_function, mock_builder)
 
             # Test that acall_invoke would be called
@@ -169,7 +174,7 @@ class TestAutoGenToolWrapper:
 
         mock_function.acall_stream = mock_stream
 
-        with patch('nat.plugins.autogen.tool_wrapper.FunctionTool'):
+        with patch('nat.plugins.autogen.tool_wrapper.NATFunctionTool'):
             autogen_tool_wrapper("test_tool", mock_function, mock_builder)
 
             # Test that acall_stream would work
@@ -274,3 +279,70 @@ class TestTypeResolution:
         result = resolve_type(optional_str)
         # Should return str (the non-None type)
         assert result is str
+
+
+class NestedRequest(BaseModel):
+    """The object an MCP style tool asks for."""
+
+    action: str
+    ticker: str | None = None
+
+
+class NestedInput(BaseModel):
+    """An input schema whose only field is the request object."""
+
+    request: NestedRequest
+
+
+class TwoNestedInput(BaseModel):
+    """An input schema where two fields could hold the same arguments."""
+
+    request: NestedRequest
+    fallback: NestedRequest
+
+
+def _nested_tool(input_schema: type[BaseModel], name: str) -> typing.Any:
+    """Wrap a real NAT function which takes a single nested request object."""
+
+    async def _lookup(tool_input: BaseModel | None = None, **kwargs) -> str:
+        return kwargs["request"].action
+
+    info = FunctionInfo.create(single_fn=_lookup, description="Look a company up", input_schema=input_schema)
+    fn = LambdaFunction.from_info(config=EmptyFunctionConfig(), info=info, instance_name=name)
+
+    return autogen_tool_wrapper(name, fn, Mock(spec=Builder))
+
+
+class TestNestedRequestArguments:
+    """AutoGen validates against the model it generates, so a missing wrapper is refused there."""
+
+    async def test_wrapped_arguments(self):
+        """A correctly wrapped call is unaffected."""
+        tool = _nested_tool(NestedInput, "autogen_wrapped")
+
+        assert await tool.run_json({"request": {"action": "cik", "ticker": "KVUE"}}, CancellationToken()) == "cik"
+
+    async def test_flat_arguments_are_wrapped(self):
+        """The inner fields supplied directly are wrapped back up and the tool runs."""
+        tool = _nested_tool(NestedInput, "autogen_flat")
+
+        assert await tool.run_json({"action": "cik", "ticker": "KVUE"}, CancellationToken()) == "cik"
+
+    async def test_flat_arguments_matching_nothing(self):
+        """Arguments which fit nothing leave the original error in place."""
+        tool = _nested_tool(NestedInput, "autogen_no_match")
+
+        with pytest.raises(ValidationError) as exc_info:
+            await tool.run_json({"nonsense": "KVUE"}, CancellationToken())
+
+        assert "validation error for autogen_no_matchargs" in str(exc_info.value)
+        assert "Field required" in str(exc_info.value)
+
+    async def test_two_wrappers_are_not_guessed(self):
+        """Two fields could hold the arguments, so the original error stands."""
+        tool = _nested_tool(TwoNestedInput, "autogen_ambiguous")
+
+        with pytest.raises(ValidationError) as exc_info:
+            await tool.run_json({"action": "cik"}, CancellationToken())
+
+        assert "2 validation errors for autogen_ambiguousargs" in str(exc_info.value)

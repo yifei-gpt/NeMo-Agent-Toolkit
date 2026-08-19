@@ -16,6 +16,8 @@
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic import BaseModel
+from pydantic import ValidationError
 
 from nat.builder.builder import Builder
 from nat.builder.function import LambdaFunction
@@ -69,3 +71,86 @@ async def test_langchain_tool_wrapper_maps_string_to_chat_request() -> None:
     assert await tool.ainvoke({"messages": '[{"role": "user", "content": "json hi"}]'}) == "json hi"
     assert await tool.ainvoke({"messages": '[{"role": "user", "content": {"type": "text", "text": "json object hi"}}]'}
                               ) == "json object hi"
+
+
+class NestedRequest(BaseModel):
+    """The object an MCP style tool asks for."""
+
+    action: str
+    ticker: str | None = None
+
+
+class NestedInput(BaseModel):
+    """An input schema whose only field is the request object."""
+
+    request: NestedRequest
+
+
+class TwoNestedInput(BaseModel):
+    """An input schema where two fields could hold the same arguments."""
+
+    request: NestedRequest
+    fallback: NestedRequest
+
+
+def _nested_tool(input_schema: type[BaseModel], name: str):
+    """Wrap a real NAT function which takes a single nested request object."""
+
+    async def _lookup(tool_input: BaseModel | None = None, **kwargs) -> str:
+        return kwargs["request"].action
+
+    info = FunctionInfo.create(single_fn=_lookup, description="Look a company up", input_schema=input_schema)
+    fn = LambdaFunction.from_info(config=EmptyFunctionConfig(), info=info, instance_name=name)
+
+    return langchain_tool_wrapper(name, fn, MagicMock(spec=Builder))
+
+
+@pytest.mark.asyncio
+async def test_langchain_tool_wrapper_keeps_wrapped_arguments() -> None:
+    tool = _nested_tool(NestedInput, "lc_wrapped")
+
+    assert await tool.ainvoke({"request": {"action": "cik", "ticker": "KVUE"}}) == "cik"
+
+
+@pytest.mark.asyncio
+async def test_langchain_tool_wrapper_wraps_flat_arguments() -> None:
+    tool = _nested_tool(NestedInput, "lc_flat")
+
+    assert await tool.ainvoke({"action": "cik", "ticker": "KVUE"}) == "cik"
+
+
+@pytest.mark.asyncio
+async def test_langchain_tool_wrapper_keeps_the_original_error() -> None:
+    tool = _nested_tool(NestedInput, "lc_no_match")
+
+    with pytest.raises(ValidationError) as exc_info:
+        await tool.ainvoke({"nonsense": "KVUE"})
+
+    assert "validation error for NestedInput" in str(exc_info.value)
+    assert "Field required" in str(exc_info.value)
+
+    ambiguous = _nested_tool(TwoNestedInput, "lc_ambiguous")
+
+    with pytest.raises(ValidationError) as exc_info:
+        await ambiguous.ainvoke({"action": "cik"})
+
+    assert "2 validation errors for TwoNestedInput" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_langchain_tool_node_runs_a_flat_call() -> None:
+    """The agent calls tools through a ToolNode, which turns a refusal into a message nobody sees."""
+    from langchain_core.messages import AIMessage
+    from langgraph.prebuilt import ToolNode
+    from langgraph.runtime import DEFAULT_RUNTIME
+
+    tool = _nested_tool(NestedInput, "lc_tool_node")
+    node = ToolNode([tool], handle_tool_errors=True)
+    call = AIMessage(content="", tool_calls=[{"name": "lc_tool_node", "args": {"action": "cik"}, "id": "call_1"}])
+
+    # The same config the agent uses, since a ToolNode called outside its graph has no runtime.
+    response = await node.ainvoke({"messages": [call]}, config={"configurable": {"__pregel_runtime": DEFAULT_RUNTIME}})
+    message = response["messages"][-1]
+
+    assert message.content == "cik"
+    assert message.status == "success"

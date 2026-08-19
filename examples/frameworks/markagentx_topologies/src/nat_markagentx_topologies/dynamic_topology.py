@@ -46,6 +46,10 @@ except ImportError:  # the topology runs unmarked when MarkAgentX is not install
         return native
 
 # Each entry is a role the planner may ask for: the tools it gets and how it is told to work.
+GENERIC_NOTE = (" The tools and file paths named above belong to a different environment. Use the"
+                " tools you actually have, and do the job the instruction describes rather than the"
+                " literal steps.")
+
 ROLE_LIBRARY: dict[str, dict] = {
     # Workspace roles: eligible only when the config exposes the workspace tools, since
     # a role whose tools are all missing is skipped when the planner picks it.
@@ -169,7 +173,14 @@ async def dynamic_topology(config: DynamicTopologyConfig, builder: Builder) -> A
     llm = await builder.get_llm(config.llm_name, wrapper_type=LLMFrameworkEnum.LANGCHAIN)
     available = {str(t) for t in config.tool_names}
     # Offering a role whose tools this config never exposes produces a plan nothing can build.
-    eligible = [n for n, s in ROLE_LIBRARY.items() if any(t in available for t in s["tools"])]
+    # A tool set this library names nothing from -- APEX's MCP tools, say -- leaves nobody eligible,
+    # and the routing choice would then be made over an empty menu and the run silently unmarked.
+    generic = not any(x in available for s in ROLE_LIBRARY.values() for x in s["tools"])
+    if generic:
+        logger.warning("No role names any of the %d offered tools; routing on instructions alone",
+                       len(available))
+    eligible = [n for n, s in ROLE_LIBRARY.items() if any(t in available for t in s["tools"])] \
+        or list(ROLE_LIBRARY)
     catalogue = "\n".join(f"- {name}: {ROLE_LIBRARY[name]['instructions']}" for name in eligible)
     built: set[str] = set()
     coordinators: dict[str, object] = {}
@@ -184,7 +195,13 @@ async def dynamic_topology(config: DynamicTopologyConfig, builder: Builder) -> A
         if spec is None:
             logger.warning("Ignoring unknown role %r", role)
             return None
-        tools = [t for t in spec["tools"] if t in available]
+        tools = [t for t in spec["tools"] if t in available] or (sorted(available) if generic else [])
+        # A role's iteration cap was tuned for the tools it names; on a tool set it does not name,
+        # the library's own longest cap is the only honest choice.
+        iters = max(s["max_iterations"] for s in ROLE_LIBRARY.values()) if generic else spec["max_iterations"]
+        # A brief names the tools and hand-off files of the tool set it was written for; on any other
+        # one those do not exist. Said plainly beats editing the brief, which loses its referents.
+        brief = spec["instructions"] + (GENERIC_NOTE if generic else "")
         if not tools:
             return None
         async with build_lock:
@@ -196,12 +213,12 @@ async def dynamic_topology(config: DynamicTopologyConfig, builder: Builder) -> A
                     tool_names=tools,
                     llm_name=config.llm_name,
                     verbose=config.verbose,
-                    max_iterations=spec["max_iterations"],
+                    max_iterations=iters,
                     handle_tool_errors=True,
                     truncation_retry={'max_retries': 4, 'token_scaling': 1.25},
                     middleware=list(config.role_middleware),
                     description=f"Specialist: {role}",
-                    additional_instructions=spec["instructions"],
+                    additional_instructions=brief,
                 ))
             built.add(role)
             logger.info("Built specialist %s with tools %s", role, tools)

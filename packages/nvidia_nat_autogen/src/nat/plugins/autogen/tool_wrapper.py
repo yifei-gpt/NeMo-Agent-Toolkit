@@ -17,18 +17,22 @@
 import logging
 from collections.abc import AsyncIterator
 from collections.abc import Callable
+from collections.abc import Mapping
 from dataclasses import is_dataclass
 
 # PythonType not available in AutoGen 0.7.4, using Any instead
 from typing import Any
 
+from autogen_core import CancellationToken
 from autogen_core.tools import FunctionTool
 from pydantic import BaseModel
+from pydantic import ValidationError
 from pydantic.dataclasses import dataclass as pydantic_dataclass
 
 from nat.builder.builder import Builder
 from nat.builder.framework_enum import LLMFrameworkEnum
 from nat.builder.function import Function
+from nat.builder.function_base import wrap_flat_input
 from nat.cli.register_workflow import register_tool_wrapper
 from nat.utils.type_utils import DecomposedType
 
@@ -49,6 +53,33 @@ def resolve_type(t: Any) -> Any:
     if resolved.is_optional:
         return resolved.get_optional_type().type
     return resolved.type
+
+
+class NATFunctionTool(FunctionTool):
+    """An AutoGen `FunctionTool` which repairs arguments supplied without their wrapper object."""
+
+    async def run_json(self,
+                       args: Mapping[str, Any],
+                       cancellation_token: CancellationToken,
+                       call_id: str | None = None) -> Any:
+        """Run the tool, retrying once with the arguments wrapped if its own schema rejects them.
+
+        Args:
+            args (Mapping[str, Any]): The arguments the model emitted for the tool.
+            cancellation_token (CancellationToken): A token to cancel the operation if needed.
+            call_id (str | None): An optional identifier for the tool call, used for tracing.
+
+        Returns:
+            Any: The result of running the tool.
+        """
+        try:
+            return await super().run_json(args, cancellation_token, call_id)
+        except ValidationError as e:
+            # AutoGen validates against the model it generates from the signature, so a missing
+            # wrapper is refused here and never reaches the NAT function which could repair it.
+            wrapped = wrap_flat_input(self.args_type(), dict(args), e, self.name)
+
+            return await super().run_json(wrapped.model_dump(), cancellation_token, call_id)
 
 
 @register_tool_wrapper(wrapper_type=LLMFrameworkEnum.AUTOGEN)
@@ -177,7 +208,7 @@ def autogen_tool_wrapper(
     else:
         logger.debug("Creating non-streaming FunctionTool for: %s", name)
         callable_tool = nat_function(func=callable_ainvoke)
-    return FunctionTool(
+    return NATFunctionTool(
         func=callable_tool,
         name=name,
         description=fn.description or "No description provided.",

@@ -29,8 +29,10 @@ def _resolve(rel: str) -> Path:
     parts = Path(rel.strip()).parts
     parts = parts[parts.index(root.name) + 1:] if root.name in parts else tuple(
         x for x in parts if x not in ("/", "", "."))
-    p = root.joinpath(*parts).resolve()
-    if not str(p).startswith(str(root)):
+    # Containment is judged lexically: resolve() would follow a link the workspace itself placed
+    # (worlds are laid out as links into shared read-only data) and read it as an escape.
+    p = Path(os.path.normpath(root.joinpath(*parts)))
+    if p != root and root not in p.parents:
         raise ValueError(f"path escapes workspace: {rel}")
     return p
 
@@ -144,6 +146,97 @@ async def workspace_read(config: WorkspaceReadConfig, builder: Builder) -> Async
         "a long file from where the last call stopped."))
 
 
+def _add_table(doc, rows: list[str]) -> None:
+    cells = [[c.strip() for c in r.strip("|").split("|")] for r in rows]
+    # The `|---|:--:|` rule under a markdown header carries no data, so it must not become a row.
+    cells = [r for r in cells if not all(set(c) <= set("-: ") for c in r)]
+    if not cells:
+        return
+    table = doc.add_table(rows=len(cells), cols=max(len(r) for r in cells))
+    table.style = "Table Grid"
+    for i, row in enumerate(cells):
+        for j, value in enumerate(row):
+            table.cell(i, j).text = value
+
+
+def _write_docx(p: Path, text: str) -> str:
+    """Build a real Word document out of markdown-ish text."""
+    import re
+
+    from docx import Document
+
+    doc = Document()
+    para: list[str] = []
+    rows: list[str] = []
+
+    def flush_para() -> None:
+        if para:
+            doc.add_paragraph(" ".join(para))
+            para.clear()
+
+    def flush_rows() -> None:
+        if rows:
+            _add_table(doc, rows)
+            rows.clear()
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("|") and line.endswith("|"):
+            flush_para()
+            rows.append(line)
+            continue
+        flush_rows()
+        head = re.match(r"(#{1,3})\s+(.+)", line)
+        bullet = re.match(r"([-*+\u2022]|\d+[.)])\s+", line)
+        if head or bullet or not line:
+            flush_para()
+        if head:
+            doc.add_heading(head[2].strip(" #"), level=len(head[1]))
+        elif bullet:
+            doc.add_paragraph(line)
+        elif line:
+            para.append(line)
+    flush_rows()
+    flush_para()
+    doc.save(p)
+    return f"{len(doc.paragraphs)} paragraphs, {len(doc.tables)} tables"
+
+
+def _write_xlsx(p: Path, text: str) -> str:
+    """Build a real Excel workbook out of CSV text."""
+    import csv
+    import io
+
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    # StringIO rather than splitlines(): only a real stream keeps a newline inside a quoted field.
+    for row in csv.reader(io.StringIO(text)):
+        ws.append(row)
+    wb.save(p)
+    return f"{ws.max_row} rows x {ws.max_column} columns"
+
+
+def _write_pptx(p: Path, text: str) -> str:
+    """Build a real PowerPoint deck, one slide per blank-line-separated block."""
+    import re
+
+    from pptx import Presentation
+
+    prs = Presentation()
+    layout = prs.slide_layouts[1]
+    for block in re.split(r"\n[ \t]*\n", text.strip()):
+        lines = [ln.strip().lstrip("#-*\u2022 ").strip() for ln in block.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        slide = prs.slides.add_slide(layout)
+        slide.shapes.title.text = lines[0]
+        slide.placeholders[1].text = "\n".join(lines[1:])
+    prs.save(p)
+    return f"{len(prs.slides)} slides"
+
+
 class WorkspaceWriteConfig(FunctionBaseConfig, name="workspace_write"):
     pass
 
@@ -155,11 +248,30 @@ async def workspace_write(config: WorkspaceWriteConfig, builder: Builder) -> Asy
     async def _run(path: str, content: str) -> str:
         p = _resolve(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
-        return f"wrote {p.relative_to(_root())} ({len(content)} chars)"
+        # Writing "to" a symlink was never meant to edit what it points at; a workspace laid out as
+        # links into a shared read-only world would otherwise reject the write or corrupt the world.
+        if p.is_symlink():
+            p.unlink()
+        build = {".docx": _write_docx, ".xlsx": _write_xlsx, ".pptx": _write_pptx}.get(p.suffix.lower())
+        if build is None:
+            p.write_text(content, encoding="utf-8")
+            return f"wrote {p.relative_to(_root())} ({len(content)} chars)"
+        try:
+            detail = build(p, content)
+        except Exception as exc:  # noqa: BLE001
+            # Saving the text under the Office name instead would look like a delivered file and
+            # score zero at grading time, so the agent has to hear about the failure now.
+            return f"failed to build {p.name}: {exc}. Resend `content` in the shape that extension expects."
+        return f"wrote {p.relative_to(_root())} ({detail})"
 
-    yield FunctionInfo.from_fn(
-        _run, description="Write a file into the workspace. Args: path relative to the root, and content.")
+    yield FunctionInfo.from_fn(_run, description=(
+        "Write a deliverable into the workspace. Args: `path` relative to the root, and `content`. "
+        "The extension picks the format that gets built, so send `content` in the shape it expects: "
+        "`.xlsx` wants CSV text -- header row first, one line per row, fields holding a comma quoted; "
+        "`.docx` wants markdown-ish prose -- a blank line ends a paragraph, a leading `#`, `##` or `###` "
+        "makes a heading of that level, and a run of `| a | b |` rows becomes a real table; "
+        "`.pptx` wants one blank-line-separated block per slide, first line the title and the rest bullets. "
+        "Every other extension is stored as the exact text you send."))
 
 
 class WorkspaceSearchConfig(FunctionBaseConfig, name="workspace_search"):

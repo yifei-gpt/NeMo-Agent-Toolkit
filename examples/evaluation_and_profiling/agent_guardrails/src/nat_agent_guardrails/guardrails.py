@@ -53,9 +53,12 @@ class OutputLimitConfig(FunctionMiddlewareBaseConfig, name="tool_output_limit"):
     """Truncates tool output so a long transcript cannot exceed the context window."""
 
     max_chars: int = Field(default=8000, gt=0, description="Maximum characters returned by an intercepted call")
-    # Per call, the cap says nothing about the transcript: a budget of 80 calls at 20k chars is
-    # 1.6M, well past a 256k-token window, and the run dies mid-way with nothing to show.
-    max_chars_per_run: int = Field(default=600_000, ge=0,
+    # Per call, the cap says nothing about the transcript, and the run then dies mid-way with
+    # nothing to show. Measured on the runs that overflowed a 256k-token window: 260k chars of tool
+    # output (~70k tokens) but 246k input tokens, because every turn resends the whole history --
+    # the agent's own reasoning and the tool schemas dwarf the outputs. So the cap has to sit well
+    # under what the outputs alone would allow.
+    max_chars_per_run: int = Field(default=200_000, ge=0,
                                    description="Total characters of tool output per run; 0 disables")
     notice: str = Field(default="\n...[output truncated; narrow your query to see more]",
                         description="Appended when output is truncated")
