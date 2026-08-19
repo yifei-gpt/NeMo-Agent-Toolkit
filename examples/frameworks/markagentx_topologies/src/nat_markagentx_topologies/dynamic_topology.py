@@ -56,19 +56,22 @@ ROLE_LIBRARY: dict[str, dict] = {
     "workspace_surveyor": {
         "max_iterations": 45,
         "tools": ["workspace_list", "workspace_read", "workspace_write", "workspace_search"],
-        "instructions": ("Reply in at most three sentences and never restate what you were given. ""Survey the workspace, then write what you found to _notes/survey.md with "
+        "instructions": ("Reply in at most three sentences and never restate what you were given. "
+                         "Survey the workspace, then write what you found to _notes/survey.md with "
                          "workspace_write. Reply with one sentence naming that file, never the findings."),
     },
     "workspace_author": {
         "max_iterations": 45,
         "tools": ["workspace_list", "workspace_read", "workspace_write", "workspace_search"],
-        "instructions": ("Reply in at most three sentences and never restate what you were given. ""Read _notes/survey.md first, then write the deliverable with workspace_write "
+        "instructions": ("Reply in at most three sentences and never restate what you were given. "
+                         "Read _notes/survey.md first, then write the deliverable with workspace_write "
                          "under the exact filename the task names. Reply with the filename only."),
     },
     "workspace_auditor": {
         "max_iterations": 45,
         "tools": ["workspace_list", "workspace_read", "workspace_write", "workspace_search"],
-        "instructions": ("Reply in at most three sentences and never restate what you were given. ""Read the deliverable back and rewrite it if a requirement or the format is "
+        "instructions": ("Reply in at most three sentences and never restate what you were given. "
+                         "Read the deliverable back and rewrite it if a requirement or the format is "
                          "missed. Reply with one sentence, never the file contents."),
     },
     # Generic roles: the benchmark supplies helpers under these names, so one library serves
@@ -76,25 +79,35 @@ ROLE_LIBRARY: dict[str, dict] = {
     "drafter": {
         "max_iterations": 12,
         "tools": ["write_draft"],
-        "instructions": ("Reply in at most three sentences and never restate what you were given. ""Send the task to write_draft and return its answer verbatim, in the exact format "
+        "instructions": ("Reply in at most three sentences and never restate what you were given. "
+                         "Send the task to write_draft and return its answer verbatim, in the exact format "
                          "the task demands. Call write_draft once."),
     },
     "critic": {
         "max_iterations": 12,
         "tools": ["list_defects"],
-        "instructions": ("Reply in at most three sentences and never restate what you were given. ""Send the draft to list_defects and report only the concrete defects it names. "
+        "instructions": ("Reply in at most three sentences and never restate what you were given. "
+                         "Send the draft to list_defects and report only the concrete defects it names. "
                          "Never rewrite the answer yourself."),
     },
     "finalizer": {
         "max_iterations": 12,
         "tools": ["emit_final"],
-        "instructions": ("Reply in at most three sentences and never restate what you were given. ""Send the draft and any criticism to emit_final, then reply with its output "
+        "instructions": ("Reply in at most three sentences and never restate what you were given. "
+                         "Send the draft and any criticism to emit_final, then reply with its output "
                          "verbatim and nothing else."),
+    },
+    "code_writer": {
+        "max_iterations": 12,
+        "tools": ["write_code"],
+        "instructions": ("Reply in at most three sentences and never restate what you were given. "
+                         "Send what must be computed to write_code and report what it returns."),
     },
     "entity_researcher": {
         # It is asked for dates, so it gets the clock: one tool leaves it re-searching until the budget goes.
         "tools": ["wikipedia_search", "calculator", "current_datetime"],
-        "instructions": ("Reply in at most three sentences and never restate what you were given. ""Look up one named entity at a time and report the dates, figures and relations "
+        "instructions": ("Reply in at most three sentences and never restate what you were given. "
+                         "Look up one named entity at a time and report the dates, figures and relations "
                          "you find. Do not attempt the wider question."),
         "max_iterations": 8,
     },
@@ -110,7 +123,8 @@ ROLE_LIBRARY: dict[str, dict] = {
     },
     "comparison_analyst": {
         "tools": ["wikipedia_search", "calculator", "current_datetime"],
-        "instructions": ("Reply in at most three sentences and never restate what you were given. ""Compare the quantities the question asks about, gathering any figure you are "
+        "instructions": ("Reply in at most three sentences and never restate what you were given. "
+                         "Compare the quantities the question asks about, gathering any figure you are "
                          "missing before deciding."),
         "max_iterations": 8,
     },

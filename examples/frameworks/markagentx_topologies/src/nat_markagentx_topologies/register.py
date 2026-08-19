@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import crewai_crew_probe  # noqa: F401, pylint: disable=unused-import
 from . import blackboard_topology  # noqa: F401, pylint: disable=unused-import
 from . import cached_wiki  # noqa: F401, pylint: disable=unused-import
-from . import debate_topology  # noqa: F401, pylint: disable=unused-import
+from . import crewai_crew_probe  # noqa: F401, pylint: disable=unused-import
 from . import crewai_probe  # noqa: F401, pylint: disable=unused-import
+from . import debate_topology  # noqa: F401, pylint: disable=unused-import
 from . import dynamic_topology  # noqa: F401, pylint: disable=unused-import
 from . import multi_agent_probes  # noqa: F401, pylint: disable=unused-import
 from . import single_agent_probes  # noqa: F401, pylint: disable=unused-import

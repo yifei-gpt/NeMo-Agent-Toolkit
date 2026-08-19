@@ -83,6 +83,11 @@ ROLE_LIBRARY: dict[str, dict] = {
         "brief": "Send the draft and any criticism to emit_final and record its answer.",
         "max_iterations": 12,
     },
+    "code_writer": {
+        "tools": ["write_code"],
+        "brief": "Send what must be computed to write_code and record what it returns.",
+        "max_iterations": 12,
+    },
     "entity_researcher": {
         # All three, as dynamic_topology already learned: a single tool leaves a
         # specialist re-searching until the budget goes, and records no choice at all.
@@ -129,6 +134,8 @@ class BlackboardTopologyConfig(FunctionBaseConfig, name="blackboard_topology"):
     llm_name: LLMRef = Field(description="Model for the planner, the specialists and the composer")
     tool_names: list[FunctionRef] = Field(default_factory=list, description="Tools the specialists may use")
     max_roles: int = Field(default=3, ge=1, description="Most specialists to staff for one question")
+    role_middleware: list[str] = Field(default_factory=list,
+                                       description="Middleware every specialist carries")
     brief: str = Field(default="", description="What the task set asks of any agent working it")
     max_record_chars: int = Field(default=6000, description="Cap on the shared record handed to each turn")
     verbose: bool = Field(default=False, description="Verbose agent logging")
@@ -203,6 +210,7 @@ async def blackboard_topology(config: BlackboardTopologyConfig,
                                                 verbose=config.verbose,
                                                 max_iterations=iters,
                                                 handle_tool_errors=True,
+                                                middleware=list(config.role_middleware),
                                                 # What the task set asks of anyone, then what this
                                                 # role is for: dynamic_topology already does both.
                                                 additional_instructions=" ".join(

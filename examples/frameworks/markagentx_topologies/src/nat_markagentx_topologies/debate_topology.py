@@ -51,6 +51,8 @@ class DebateTopologyConfig(FunctionBaseConfig, name="debate_topology"):
     llm_name: LLMRef = Field(description="Model for both analysts")
     judge_llm_name: LLMRef = Field(description="Model that rules on the exchange")
     tool_names: list[FunctionRef] = Field(default_factory=list, description="Tools both analysts may use")
+    role_middleware: list[str] = Field(default_factory=list,
+                                       description="Middleware every specialist carries")
     brief: str = Field(default="", description="What the task set asks of any agent working it")
     rounds: int = Field(default=1, ge=0, description="Rebuttal rounds after the opening answers")
     max_iterations: int = Field(default=10, description="Tool-call cap per analyst turn")
@@ -75,6 +77,7 @@ async def debate_topology(config: DebateTopologyConfig, builder: Builder) -> Asy
                                         verbose=config.verbose,
                                         max_iterations=config.max_iterations,
                                         handle_tool_errors=True,
+                                        middleware=list(config.role_middleware),
                                         additional_instructions=config.brief or None,
                                         description=f"Debate analyst {side.upper()}"))
 
