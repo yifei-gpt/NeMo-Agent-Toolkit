@@ -48,6 +48,8 @@ class ChatCompletionConfig(FunctionBaseConfig, name="chat_completion"):
                                description="The system prompt to use for chat completion.")
 
     llm_name: LLMRef = Field(description="The LLM to use for generating responses.")
+    # The register code already reads this via getattr; without the field pydantic silently drops it.
+    description: str = Field(default="Chat completion", description="What callers are told this tool does.")
 
 
 def _messages_to_langchain_messages(

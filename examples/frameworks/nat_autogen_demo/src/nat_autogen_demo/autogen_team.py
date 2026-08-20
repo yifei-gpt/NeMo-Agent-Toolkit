@@ -37,8 +37,6 @@ class AutoGenFunctionConfig(FunctionBaseConfig, name="autogen_team"):
     query_processing_agent_instructions: str = Field(description="Instructions for the query processing agent")
     final_response_agent_name: str = Field(description="Name of the final response agent")
     final_response_agent_instructions: str = Field(description="Instructions for the final response agent")
-    # A literal 5 capped every run at five tool calls whatever the task asked for.
-    max_tool_iterations: int = Field(default=20, description="Tool calls the query agent may make in a turn")
 
 
 @register_function(config_type=AutoGenFunctionConfig, framework_wrappers=[LLMFrameworkEnum.AUTOGEN])
@@ -84,7 +82,7 @@ async def autogen_team(config: AutoGenFunctionConfig, builder: Builder) -> Async
                     system_message=config.query_processing_agent_instructions,
                     # Enable agent to make multiple sequential tool calls in one turn
                     reflect_on_tool_use=True,
-                    max_tool_iterations=config.max_tool_iterations,
+                    max_tool_iterations=5,  # Allow up to 5 tool call iterations
                 )
                 final_response_agent = AssistantAgent(
                     name=config.final_response_agent_name,
