@@ -6,3 +6,16 @@ ipython
 plotly
 pydantic
 pyuwsgi==2.0.*
+# A shell-capable baseline opens spreadsheets, documents and images; without these the agent can
+# read a task's files but not the formats the task ships them in.
+matplotlib
+openpyxl
+python-docx
+python-pptx
+requests
+scikit-learn
+pillow
+tabulate
+beautifulsoup4
+lxml
+pypdf
