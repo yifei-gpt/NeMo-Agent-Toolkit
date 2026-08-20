@@ -134,12 +134,15 @@ examples = [
   "nat_alert_triage_agent",
   "nat_autogen_demo",
   "nat_automated_description_generation",
+  "nat_cached_wikipedia",
   "nat_claude_code_agent_adapter",
   "nat_codex_agent_adapter",
   "nat_cursor_agent_adapter",
+  "nat_debate_topology",
   "nat_dpo_tic_tac_toe",
   "nat_documentation_guides",
   "nat_email_phishing_analyzer",
+  "nat_framework_probes",
   "nat_haystack_deep_research_agent",
   "nat_hermes_agent_adapter",
   "nat_hybrid_control_flow",
@@ -162,6 +165,7 @@ examples = [
   "nat_semantic_kernel_demo",
   "nat_sequential_executor",
   "nat_service_account_auth_mcp",
+  "nat_staffed_topologies",
   "nat_simple_auth",
   "nat_simple_auth_mcp",
   "nat_simple_calculator",
@@ -271,13 +275,16 @@ nat_agno_personal_finance = { path = "examples/frameworks/agno_personal_finance"
 nat_agents_examples = { path = "examples/agents", editable = true }
 nat_alert_triage_agent = { path = "examples/advanced_agents/alert_triage_agent", editable = true }
 nat_autogen_demo = { path = "examples/frameworks/nat_autogen_demo", editable = true }
+nat_cached_wikipedia = { path = "examples/custom_functions/cached_wikipedia", editable = true }
 nat_automated_description_generation = { path = "examples/custom_functions/automated_description_generation", editable = true }
 nat_claude_code_agent_adapter = { path = "examples/experimental/claude_code_agent_adapter", editable = true }
 nat_codex_agent_adapter = { path = "examples/experimental/codex_agent_adapter", editable = true }
 nat_cursor_agent_adapter = { path = "examples/experimental/cursor_agent_adapter", editable = true }
+nat_debate_topology = { path = "examples/advanced_agents/debate_topology", editable = true }
 nat_dpo_tic_tac_toe = { path = "examples/finetuning/dpo_tic_tac_toe", editable = true }
 nat_documentation_guides = { path = "examples/documentation_guides", editable = true }
 nat_email_phishing_analyzer = { path = "examples/evaluation_and_profiling/email_phishing_analyzer", editable = true }
+nat_framework_probes = { path = "examples/frameworks/framework_probes", editable = true }
 nat_haystack_deep_research_agent = { path = "examples/frameworks/haystack_deep_research_agent", editable = true }
 nat_hermes_agent_adapter = { path = "examples/experimental/hermes_agent_adapter", editable = true }
 nat_hybrid_control_flow = { path = "examples/control_flow/hybrid_control_flow", editable = true }
@@ -300,6 +307,7 @@ nat_router_agent = { path = "examples/control_flow/router_agent", editable = tru
 nat_semantic_kernel_demo = { path = "examples/frameworks/semantic_kernel_demo", editable = true }
 nat_sequential_executor = { path = "examples/control_flow/sequential_executor", editable = true }
 nat_service_account_auth_mcp = { path = "examples/MCP/service_account_auth_mcp", editable = true }
+nat_staffed_topologies = { path = "examples/advanced_agents/staffed_topologies", editable = true }
 nat_simple_auth = { path = "examples/front_ends/simple_auth", editable = true }
 nat_simple_auth_mcp = { path = "examples/MCP/simple_auth_mcp", editable = true }
 nat_simple_calculator = { path = "examples/getting_started/simple_calculator", editable = true }

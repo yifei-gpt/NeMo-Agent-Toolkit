@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import os
 from typing import Literal
 
 from pydantic import BaseModel
@@ -52,23 +53,44 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
     sandbox = get_sandbox(sandbox_type=config.sandbox_type, **sandbox_kwargs)
     logger.info(f"[DEBUG] Created sandbox of type: {config.sandbox_type}")
 
+    def _in_workspace(code: str) -> str:
+        # The sandbox starts in its own container directory, so an unqualified write lands somewhere
+        # the agent can never read back while the tool still reports success.
+        root = os.environ.get("NAT_WORKSPACE_DIR")
+        # umask too: the sandbox runs as root, and a 644 file it leaves behind is one the workspace
+        # tools can then never rewrite.
+        # No try: a workspace the sandbox cannot enter must fail loudly, not run in the container.
+        return code if not root else (f"import os\nos.umask(0)\nos.chdir({root!r})\n" + code)
+
     async def _execute_code(generated_code: str) -> dict:
         logger.info("Executing code in the sandbox at %s", config.uri)
         try:
             output = await sandbox.execute_code(
-                generated_code=generated_code,
+                generated_code=_in_workspace(generated_code),
                 language="python",
                 timeout_seconds=config.timeout,
                 max_output_characters=config.max_output_characters,
             )
         except Exception as e:
             logger.exception("Error when executing code in the sandbox, %s", e)
-            return {"process_status": "error", "stdout": "", "stderr": str(e)}
+            output = {"process_status": "error", "stdout": "", "stderr": str(e)}
+        # A silently absent sandbox is worse than a loud one: the agent answers from memory instead.
+        if output.get("process_status") == "error":
+            output["stdout"] = ("THE SANDBOX DID NOT RUN THIS CODE. Do not answer from your own "
+                                "arithmetic -- retry, use another tool, or report the failure.")
+        text = output.get("stdout") or ""
+        cap = config.max_output_characters
+        if output.get("process_status") == "timeout" and not text:
+            output["stdout"] = ("No output: the sandbox times out when a single run prints more than "
+                                "about 60000 characters. Print a summary, not the whole thing.")
+        elif len(text) > cap:
+            output["stdout"] = text[:cap] + f"\n... {len(text) - cap} more characters, print less"
         return output
 
     yield FunctionInfo.from_fn(
         fn=_execute_code,
         input_schema=CodeExecutionInputSchema,
-        description="""Executes the provied 'generated_code' in a python sandbox environment and returns
-        a dictionary containing stdout, stderr, and the execution status, as well as a session_id. The
-        session_id can be used to append to code that was previously executed.""")
+        description="""Runs `generated_code` as python and returns its stdout, stderr and status.
+        Print what you want to see -- nothing is returned otherwise, and no variable survives to the
+        next call. The workspace is the working directory, so relative paths read and write the same
+        files the workspace tools see.""")

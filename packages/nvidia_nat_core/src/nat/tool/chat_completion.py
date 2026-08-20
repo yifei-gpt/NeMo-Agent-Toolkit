@@ -60,6 +60,10 @@ def _messages_to_langchain_messages(
     from langchain_core.messages.utils import convert_to_messages
 
     message_dicts = [m.model_dump() for m in nat_messages]
+    # A history with no user turn is rejected by the server, and the error comes back as an apology
+    # the agent then treats as the draft it asked for.
+    if message_dicts and not any(d.get("role") == "user" for d in message_dicts):
+        message_dicts[-1] = {**message_dicts[-1], "role": "user"}
     has_system = any(d.get("role") == "system" for d in message_dicts)
     if not has_system and system_prompt:
         message_dicts = [{"role": "system", "content": system_prompt}] + message_dicts
