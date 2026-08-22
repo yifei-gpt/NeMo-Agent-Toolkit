@@ -16,6 +16,7 @@
 only those are built with `Builder.add_function`, and a coordinator delegates."""
 
 import asyncio
+import hashlib
 import logging
 from collections.abc import AsyncGenerator
 
@@ -90,8 +91,12 @@ async def dynamic_topology(config: DynamicTopologyConfig, builder: Builder) -> A
     # Questions are evaluated concurrently, so every add_function call is serialised.
     build_lock = asyncio.Lock()
 
-    async def _ensure_role(role: str) -> str | None:
-        """Builds a specialist on first use; later questions reuse the same instance."""
+    async def _ensure_role(role: str, task: str = "") -> str | None:
+        """Builds a specialist for the task it will work on; the same task reuses it.
+
+        A specialist used to see only what the coordinator wrote to it, and a paraphrase drops
+        exactly what these tasks are scored on -- which quarter, which percentage, which file.
+        """
         # A method may return a name never on the menu; losing one specialist beats a KeyError.
         spec = library.get(role)
         if spec is None:
@@ -103,13 +108,21 @@ async def dynamic_topology(config: DynamicTopologyConfig, builder: Builder) -> A
         # Briefs name tools of the set they were written for; saying so beats editing them per set.
         brief = " ".join(x for x in (config.brief, spec["instructions"]) if x) \
             + (GENERIC_NOTE if generic else "")
+        if task:
+            # The whole task, not a summary of it, and the shared directory that lets the
+            # specialists hand work to each other instead of through the coordinator's retelling.
+            brief += ("\n\nThe task in full, as it was given:\n" + task
+                      + "\n\nYou share a working directory with the other specialists. Read what "
+                        "they have already left there before repeating their work, and write what "
+                        "you produce to a file, naming it in your reply.")
         if not tools:
             return None
+        named = f"{role}__{hashlib.sha256(task.encode()).hexdigest()[:8]}" if task else role
         async with build_lock:
-            if role in built:
-                return role
+            if named in built:
+                return named
             await builder.add_function(
-                role,
+                named,
                 ToolCallAgentWorkflowConfig(
                     tool_names=tools,
                     llm_name=config.llm_name,
@@ -121,9 +134,9 @@ async def dynamic_topology(config: DynamicTopologyConfig, builder: Builder) -> A
                     description=f"Specialist: {role}",
                     additional_instructions=brief,
                 ))
-            built.add(role)
-            logger.info("Built specialist %s with tools %s", role, tools)
-        return role
+            built.add(named)
+            logger.info("Built specialist %s with tools %s", named, tools)
+        return named
 
     async def _run(inputs: str) -> str:
         plan = await llm.ainvoke([
@@ -133,7 +146,7 @@ async def dynamic_topology(config: DynamicTopologyConfig, builder: Builder) -> A
         # The widest choice this workflow makes, so it is offered for marking; unmarked keeps the plan.
         prompt = PLANNER_PROMPT.format(roles=catalogue, question=inputs, limit=config.max_roles)
         picked = pick_staff(list(dict.fromkeys(roles)), eligible, prompt)
-        chosen = [r for r in [await _ensure_role(role) for role in dict.fromkeys(picked)] if r]
+        chosen = [r for r in [await _ensure_role(role, inputs) for role in dict.fromkeys(picked)] if r]
         logger.info("Question routed to %s", chosen)
 
         # An unbuildable plan once yielded "", scoring as wrong instead of failure; answer directly.
@@ -150,6 +163,8 @@ async def dynamic_topology(config: DynamicTopologyConfig, builder: Builder) -> A
                         tool_names=chosen,
                         llm_name=config.llm_name,
                         verbose=config.verbose,
+                        # Not scaled by the number of specialists: given the room, this
+                        # coordinator spends it asking one of them forty-seven times.
                         max_iterations=config.coordinator_max_iterations,
                         handle_tool_errors=True,
                         truncation_retry={'max_retries': 4, 'token_scaling': 1.25},
