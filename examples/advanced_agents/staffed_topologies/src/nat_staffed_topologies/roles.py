@@ -29,6 +29,25 @@ ROLE_LIBRARY: dict[str, dict] = {'workspace_surveyor': {'tools': ['workspace_lis
                                         'to _notes/survey.md with workspace_write. Reply with one '
                                         'sentence naming that file, never the findings.',
                         'brief': 'Survey the files the task gives you and record what each one holds.'},
+ 'web_researcher': {'tools': ['web_search', 'web_fetch', 'web_find',
+                              'workspace_write', 'workspace_read'],
+                    'max_iterations': 40,
+                    'instructions': 'Reply in at most three sentences and never restate what you '
+                                    'were given. Search, open the pages worth opening, and use '
+                                    'web_find to reach the passage inside them -- opening a source '
+                                    'and reading the part that matters are different acts. Record '
+                                    'what you found, with its URL, to _notes/web.md with '
+                                    'workspace_write. Reply with one sentence naming that file.',
+                    'brief': 'Find on the web what the task asks about, and record each finding '
+                             'with the URL it came from.'},
+ 'fact_checker': {'tools': ['web_search', 'web_fetch', 'web_find',
+                            'workspace_read', 'workspace_write'],
+                  'max_iterations': 30,
+                  'instructions': 'Reply in at most three sentences and never restate what you '
+                                  'were given. Take the claims already on the record and check '
+                                  'each against its source, naming any that the source does not '
+                                  'support. Write the verdicts to _notes/checked.md.',
+                  'brief': 'Check the claims already recorded against the sources they cite.'},
  'workspace_author': {'tools': ['workspace_list',
                                 'workspace_read',
                                 'workspace_write',

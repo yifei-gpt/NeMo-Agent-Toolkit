@@ -48,7 +48,9 @@ TURN_PROMPT = ("Question: {question}\n\n"
                "Shared record so far:\n{record}\n\n"
                "You are the {role}. {brief} Add only what is missing; do not repeat what is "
                "already recorded. Use your tools to establish what you report -- never answer "
-               "from the task text alone -- then give your findings in one short paragraph.")
+               "from the task text alone -- then report what you found in full: the figures, "
+               "dates and names themselves, each with the file or URL it came from. A summary "
+               "is what the record loses; the specifics are what the answer is judged on.")
 
 COMPOSE_PROMPT = ("Question: {question}\n\n"
                   "Shared record from the team:\n{record}\n\n"
@@ -121,6 +123,27 @@ async def blackboard_topology(config: BlackboardTopologyConfig,
                 logger.info("Built specialist %s with tools %s", role, tools)
         return built[role]
 
+    async def _composer():
+        """The one that writes the answer, with the tools to check what it writes."""
+        tools = [t for t in ("workspace_list", "workspace_read", "workspace_search",
+                             "web_fetch", "web_find") if t in available]
+        if not tools:
+            return None
+        async with build_lock:
+            if "__composer" not in built:
+                built["__composer"] = await builder.add_function(
+                    "bb_composer",
+                    ToolCallAgentWorkflowConfig(
+                        tool_names=tools, llm_name=config.llm_name, verbose=config.verbose,
+                        max_iterations=30, handle_tool_errors=True,
+                        middleware=list(config.role_middleware),
+                        additional_instructions=(
+                            config.brief + " You write the answer. The record names what the team "
+                            "found; open the files and pages behind it to get the figures exactly "
+                            "right, and cover every part the question asks."),
+                        description="Writes the final answer from the shared record"))
+        return built["__composer"]
+
     async def _run(inputs: str) -> str:
         plan = await llm.ainvoke(
             [HumanMessage(content=PLANNER_PROMPT.format(roles=catalogue, question=inputs, limit=config.max_roles))])
@@ -149,6 +172,15 @@ async def blackboard_topology(config: BlackboardTopologyConfig,
 
         shared = "\n\n".join(record)[-config.max_record_chars:] or "(empty)"
         prompt = COMPOSE_PROMPT.format(question=inputs, record=shared, brief=config.brief)
+        # The record is what the specialists could fit into a reply; the files and pages they
+        # worked from still hold the rest, so whoever writes the answer is given the means to
+        # go back to them rather than reconstructing from a summary.
+        composer = await _composer()
+        if composer is not None:
+            try:
+                return str(await composer.acall_invoke(prompt))
+            except Exception as exc:  # noqa: BLE001 -- an answer from the record beats no answer
+                logger.warning("Composer failed (%s); answering from the record alone", exc)
         final = await llm.ainvoke([HumanMessage(content=prompt)])
         return str(getattr(final, "content", final))
 
