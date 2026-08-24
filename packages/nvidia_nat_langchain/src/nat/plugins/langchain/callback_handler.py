@@ -175,6 +175,15 @@ class LangchainProfilerHandler(AsyncCallbackHandler, BaseProfilerCallback):
                                        reasoning_tokens=reasoning_tokens)
         return TokenUsageBaseModel()
 
+    def _snapshot(self, value):
+        """A defensive copy of what is published, made only when something is listening.
+
+        These payloads carry the whole message history, and it is copied several times per step,
+        so the cost grows with the conversation: with no exporter attached it was over half of
+        this process's CPU, spent on values that reached no subscriber.
+        """
+        return copy.deepcopy(value) if self.step_manager.has_subscribers() else value
+
     async def on_llm_start(self, serialized: dict[str, Any], prompts: list[str], **kwargs: Any) -> None:
 
         model_name = ""
@@ -191,7 +200,7 @@ class LangchainProfilerHandler(AsyncCallbackHandler, BaseProfilerCallback):
                                         name=model_name,
                                         UUID=run_id,
                                         data=StreamEventData(input=prompts[-1]),
-                                        metadata=TraceMetadata(chat_inputs=copy.deepcopy(prompts)),
+                                        metadata=TraceMetadata(chat_inputs=self._snapshot(prompts)),
                                         usage_info=UsageInfo(token_usage=TokenUsageBaseModel(),
                                                              num_llm_calls=1,
                                                              seconds_between_calls=int(time.time() -
@@ -224,13 +233,16 @@ class LangchainProfilerHandler(AsyncCallbackHandler, BaseProfilerCallback):
         run_id = str(run_id)
         self._run_id_to_model_name[run_id] = model_name
 
+        # One snapshot, used twice: the whole message history was being deep-copied twice per
+        # call, and it grows with the conversation.
+        chat_input = self._snapshot(messages[0])
         stats = IntermediateStepPayload(
             event_type=IntermediateStepType.LLM_START,
             framework=LLMFrameworkEnum.LANGCHAIN,
             name=model_name,
             UUID=run_id,
-            data=StreamEventData(input=copy.deepcopy(messages[0])),
-            metadata=TraceMetadata(chat_inputs=copy.deepcopy(messages[0]),
+            data=StreamEventData(input=chat_input),
+            metadata=TraceMetadata(chat_inputs=chat_input,
                                    tools_schema=_extract_tools_schema(kwargs.get("invocation_params", {}))),
             usage_info=UsageInfo(token_usage=TokenUsageBaseModel(),
                                  num_llm_calls=1,
@@ -359,8 +371,8 @@ class LangchainProfilerHandler(AsyncCallbackHandler, BaseProfilerCallback):
                                         name=serialized.get("name", ""),
                                         UUID=str(run_id),
                                         data=StreamEventData(input=input_str),
-                                        metadata=TraceMetadata(tool_inputs=copy.deepcopy(inputs),
-                                                               tool_info=copy.deepcopy(serialized)),
+                                        metadata=TraceMetadata(tool_inputs=self._snapshot(inputs),
+                                                               tool_info=self._snapshot(serialized)),
                                         usage_info=UsageInfo(token_usage=TokenUsageBaseModel()))
 
         self.step_manager.push_intermediate_step(stats)
@@ -382,16 +394,16 @@ class LangchainProfilerHandler(AsyncCallbackHandler, BaseProfilerCallback):
         run_id_str = str(run_id)
         start_time = time.time()
         name = _extract_run_name(serialized, fallback=kwargs.get("name", ""))
-        chain_inputs = copy.deepcopy(inputs)
+        chain_inputs = self._snapshot(inputs)
 
         stats = IntermediateStepPayload(event_type=IntermediateStepType.FUNCTION_START,
                                         framework=LLMFrameworkEnum.LANGCHAIN,
                                         name=name,
                                         UUID=run_id_str,
-                                        tags=copy.deepcopy(tags),
-                                        data=StreamEventData(input=chain_inputs, payload=copy.deepcopy(serialized)),
+                                        tags=self._snapshot(tags),
+                                        data=StreamEventData(input=chain_inputs, payload=self._snapshot(serialized)),
                                         metadata=TraceMetadata(span_inputs=chain_inputs,
-                                                               provided_metadata=copy.deepcopy(metadata)),
+                                                               provided_metadata=self._snapshot(metadata)),
                                         usage_info=UsageInfo(token_usage=TokenUsageBaseModel()))
 
         self.step_manager.push_intermediate_step(stats)
@@ -415,7 +427,7 @@ class LangchainProfilerHandler(AsyncCallbackHandler, BaseProfilerCallback):
     ) -> None:
 
         run_id_str = str(run_id)
-        chain_outputs = copy.deepcopy(outputs)
+        chain_outputs = self._snapshot(outputs)
         chain_input = self._run_id_to_chain_input.get(run_id_str, "")
         chain_name = self._run_id_to_chain_name.get(run_id_str, kwargs.get("name", ""))
         chain_start_time = self._run_id_to_start_time.get(run_id_str, time.time())
@@ -425,7 +437,7 @@ class LangchainProfilerHandler(AsyncCallbackHandler, BaseProfilerCallback):
                                         framework=LLMFrameworkEnum.LANGCHAIN,
                                         name=chain_name,
                                         UUID=run_id_str,
-                                        tags=copy.deepcopy(tags),
+                                        tags=self._snapshot(tags),
                                         metadata=TraceMetadata(span_outputs=chain_outputs),
                                         usage_info=UsageInfo(token_usage=TokenUsageBaseModel()),
                                         data=StreamEventData(input=chain_input,

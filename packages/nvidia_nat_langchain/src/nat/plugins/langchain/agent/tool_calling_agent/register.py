@@ -81,6 +81,10 @@ class ToolCallAgentWorkflowConfig(AgentBaseConfig, name="tool_calling_agent"):
     input parameters to select the optimal tool.  Supports handling tool errors.
     """
     description: str = Field(default="Tool Calling Agent Workflow", description="Description of this functions use.")
+    # Off unless a task set asks for it: some tasks are answerable without looking anything up.
+    min_tool_rounds: int = Field(default=0,
+                                 description="Push back once if the agent answers with fewer than "
+                                             "this many tool rounds; 0 never pushes back")
     tool_names: list[FunctionRef | FunctionGroupRef] = Field(
         default_factory=list, description="The list of tools to provide to the tool calling agent.")
     handle_tool_errors: bool = Field(default=True, description="Specify ability to handle tool calling errors.")
@@ -139,6 +143,9 @@ async def tool_calling_agent_workflow(config: ToolCallAgentWorkflowConfig, build
         max_truncation_retries=config.truncation_retry.max_retries,
         truncation_scaling_fn=config.truncation_retry.build_scaling_fn(),
         max_empty_response_retries=config.max_empty_response_retries,
+        # One turn short of the limit, so the closing answer has somewhere to happen.
+        max_tool_rounds=max(1, config.max_iterations - 1),
+        min_tool_rounds=config.min_tool_rounds,
     ).build_graph()
 
     async def _response_fn(chat_request_or_message: ChatRequestOrMessage) -> str:

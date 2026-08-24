@@ -55,6 +55,11 @@ class ReWOOAgentWorkflowConfig(AgentBaseConfig, name="rewoo_agent"):
                                                description="The number of retries before raising a tool call error.",
                                                ge=1)
     max_history: int = Field(default=15, description="Maximum number of messages to keep in the conversation history.")
+    solver_max_tool_rounds: int = Field(
+        default=0, ge=0,
+        description="Tool rounds the solver may take after the plan has run. Zero is the paper's "
+                    "solver, which answers from evidence and cannot act; a task that names a file "
+                    "to produce needs more than that, because the plan is fixed before any tool ran")
     additional_planner_instructions: str | None = Field(
         default=None,
         validation_alias=AliasChoices("additional_planner_instructions", "additional_instructions"),
@@ -121,7 +126,8 @@ async def rewoo_agent_workflow(config: ReWOOAgentWorkflowConfig, builder: Builde
         detailed_logs=config.verbose,
         log_response_max_chars=config.log_response_max_chars,
         tool_call_max_retries=config.tool_call_max_retries,
-        raise_tool_call_error=config.raise_tool_call_error).build_graph()
+        raise_tool_call_error=config.raise_tool_call_error,
+        solver_max_tool_rounds=config.solver_max_tool_rounds).build_graph()
 
     async def _response_fn(chat_request_or_message: ChatRequestOrMessage) -> ChatResponse | str:
         """

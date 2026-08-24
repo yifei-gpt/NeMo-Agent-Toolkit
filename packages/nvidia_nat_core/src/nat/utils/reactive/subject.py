@@ -47,6 +47,13 @@ class Subject(Observable[T], Observer[T], SubjectBase[T]):
         self._observers: list[Observer[T]] = []
         self._disposed = False
 
+    @property
+    def has_observers(self) -> bool:
+        """Whether anything is listening. A producer that must copy what it publishes can skip
+        the copy when the value is going nowhere."""
+        with self._lock:
+            return bool(self._observers) and not self._disposed
+
     # ==========================================================================
     # Observable[T] - for consumers
     # ==========================================================================

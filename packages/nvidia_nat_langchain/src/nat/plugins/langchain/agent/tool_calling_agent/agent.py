@@ -19,6 +19,7 @@ import typing
 from langchain_core.callbacks.base import AsyncCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
+from langchain_core.messages import HumanMessage
 from langchain_core.messages import AIMessageChunk
 from langchain_core.messages import SystemMessage
 from langchain_core.messages import ToolMessage
@@ -47,6 +48,17 @@ if typing.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+_WARN_AT = 0.7
+_LOOK_FIRST = ("You have not consulted any source yet. Use the tools to check what the task asks "
+               "about before you answer -- an answer recalled from memory is the wrong one often "
+               "enough that it is not worth giving.")
+_LOW = ("You have used {used} of your {total} turns. Bring what you have to a finished state and "
+        "write the answer or the deliverable now; do not start anything you cannot complete.")
+_CLOSING = ("You have used all of your tool calls. Do not call any more tools. Write your "
+            "final answer now, in full, from what you have already gathered -- state what you "
+            "found, and say plainly which parts you could not verify.")
+
+
 class ToolCallAgentGraphState(BaseModel):
     """State schema for the Tool Calling Agent Graph"""
     messages: list[BaseMessage] = Field(default_factory=list)  # input and output of the Agent
@@ -70,6 +82,8 @@ class ToolCallAgentGraph(DualNodeAgent):
         max_truncation_retries: int = 0,
         truncation_scaling_fn: typing.Callable[[int], int] | None = None,
         max_empty_response_retries: int = 0,
+        max_tool_rounds: int | None = None,
+        min_tool_rounds: int = 0,
     ):
         super().__init__(llm=llm,
                          tools=tools,
@@ -99,6 +113,13 @@ class ToolCallAgentGraph(DualNodeAgent):
             )
 
         self.agent = prompt_runnable | self.bound_llm
+        # The same agent with nothing to call. An agent out of turns still holds everything it
+        # gathered, and a bound tool schema is an invitation to spend a turn it does not have.
+        self.closing_agent = prompt_runnable | llm
+        self.max_tool_rounds = max_tool_rounds
+        self._warned_low = False
+        self.min_tool_rounds = min_tool_rounds
+        self._pushed_back = False
         self.tool_caller = ToolNode(tools, handle_tool_errors=handle_tool_errors)
         self.return_direct = [tool.name for tool in return_direct] if return_direct else []
 
@@ -106,11 +127,15 @@ class ToolCallAgentGraph(DualNodeAgent):
         self._truncation_retries_remaining: int = max_truncation_retries
         self._truncation_scaling_fn: typing.Callable[[int], int] = truncation_scaling_fn or (lambda c: c + 1024)
         self._current_max_tokens: int | None = getattr(llm, "max_tokens", None)
+        # Measured: a run that truncated once recovered on the first retry and scored; one that
+        # truncated three times never recovered and spent its wall clock generating. Truncating at
+        # 16k means the model is rambling, and more room does not stop that.
+        self._truncation_ceiling: int = int((self._current_max_tokens or 8192) * 1.25)
         self._max_empty_response_retries: int = max_empty_response_retries
 
         logger.debug("%s Initialized Tool Calling Agent Graph", AGENT_LOG_PREFIX)
 
-    async def _invoke_llm(self, state: ToolCallAgentGraphState):
+    async def _invoke_llm(self, state: ToolCallAgentGraphState, closing: bool = False):
         """Stream the LLM and return the accumulated AIMessage response.
 
         Args:
@@ -125,7 +150,8 @@ class ToolCallAgentGraph(DualNodeAgent):
         # Use astream so LangGraph's stream_mode="messages" can observe individual LLM tokens.
         # Config is inherited from LangGraph's context, preserving streaming callbacks.
         chunks: list[AIMessageChunk] = []
-        async for chunk in self.agent.astream({"messages": state.messages}):
+        runnable = self.closing_agent if closing else self.agent
+        async for chunk in runnable.astream({"messages": state.messages}):
             chunks.append(chunk)
         if not chunks:
             raise RuntimeError('No response received from agent')
@@ -140,7 +166,27 @@ class ToolCallAgentGraph(DualNodeAgent):
             if len(state.messages) == 0:
                 raise RuntimeError('No input received in state: "messages"')
 
-            response = await self._invoke_llm(state)
+            # Out of turns is not the same as having nothing to say: asked once more with no
+            # tools bound, the agent writes what it found instead of the graph raising.
+            rounds = sum(1 for message in state.messages if getattr(message, "tool_calls", None))
+            closing = bool(self.max_tool_rounds) and rounds >= self.max_tool_rounds
+            if closing:
+                state.messages = state.messages + [HumanMessage(content=_CLOSING)]
+            elif (self.max_tool_rounds and not self._warned_low
+                  and rounds >= self.max_tool_rounds * _WARN_AT):
+                # Once, while there is still room to act on it: told only at the limit, a run
+                # stops mid-task with everything it gathered unwritten.
+                self._warned_low = True
+                state.messages = state.messages + [HumanMessage(
+                    content=_LOW.format(used=rounds, total=self.max_tool_rounds))]
+            response = await self._invoke_llm(state, closing=closing)
+            # Asked once, and only where the task set says looking things up is the job: a run
+            # that answered with zero lookups got the surname right and the first name wrong.
+            if (self.min_tool_rounds and not self._pushed_back and not closing
+                    and rounds < self.min_tool_rounds and not getattr(response, "tool_calls", None)):
+                self._pushed_back = True
+                state.messages = state.messages + [HumanMessage(content=_LOOK_FIRST)]
+                response = await self._invoke_llm(state)
 
             if isinstance(response, AIMessageChunk):
                 response = _chunk_to_message(response)
@@ -268,7 +314,10 @@ class ToolCallAgentGraph(DualNodeAgent):
 
         while self._truncation_retries_remaining > 0:
             self._truncation_retries_remaining -= 1
-            new_limit: int = self._truncation_scaling_fn(self._current_max_tokens)
+            # Capped: unbounded 1.25x growth asked for 32000 tokens on the fourth try, and the
+            # model spent half an hour generating them before the run's wall clock ended it.
+            new_limit: int = min(self._truncation_scaling_fn(self._current_max_tokens),
+                                 self._truncation_ceiling)
             retries_used: int = self._max_truncation_retries - self._truncation_retries_remaining
 
             logger.warning(
@@ -299,8 +348,17 @@ class ToolCallAgentGraph(DualNodeAgent):
                 return response
 
         usage = self._get_token_usage(response or first_response)
+        # A run that gathered its evidence and then ran long writing it up has an answer worth
+        # grading; raising here threw away the work and scored the whole task zero.
+        last = response or first_response
+        logger.warning("%s Output still truncated after %d retries (last max_tokens=%s, "
+                       "output_tokens=%s); keeping what was written.", AGENT_LOG_PREFIX,
+                       self._max_truncation_retries, self._current_max_tokens,
+                       usage.get("output_tokens", "N/A"))
+        if last is not None and getattr(last, "content", None):
+            return last
         raise RuntimeError(f"LLM output still truncated after {self._max_truncation_retries} retries "
-                           f"(last max_tokens={self._current_max_tokens}). "
+                           f"(last max_tokens={self._current_max_tokens}) and nothing was written. "
                            f"output_tokens={usage.get('output_tokens', 'N/A')}, "
                            f"input_tokens={usage.get('input_tokens', 'N/A')}, "
                            f"total_tokens={usage.get('total_tokens', 'N/A')}")

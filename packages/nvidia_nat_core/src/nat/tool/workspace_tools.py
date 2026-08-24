@@ -7,8 +7,10 @@ import logging
 import os
 import tempfile
 import subprocess
+import time
 import sys
 from collections.abc import AsyncGenerator
+from collections import OrderedDict
 from pathlib import Path
 
 from pydantic import Field
@@ -50,15 +52,31 @@ _PDF_CHILD = ("import sys, pdfplumber\n"
               "    sys.stdout.write('\\n'.join((p.extract_text() or '') for p in pdf.pages[:40]))\n")
 
 
+# A PDF that could not be parsed cannot be parsed the next time either, and each attempt costs
+# the full timeout. Two workspace runs spent their wall clock re-parsing the same broken file.
+_PDF_REFUSED: dict[tuple[str, int, float], None] = {}
+# Successful extractions too: a second search over the same tree re-parsed 1950 PDFs from scratch.
+_EXTRACTED: "OrderedDict[tuple[str, int, float], str | None]" = OrderedDict()
+_EXTRACT_CACHE_MAX = 4000
+
+
 def _pdf_text(p: Path) -> str | None:
+    try:
+        stamp = (str(p), p.stat().st_size, p.stat().st_mtime)
+    except OSError:
+        stamp = (str(p), -1, -1.0)
+    if stamp in _PDF_REFUSED:
+        return None
     try:
         done = subprocess.run([sys.executable, "-c", _PDF_CHILD, str(p)],
                               capture_output=True, timeout=60, check=False)
     except subprocess.TimeoutExpired:
         logger.warning("PDF %s took over 60s to parse and was skipped", p.name)
+        _PDF_REFUSED[stamp] = None
         return None
     if done.returncode != 0:
         logger.warning("PDF %s could not be parsed (exit %s)", p.name, done.returncode)
+        _PDF_REFUSED[stamp] = None
         return None
     return done.stdout.decode("utf-8", "ignore").strip() or None
 
@@ -66,6 +84,22 @@ def _pdf_text(p: Path) -> str | None:
 def _extract(p: Path) -> str | None:
     """Text from a workspace file, or None: Office formats are zipped XML read via the stdlib;
     reading them as UTF-8 yields mojibake that floods the context window."""
+    try:
+        stamp = (str(p), p.stat().st_size, p.stat().st_mtime)
+    except OSError:
+        stamp = None
+    if stamp is not None and stamp in _EXTRACTED:
+        _EXTRACTED.move_to_end(stamp)
+        return _EXTRACTED[stamp]
+    text = _extract_uncached(p)
+    if stamp is not None:
+        _EXTRACTED[stamp] = text
+        while len(_EXTRACTED) > _EXTRACT_CACHE_MAX:
+            _EXTRACTED.popitem(last=False)
+    return text
+
+
+def _extract_uncached(p: Path) -> str | None:
     import re
     import zipfile
 
@@ -299,6 +333,10 @@ async def workspace_write(config: WorkspaceWriteConfig, builder: Builder) -> Asy
 
 class WorkspaceSearchConfig(FunctionBaseConfig, name="workspace_search"):
     max_hits: int = Field(default=60, description="Cap on returned matching lines")
+    # max_hits bounds the answer, not the work: a query that matches nothing still opened every
+    # PDF in the tree. One workspace holds 1950 of them and the scan measured 81 minutes.
+    max_seconds: float = Field(default=90.0, description="Wall clock one search may spend scanning")
+    max_documents: int = Field(default=250, description="Documents whose text may be extracted per search")
 
 
 @register_function(config_type=WorkspaceSearchConfig)
@@ -313,9 +351,17 @@ async def workspace_search(config: WorkspaceSearchConfig, builder: Builder) -> A
         if not base.is_dir():
             return f"not a directory: {subdir}"
         hits: list[str] = []
+        started, opened, seen, skipped = time.time(), 0, 0, 0
         for p in sorted(base.rglob("*")):
             if not p.is_file() or (path_contains and path_contains.lower() not in str(p).lower()):
                 continue
+            seen += 1
+            costly = p.suffix.lower() in {".pdf", ".docx", ".xlsx", ".pptx"}
+            if costly and (opened >= config.max_documents
+                           or time.time() - started > config.max_seconds):
+                skipped += 1
+                continue
+            opened += costly
             text = _extract(p)
             if text is None:
                 continue
@@ -327,7 +373,12 @@ async def workspace_search(config: WorkspaceSearchConfig, builder: Builder) -> A
                         # Past the cap the agent needs a narrower query, not an arbitrary prefix.
                         return ("\n".join(hits[:config.max_hits]) +
                                 f"\n... more than {config.max_hits} matches; narrow the query.")
-        return "\n".join(hits) if hits else f"(no line contains {query!r})"
+        # Said, not hidden: a truncated scan that reads as "no matches" sends the agent away
+        # from the file it was looking for.
+        note = (f"\n[scanned {seen - skipped} of {seen} files in {time.time() - started:.0f}s; "
+                f"{skipped} documents were left unopened -- narrow with subdir= or path_contains=]"
+                if skipped else "")
+        return ("\n".join(hits) + note) if hits else (f"(no line contains {query!r})" + note)
 
     yield FunctionInfo.from_fn(_run, description=(
         "Search workspace file contents for a string and return matching lines with their paths. "

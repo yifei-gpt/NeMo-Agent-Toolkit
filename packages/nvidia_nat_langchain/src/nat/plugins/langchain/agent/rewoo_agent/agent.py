@@ -91,7 +91,8 @@ class ReWOOAgentGraph(BaseAgent):
                  detailed_logs: bool = False,
                  log_response_max_chars: int = 1000,
                  tool_call_max_retries: int = 3,
-                 raise_tool_call_error: bool = True):
+                 raise_tool_call_error: bool = True,
+                 solver_max_tool_rounds: int = 0):
         super().__init__(llm=llm,
                          tools=tools,
                          callbacks=callbacks,
@@ -116,6 +117,10 @@ class ReWOOAgentGraph(BaseAgent):
         self.tools_dict = {tool.name: tool for tool in tools}
         self.tool_call_max_retries = tool_call_max_retries
         self.raise_tool_call_error = raise_tool_call_error
+        # Zero keeps the paper's solver, which answers from the plan's evidence and cannot act. A
+        # task that names a file to produce needs the value first and the write after, which a plan
+        # written before any tool ran cannot order -- three self-test sets delivered nothing at all.
+        self.solver_max_tool_rounds = solver_max_tool_rounds
 
         logger.debug("%s Initialized ReWOO Agent Graph", AGENT_LOG_PREFIX)
 
@@ -178,12 +183,24 @@ class ReWOOAgentGraph(BaseAgent):
             for step in steps if step.evidence and step.evidence.placeholder
         }
 
+        def _referenced(step: ReWOOPlanStep) -> list[str]:
+            """Which earlier evidences this step needs, by token or by the prose name planners write.
+
+            A missed edge is worse than a missed substitution: the step is levelled first and runs
+            before the value it wanted exists, so nothing is there to substitute later.
+            """
+            text = str(step.evidence.tool_input)
+            found = [var for var in _REWOO_PLACEHOLDER_PATTERN.findall(text) if var in evidences]
+            for key in evidences:
+                bare = key.lstrip("#")
+                if key not in found and bare and re.search(
+                        rf"\b[A-Za-z][A-Za-z0-9_]*_{re.escape(bare)}\b|\b{re.escape(bare)}\b", text):
+                    found.append(key)
+            return [var for var in dict.fromkeys(found) if var != step.evidence.placeholder]
+
         # Second pass: find dependencies now that we have all placeholders
         dependencies = {
-            step.evidence.placeholder: [
-                var for var in _REWOO_PLACEHOLDER_PATTERN.findall(str(step.evidence.tool_input))
-                if var in evidences and var != step.evidence.placeholder
-            ]
+            step.evidence.placeholder: _referenced(step)
             for step in steps if step.evidence and step.evidence.placeholder
         }
 
@@ -231,8 +248,21 @@ class ReWOOAgentGraph(BaseAgent):
             if tool_input in replacements:
                 return copy.deepcopy(replacements[tool_input])
 
-            return _REWOO_PLACEHOLDER_PATTERN.sub(lambda match: str(replacements.get(match.group(0), match.group(0))),
-                                                  tool_input)
+            replaced = _REWOO_PLACEHOLDER_PATTERN.sub(
+                lambda match: str(replacements.get(match.group(0), match.group(0))), tool_input)
+            # Planners name a placeholder in prose as often as they write the token, and only the
+            # token substitutes -- one run delivered a file holding CALCULATED_TOTAL_FROM_E2.
+            for key, value in replacements.items():
+                bare = key.lstrip("#")
+                if not bare or key in replaced:
+                    continue
+                loose = re.sub(rf"\b[A-Za-z][A-Za-z0-9_]*_{re.escape(bare)}\b|\b{re.escape(bare)}\b",
+                               lambda _match: str(value), replaced)
+                if loose != replaced:
+                    logger.warning("%s ReWOO plan referred to %s by name rather than by token; "
+                                   "substituted it anyway", AGENT_LOG_PREFIX, key)
+                    replaced = loose
+            return replaced
 
         return tool_input
 
@@ -503,9 +533,11 @@ class ReWOOAgentGraph(BaseAgent):
 
             task = str(state.task.content)
             solver_prompt = self.solver_prompt.partial(plan=plan)
-            solver = solver_prompt | self.llm
-
-            output_message = await self._stream_llm(solver, {"task": task})
+            if not self.solver_max_tool_rounds:
+                solver = solver_prompt | self.llm
+                output_message = await self._stream_llm(solver, {"task": task})
+            else:
+                output_message = await self._solve_with_tools(solver_prompt, task)
 
             if self.detailed_logs:
                 solver_output_log_message = AGENT_CALL_LOG_MESSAGE % (task, str(output_message.content))
@@ -516,6 +548,44 @@ class ReWOOAgentGraph(BaseAgent):
         except Exception as ex:
             logger.error("%s Failed to call solver_node: %s", AGENT_LOG_PREFIX, ex)
             raise
+
+    async def _solve_with_tools(self, solver_prompt: ChatPromptTemplate, task: str) -> AIMessage:
+        """Answer from the evidence, with the tools to act on what it turned out to be.
+
+        The plan is fixed before any tool runs, so a deliverable it did not think to write is one
+        nothing else will. Bounded: past the last round the tools come off and an answer is due.
+        """
+        messages: list[BaseMessage] = list(solver_prompt.format_messages(task=task))
+        # The solver prompt tells it to answer from evidence, so bound tools alone leave it
+        # answering: it has to be told the plan is done and acting is now its job.
+        messages.append(HumanMessage(content=(
+            "The plan has finished; its results are above. You now have the tools yourself. "
+            "If the task asks for a file, WRITE IT NOW with a tool -- the plan could not, because it "
+            "was fixed before any of these values existed. Check with a tool that what you wrote is "
+            "there, then answer and name the file. If nothing needs writing, just answer.")))
+        bound = self.llm.bind_tools(list(self.tools_dict.values()))
+        for spent in range(self.solver_max_tool_rounds):
+            reply = await bound.ainvoke(messages, config={"callbacks": self.callbacks})
+            calls = getattr(reply, "tool_calls", None)
+            if not calls:
+                return reply
+            messages.append(reply)
+            for call in calls:
+                tool = self._get_tool(call["name"])
+                if tool is None:
+                    content = f"no such tool: {call['name']}"
+                else:
+                    try:
+                        content = str(await tool.ainvoke(call.get("args") or {}))
+                    except Exception as exc:  # a tool's failure is the solver's to work around
+                        content = f"{type(exc).__name__}: {exc}"
+                messages.append(ToolMessage(content=content, tool_call_id=call.get("id", "")))
+            logger.info("%s ReWOO solver acted, round %d of %d", AGENT_LOG_PREFIX,
+                        spent + 1, self.solver_max_tool_rounds)
+        # Out of rounds is not out of things to say: asked once more with no tools bound.
+        messages.append(HumanMessage(content="Do not call any more tools. Answer now, and name the "
+                                             "file holding any deliverable the task asked for."))
+        return await self.llm.ainvoke(messages, config={"callbacks": self.callbacks})
 
     async def conditional_edge(self, state: ReWOOGraphState):
         try:

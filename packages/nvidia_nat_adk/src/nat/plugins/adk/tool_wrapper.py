@@ -34,6 +34,21 @@ from nat.cli.register_workflow import register_tool_wrapper
 logger = logging.getLogger(__name__)
 
 
+def _is_text(annotation: Any) -> bool:
+    """Whether this field is declared as a string -- `str`, or an optional/union of it.
+
+    A `list[str]` is not text: its JSON form is what the model must send, so it still decodes.
+    """
+    import types
+    import typing
+    if annotation is str:
+        return True
+    if typing.get_origin(annotation) in (typing.Union, types.UnionType):
+        args = [a for a in typing.get_args(annotation) if a is not type(None)]
+        return bool(args) and all(a is str for a in args)
+    return False
+
+
 def resolve_type(t: Any) -> Any:
     """Return the non-None member of a Union/PEP 604 union;
     otherwise return the type unchanged.
@@ -119,10 +134,19 @@ def google_adk_tool_wrapper(
                 continue
             if not value.lstrip()[:1] in ("{", "["):
                 continue
+            # A field declared as text keeps the text. Decoding it turned a message that merely
+            # began with "{" into a mapping, and the schema then read it as two inputs at once:
+            # "Either messages or input_message must be provided, not both".
+            if _is_text(fields[key].annotation):
+                continue
             try:
                 out[key] = json.loads(value)
             except json.JSONDecodeError:
                 pass                      # a string that merely looks like JSON stays a string
+        # A one-of schema shows the model both fields, and it fills both: "Either messages or
+        # input_message must be provided, not both". The plain string is what a tool call means.
+        if out.get("messages") is not None and out.get("input_message") is not None:
+            out.pop("messages")
         return out
 
     async def callable_ainvoke(*args: Any, **kwargs: Any) -> Any:
