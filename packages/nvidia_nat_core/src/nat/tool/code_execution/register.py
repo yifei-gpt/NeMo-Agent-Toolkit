@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import os
 from typing import Literal
@@ -59,11 +60,31 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
         root = os.environ.get("NAT_WORKSPACE_DIR")
         # umask too: the sandbox runs as root, and a 644 file it leaves behind is one the workspace
         # tools can then never rewrite.
+        # A container sandbox already starts where the task lives and accepts shell as well as
+        # python; a host chdir prepended there is both the wrong path and the wrong language.
+        # Only a bridge the harness actually opened counts: the placeholder set for config
+        # validation would otherwise skip the chdir and claim a container session that is not there.
+        bridge = os.environ.get("MARKAGENTX_BRIDGE_URL") if os.environ.get("MARKAGENTX_BRIDGE_READY") else None
+        if not root or bridge:
+            logger.info("sandbox preamble off (root=%s bridge=%s uri=%s)", bool(root), bridge, config.uri)
+            return code
         # No try: a workspace the sandbox cannot enter must fail loudly, not run in the container.
-        return code if not root else (f"import os\nos.umask(0)\nos.chdir({root!r})\n" + code)
+        return f"import os\nos.umask(0)\nos.chdir({root!r})\n" + code
+
+    def _record(code: str, output: dict | None) -> None:
+        """What the agent actually submitted, when asked for. The decision journal records which
+        tool was chosen and never the code, and that is where a stuck or mistaken run hides."""
+        trail = os.environ.get("MARKAGENTX_CODE_LOG")
+        if not trail:
+            return
+        entry = {"code": code[:800]} if output is None else {
+            "status": output.get("process_status"), "out": str(output.get("stdout", ""))[:400]}
+        with open(trail, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry) + "\n")
 
     async def _execute_code(generated_code: str) -> dict:
         logger.info("Executing code in the sandbox at %s", config.uri)
+        _record(generated_code, None)
         try:
             output = await sandbox.execute_code(
                 generated_code=_in_workspace(generated_code),
@@ -73,12 +94,21 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
             )
         except Exception as e:
             logger.exception("Error when executing code in the sandbox, %s", e)
-            output = {"process_status": "error", "stdout": "", "stderr": str(e)}
+            output = {"process_status": "unreachable", "stdout": "", "stderr": str(e)}
+        _record("", output)
         # A silently absent sandbox is worse than a loud one: the agent answers from memory instead.
-        if output.get("process_status") == "error":
+        # Only when nothing ran, though: the sandbox reports "error" for code that raised, and that
+        # code has usually printed real results first -- telling the agent they never happened
+        # throws away the work and is untrue.
+        if output.get("process_status") == "unreachable":
             output["stdout"] = ("THE SANDBOX DID NOT RUN THIS CODE. Do not answer from your own "
                                 "arithmetic -- retry, use another tool, or report the failure.")
         text = output.get("stdout") or ""
+        # The traceback is what tells the agent which line to fix; without it the failure is mute.
+        if output.get("process_status") == "error":
+            tail = str(output.get("stderr") or "").strip()[-600:]
+            text = (text + "\n\n[the run raised after this output]\n" + tail).strip()
+            output["stdout"] = text
         cap = config.max_output_characters
         if output.get("process_status") == "timeout" and not text:
             output["stdout"] = ("No output: the sandbox times out when a single run prints more than "
@@ -90,7 +120,12 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
     yield FunctionInfo.from_fn(
         fn=_execute_code,
         input_schema=CodeExecutionInputSchema,
-        description="""Runs `generated_code` as python and returns its stdout, stderr and status.
+        description=("Runs `generated_code` in the task's own container and returns its stdout, "
+                     "stderr and status. A shell command line works as well as python -- send "
+                     "whichever suits the step. The session persists, so a directory you enter "
+                     "and a file you write are still there on the next call."
+                     if os.environ.get("MARKAGENTX_BRIDGE_READY") else
+                     """Runs `generated_code` as python and returns its stdout, stderr and status.
         Print what you want to see -- nothing is returned otherwise, and no variable survives to the
         next call. The workspace is the working directory, so relative paths read and write the same
-        files the workspace tools see.""")
+        files the workspace tools see."""))

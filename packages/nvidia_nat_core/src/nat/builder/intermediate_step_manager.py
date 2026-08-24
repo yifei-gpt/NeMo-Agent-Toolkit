@@ -63,6 +63,10 @@ class IntermediateStepManager:
         IntermediateStepManager._instance_count += 1
         IntermediateStepManager._active_instances.add(weakref.ref(self, self._cleanup_instance_tracking))
 
+    def has_subscribers(self) -> bool:
+        """Whether any exporter is consuming this stream."""
+        return bool(getattr(self._context_state.event_stream.get(), "has_observers", True))
+
     def push_intermediate_step(self, payload: IntermediateStepPayload) -> None:
         """
         Pushes an intermediate step to the NAT Event Stream

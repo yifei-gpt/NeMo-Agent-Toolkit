@@ -228,7 +228,10 @@ async def web_fetch_cached(tool_config: WebFetchConfig, builder: Builder):
                 return True, _as_text(answer.text, tool_config.max_chars)
         except Exception as exc:  # noqa: BLE001
             logger.warning("web fetch failed for %s: %s", url[:80], exc)
-            return False, f"Could not read {url} ({type(exc).__name__})."
+            # Said plainly, because the common cause is a guessed URL and the agent otherwise
+            # guesses a second one instead of searching for the real address.
+            return False, (f"Could not read {url} ({type(exc).__name__}). If you guessed this "
+                           "address, call web_search for the page instead of guessing again.")
 
     async def _read_page(url: str) -> str:
         url = url.strip()

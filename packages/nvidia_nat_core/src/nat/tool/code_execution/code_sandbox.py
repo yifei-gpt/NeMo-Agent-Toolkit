@@ -207,8 +207,11 @@ class LocalSandbox(Sandbox):
         POTENTIAL_PREFIXES = ["python"]
         actual_code = actual_code.strip().strip("`")
         for prefix in POTENTIAL_PREFIXES:
-            if actual_code.startswith(prefix):
-                actual_code = actual_code[len(prefix):]
+            # A fence tag sits alone on its line; `python3 -c ...` is a command, and trimming the
+            # word from it left `3 -c ...`, which the shell answered with "3: command not found".
+            rest = actual_code[len(prefix):]
+            if actual_code.startswith(prefix) and (not rest or rest[0] == "\n"):
+                actual_code = rest
                 break
 
         # Send the user's code directly to our server without any wrapper logic

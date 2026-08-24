@@ -78,6 +78,11 @@ class _RunState:
         self.results: OrderedDict[str, Any] = OrderedDict()
         self.totals: dict[str, int] = defaultdict(int)
         self.last_key: str | None = None
+        # Said once per run: a second warning is noise on every later observation.
+        self.warned: bool = False
+
+
+_RUNS: "OrderedDict[str, _RunState]" = OrderedDict()
 
 
 class RepeatBreakerMiddleware(FunctionMiddleware):
@@ -86,7 +91,10 @@ class RepeatBreakerMiddleware(FunctionMiddleware):
     def __init__(self, config: RepeatBreakerMiddlewareConfig) -> None:
         super().__init__()
         self._config = config
-        self._runs: OrderedDict[str, _RunState] = OrderedDict()
+        # Shared, not per instance: one middleware object is built per function that names it, so
+        # a per-instance counter gave a fifteen-agent workflow fifteen separate "per run" budgets.
+        # A run made 266 calls against a limit of 100 without one notice firing.
+        self._runs = _RUNS
 
     def _run_state(self) -> _RunState:
         # Counting per workflow run keeps one question's repeats from affecting the next.
@@ -116,14 +124,36 @@ class RepeatBreakerMiddleware(FunctionMiddleware):
             return self._config.budget_notice
         return None
 
-    def _repeated(self, state: _RunState, key: str) -> bool:
+    def _budget_warning(self, state: _RunState) -> str | None:
+        """Said once, while there is still room to act on it. Told only at exhaustion, a run spends
+        everything gathering and then has nothing left to write the answer with."""
+        limit = self._config.max_calls_per_run
+        share = self._config.warn_at_fraction
+        if not limit or not share or state.warned:
+            return None
+        spent = state.totals[_RUN_TOTAL]
+        if spent < limit * share:
+            return None
+        state.warned = True
+        return self._config.warning.format(spent=spent, total=limit)
+
+    def _repeated(self, state: _RunState, key: str) -> int:
         # Only back-to-back repeats are loops; after a different call, state may have changed.
         consecutive, state.last_key = state.last_key == key, key
         # Re-inserting keeps a hot repeat loop at the young end, so eviction never resets it.
         count = (state.seen.pop(key, 0) + 1) if consecutive else 1
         state.seen[key] = count
         _evict(state.seen, _MAX_KEYS_PER_RUN)
-        return count > self._config.max_repeats
+        return count
+
+    def _loop_reply(self, state: _RunState, key: str, over: int) -> str:
+        """A reply that changes with the count, because an identical one is what sustains the loop."""
+        if over >= self._config.max_loop_replies:
+            return self._config.budget_notice
+        if over == 1 and key in state.results:
+            return f"{state.results[key]}\n\n[{self._config.notice}]"
+        return (f"{self._config.notice} That was repeat {over} of the same call and its result "
+                f"will not change, so repeating it again cannot move the task forward.")
 
     def _remember(self, state: _RunState, key: str, result: Any) -> None:
         # Oversized results are dropped rather than cached; a miss only costs the notice below.
@@ -140,13 +170,18 @@ class RepeatBreakerMiddleware(FunctionMiddleware):
             return spent
 
         key = self._key(context.name, args, kwargs)
-        if self._repeated(state, key):
-            logger.info("Broke repeat loop on %s", context.name)
-            # Hand back the cached result: a bare notice leaves nothing, so the caller burns a retry.
-            return state.results.get(key, self._config.notice)
+        repeats = self._repeated(state, key)
+        over = repeats - self._config.max_repeats
+        if over > 0:
+            # An agent that ignores every escalation would otherwise spin out the whole wall clock.
+            if over >= self._config.max_loop_replies * self._config.hard_stop_multiple:
+                raise ToolBudgetExceeded(f"{context.name} was called identically {repeats} times in a row")
+            logger.info("Broke repeat loop on %s (%d in a row)", context.name, repeats)
+            return self._loop_reply(state, key, over)
         result = await call_next(*args, **kwargs)
         self._remember(state, key, result)
-        return result
+        warning = self._budget_warning(state)
+        return f"{result}\n\n[{warning}]" if warning and isinstance(result, str) else result
 
     async def function_middleware_stream(self, *args: Any, call_next: CallNextStream,
                                          context: FunctionMiddlewareContext,
@@ -158,10 +193,14 @@ class RepeatBreakerMiddleware(FunctionMiddleware):
             yield spent
             return
 
-        if self._repeated(state, self._key(context.name, args, kwargs)):
-            logger.info("Broke repeat loop on %s", context.name)
+        over = self._repeated(state, self._key(context.name, args, kwargs)) - self._config.max_repeats
+        if over > 0:
             # Replaying a stream would mean buffering every chunk, so a repeat gets the notice.
-            yield self._config.notice
+            logger.info("Broke repeat loop on %s", context.name)
+            yield self._loop_reply(state, "", over)
             return
         async for chunk in call_next(*args, **kwargs):
             yield chunk
+        warning = self._budget_warning(state)
+        if warning:
+            yield f"\n\n[{warning}]"
