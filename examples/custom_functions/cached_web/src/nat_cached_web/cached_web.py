@@ -18,6 +18,7 @@ billable call. Every answer is cached by its query: a marked run and its unmarke
 the same web when they ask the same thing, which is what makes a utility comparison a comparison.
 """
 import asyncio
+import fcntl
 import hashlib
 import json
 import logging
@@ -49,6 +50,63 @@ _STRIP = [
     (re.compile(r"[ \t\r\f\v]+"), " "),
     (re.compile(r"\n\s*\n\s*\n+"), "\n\n"),
 ]
+
+
+async def _ask(question: str, key: str, want: int, url: str) -> list[dict] | None:
+    """The provider's rows as (title, url, text), or None when it could not be reached at all."""
+    try:
+        async with httpx.AsyncClient(timeout=45.0) as client:
+            answer = await client.post(url, headers={"X-API-KEY": key},
+                                       json={"q": question, "num": want})
+            answer.raise_for_status()
+            body = answer.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("web search failed for %r: %s", question[:60], exc)
+        return None
+    rows = []
+    # The direct answer when the provider has one: the whole failure this replaced was results
+    # that were about the subject without carrying what was asked.
+    if box := body.get("answerBox"):
+        text = box.get("answer") or box.get("snippet") or ""
+        if text:
+            rows.append({"title": box.get("title") or "answer", "url": box.get("link", ""),
+                         "text": text})
+    rows += [{"title": r.get("title", ""), "url": r.get("link", ""), "text": r.get("snippet", "")}
+             for r in (body.get("organic") or [])]
+    return rows[:want]
+
+
+def _key_from(path: str) -> str:
+    try:
+        return Path(path).expanduser().read_text().strip()
+    except OSError:
+        return ""
+
+
+async def _pace(directory: Path, interval: float) -> None:
+    """Hold the whole machine to one live call per `interval`.
+
+    The asyncio lock beside this one covers a single process, and a sweep runs dozens: the rate
+    upstream saw was that many times what any one of them intended, and four of five engines
+    answered with a CAPTCHA or a 429 for the rest of the day.
+    """
+    if interval <= 0:
+        return
+    gate = directory / ".pace"
+    for _ in range(600):
+        with open(gate, "a+") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                fh.seek(0)
+                last = float(fh.read().strip() or 0)
+                wait = last + interval - time.time()
+                if wait <= 0:
+                    fh.seek(0), fh.truncate()
+                    fh.write(str(time.time()))
+                    return
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+        await asyncio.sleep(min(wait, interval))
 
 
 def _cache(directory: Path, key: str) -> Path:
@@ -116,9 +174,17 @@ def _from_pdf(raw: bytes, limit: int) -> str:
 
 
 class WebSearchConfig(FunctionBaseConfig, name="web_search_cached"):
-    """Web search through a self-hosted SearxNG, memoized on disk."""
+    """Web search through a keyed API, memoized on disk.
 
-    base_url: str = Field(default="http://127.0.0.1:8888", description="SearxNG base URL")
+    A self-hosted metasearch stood here and was removed: seven of its eight engines refuse this
+    host -- four on the first request we ever sent, so it is the address and not our rate -- and
+    the one that answered returned landing pages. Over six questions with known answers it carried
+    the answer none of six times. An agent handed python.org for "Python 3.0 release year" rewords
+    the question, and that is the loop, so a search that cannot answer now says so instead.
+    """
+
+    key_file: str = Field(default="~/.config/markagentx/serper.key", description="API key file")
+    api_url: str = Field(default="https://google.serper.dev/search", description="Search endpoint")
     cache_dir: str = Field(description="Directory holding cached query results")
     max_results: int = Field(default=8, description="Results to return per query")
     max_chars_per_result: int = Field(default=400, description="Truncate each snippet here")
@@ -132,25 +198,22 @@ async def web_search_cached(tool_config: WebSearchConfig, builder: Builder):
     lock = asyncio.Lock()
 
     async def _fetch(question: str) -> tuple[bool, str]:
-        params = {"q": question, "format": "json", "safesearch": 0}
-        try:
-            async with httpx.AsyncClient(headers={"User-Agent": _USER_AGENT}, timeout=45.0) as client:
-                answer = await client.get(tool_config.base_url.rstrip("/") + "/search", params=params)
-                answer.raise_for_status()
-                found = answer.json().get("results", [])
-        except Exception as exc:  # noqa: BLE001 -- any failure to answer means the same thing
-            logger.warning("web search failed for %r: %s", question[:60], exc)
-            return False, f"Web search is unavailable right now ({type(exc).__name__})."
-        if not found:
+        key = _key_from(tool_config.key_file)
+        if not key:
+            return False, ("Web search is not configured on this machine; work from what you have "
+                           "and say which parts you could not look up.")
+        rows = await _ask(question, key, tool_config.max_results, tool_config.api_url)
+        if rows is None:
+            return False, "Web search is unavailable right now; try again later or work without it."
+        if not rows:
             return False, _NO_RESULTS + question
-        lines = []
-        for index, row in enumerate(found[: tool_config.max_results], 1):
-            snippet = " ".join((row.get("content") or "").split())[: tool_config.max_chars_per_result]
-            lines.append(f"[{index}] {row.get('title', '')}\n    {row.get('url', '')}\n    {snippet}")
-        return True, "\n".join(lines)
+        return True, "\n".join(
+            f"[{i}] {r['title']}\n    {r['url']}\n    "
+            + " ".join(r["text"].split())[: tool_config.max_chars_per_result]
+            for i, r in enumerate(rows, 1))
 
     async def _search(question: str) -> str:
-        question = " ".join(question.split())[:400]
+        question = " ".join(question.split())[:400]  # noqa: E501
         path = _cache(directory, f"search|v1|{question}|{tool_config.max_results}")
         cached = _read(path)
         if cached is not None:
@@ -160,9 +223,9 @@ async def web_search_cached(tool_config: WebSearchConfig, builder: Builder):
             cached = _read(path)
             if cached is not None:
                 return cached
+            await _pace(directory, tool_config.min_request_interval_s)
             ok, result = await _fetch(question)
             _write(path, question, ok, result)
-            await asyncio.sleep(tool_config.min_request_interval_s)
         return result
 
     yield FunctionInfo.from_fn(
@@ -264,9 +327,9 @@ async def web_fetch_cached(tool_config: WebFetchConfig, builder: Builder):
             async with lock:
                 page = _read(path)
                 if page is None:
+                    await _pace(directory, tool_config.min_request_interval_s)
                     ok, page = await _fetch(url)
                     _write(path, url, ok, page)
-                    await asyncio.sleep(tool_config.min_request_interval_s)
         return _window(page, offset, tool_config.max_chars, tool_config.store_chars)
 
     yield FunctionInfo.from_fn(
