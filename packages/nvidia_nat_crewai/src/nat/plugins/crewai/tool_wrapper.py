@@ -37,7 +37,28 @@ def crewai_tool_wrapper(name: str, fn: Function, builder: Builder):
 
         return asyncio.run_coroutine_threadsafe(runnable(*args, **kwargs), loop).result()
 
+    _let_repeats_through()
     # CrewAI caches every result by its arguments, so a repeated call never reaches the function
     # and the loop breaker behind it never sees the repeat -- the agent asks forever.
     return Tool(name=name, description=fn.description or "", args_schema=fn.input_schema,
                 func=wrapper, cache_function=lambda *_a, **_k: False)
+
+
+def _let_repeats_through() -> None:
+    """CrewAI answers a repeat of the last call with one constant sentence and never runs the tool,
+    so the breaker behind it never sees the repeat and the constant reply is itself a fixed point.
+
+    A patch rather than a constructor flag because CrewAI exposes no switch for this one, and
+    measured rather than assumed: turning it off again put 50 of one run's calls back outside the
+    guard. Two guards where the first returns a constant are worse than one that escalates.
+    """
+    try:
+        from crewai.tools.tool_usage import ToolUsage
+    except Exception:  # noqa: BLE001 -- a crewai without it needs no patch
+        return
+    if getattr(ToolUsage._check_tool_repeated_usage, "_markagentx", False):
+        return
+    def _never(self, calling):  # noqa: ANN001, ARG001
+        return False
+    _never._markagentx = True
+    ToolUsage._check_tool_repeated_usage = _never

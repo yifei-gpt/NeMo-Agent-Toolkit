@@ -84,15 +84,20 @@ def _page_key(url: str, store: int) -> str:
     return f"fetch|v2|{url}|{store}"
 
 
-def _window(page: str, offset: int, width: int) -> str:
+def _window(page: str, offset: int, width: int, store: int = 0) -> str:
     """One slice of a page, told plainly enough that the next slice is asked for, not re-fetched."""
     offset = max(0, int(offset or 0))
+    # A document that filled the store was itself cut, and paging to its end still never reaches
+    # what was dropped: agents walked 22 windows of a 240k JSON array for a date that was not in it.
+    cut = ("\n[this document was longer than this tool keeps and was cut at "
+           f"{store} characters, so what you are looking for may not be in it at all]"
+           if store and len(page) >= store else "")
     if offset >= len(page):
-        return f"Nothing at offset {offset}; this page is {len(page)} characters long."
+        return f"Nothing at offset {offset}; this page is {len(page)} characters long.{cut}"
     end = min(offset + width, len(page))
     tail = (f"\n\n[characters {offset}-{end} of {len(page)}; call web_fetch again with "
             f"offset={end} to read on]" if end < len(page) else "")
-    return page[offset:end] + tail
+    return page[offset:end] + tail + cut
 
 
 def _from_pdf(raw: bytes, limit: int) -> str:
@@ -262,7 +267,7 @@ async def web_fetch_cached(tool_config: WebFetchConfig, builder: Builder):
                     ok, page = await _fetch(url)
                     _write(path, url, ok, page)
                     await asyncio.sleep(tool_config.min_request_interval_s)
-        return _window(page, offset, tool_config.max_chars)
+        return _window(page, offset, tool_config.max_chars, tool_config.store_chars)
 
     yield FunctionInfo.from_fn(
         _read_page,

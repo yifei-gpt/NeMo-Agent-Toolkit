@@ -5,6 +5,7 @@
 
 import logging
 import os
+import re
 import tempfile
 import subprocess
 import time
@@ -29,6 +30,11 @@ def _root() -> Path:
     if not os.environ.get("NAT_WORKSPACE_DIR"):
         os.environ["NAT_WORKSPACE_DIR"] = tempfile.mkdtemp(prefix="nat_workspace_")
     return Path(os.environ["NAT_WORKSPACE_DIR"]).resolve()
+
+
+def _bare(step: str) -> str:
+    """A step as text: agents send them bulleted, numbered, or already boxed."""
+    return re.sub(r"^[-*\d.)\s]*(\[[ xX-]\])?\s*", "", step.strip())
 
 
 def _resolve(rel: str) -> Path:
@@ -318,11 +324,18 @@ async def workspace_write(config: WorkspaceWriteConfig, builder: Builder) -> Asy
             p.unlink()
         build = {".docx": _write_docx, ".xlsx": _write_xlsx, ".pptx": _write_pptx}.get(p.suffix.lower())
         if build is None:
+            # Said at the moment the lines go: a description telling the agent to prefer
+            # workspace_edit moved 1 framework in 4, and the loss is silent otherwise.
+            before = p.read_text(encoding="utf-8", errors="ignore").count("\n") + 1 if p.is_file() else 0
             try:
                 p.write_text(content, encoding="utf-8")
             except OSError as exc:
                 return f"could not write {path}: {exc.strerror or exc}."
-            return f"wrote {p.relative_to(_root())} ({len(content)} chars)"
+            after = content.count("\n") + 1
+            note = (f" It held {before} lines and now holds {after}; the other {before - after} are "
+                    "gone. If that was not intended, workspace_edit changes one passage and leaves "
+                    "the rest." if before > after + max(5, before // 10) else "")
+            return f"wrote {p.relative_to(_root())} ({len(content)} chars){note}"
         try:
             detail = build(p, content)
         except Exception as exc:
@@ -331,7 +344,9 @@ async def workspace_write(config: WorkspaceWriteConfig, builder: Builder) -> Asy
         return f"wrote {p.relative_to(_root())} ({detail})"
 
     yield FunctionInfo.from_fn(_run, description=(
-        "Write a deliverable into the workspace. Args: `path` relative to the root, and `content`. "
+        "Write a deliverable into the workspace, replacing whatever was there. To change part of a "
+        "file that already exists, use workspace_edit instead -- everything you do not resend here "
+        "is lost. Args: `path` relative to the root, and `content`. "
         "The extension picks the format that gets built, so send `content` in the shape it expects: "
         "`.xlsx` wants CSV text -- header row first, one line per row, fields holding a comma quoted; "
         "`.docx` wants markdown-ish prose -- a blank line ends a paragraph, a leading `#`, `##` or `###` "
@@ -472,7 +487,9 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
 
     yield FunctionInfo.from_fn(_run, description=(
         "Run one shell command in the workspace and return its output. The working directory is "
-        "the workspace root, so paths are relative to it.\n\n"
+        "the workspace root, so paths are relative to it. For anything on the web use web_search "
+        "and web_fetch rather than curl or urllib here: those keep what they read where the rest "
+        "of the run can see it.\n\n"
         "Args:\n    command (str): the command line, e.g. `ls -la` or `python -m pytest -q`."))
 
 
@@ -499,31 +516,60 @@ class TaskListConfig(FunctionBaseConfig, name="task_list"):
 
 @register_function(config_type=TaskListConfig)
 async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
-    """The plan as a file, so a long run can be resumed and audited rather than remembered."""
+    """The plan as a file, so a long run can be resumed and audited rather than remembered.
 
-    async def _run(steps: str = "", done: str = "") -> str:
+    Three states, not two: closing a step by SOLVING it is the only way an agent had, so a step it
+    could not solve stayed open and it kept trying. `giving_up` closes one and says why, and the
+    reason is what stops the next agent -- or the next turn of this one -- repeating the attempt.
+    """
+
+    async def _run(steps: str = "", done: str = "", giving_up: str = "", because: str = "") -> str:
         p = _resolve(config.path)
         p.parent.mkdir(parents=True, exist_ok=True)
         lines = p.read_text(encoding="utf-8").splitlines() if p.is_file() else []
         if steps.strip():
             # Steps often arrive already bulleted, and "- [ ] - step" reads as a broken list.
-            lines = [f"- [ ] {s.strip().lstrip('-*0123456789. ').strip()}"
+            lines = [f"- [ ] {_bare(s)}"
                      for s in steps.splitlines() if s.strip()]
-        for mark in (x.strip().lower() for x in done.splitlines() if x.strip()):
+        for mark, box, why in ([(x, "- [x]", "") for x in done.splitlines() if x.strip()]
+                               + [(x, "- [-]", because) for x in giving_up.splitlines() if x.strip()]):
             for i, line in enumerate(lines):
-                if line.startswith("- [ ]") and mark in line.lower():
-                    lines[i] = line.replace("- [ ]", "- [x]", 1)
+                if line.startswith("- [ ]") and mark.strip().lower() in line.lower():
+                    lines[i] = line.replace("- [ ]", box, 1) + (f"  ({why.strip()})" if why.strip() else "")
                     break
         if lines:
             p.write_text("\n".join(lines) + "\n", encoding="utf-8")
         if not lines:
             return "The list is empty; send `steps` to start one."
         left = sum(l.startswith("- [ ]") for l in lines)
-        return "\n".join(lines) + f"\n\n({left} of {len(lines)} still open)"
+        gave = sum(l.startswith("- [-]") for l in lines)
+        tail = f"({left} of {len(lines)} still open" + (f", {gave} given up on)" if gave else ")")
+        return "\n".join(lines) + "\n\n" + tail
 
     yield FunctionInfo.from_fn(_run, description=(
         "Keep the plan for this task as a checklist. Call it once with `steps` to write the plan, "
-        "then with `done` after finishing one, and with neither to read where you are. It survives "
-        "the conversation, so a long task can be picked up from it.\n\n"
-        "Args:\n    steps (str): the plan, one step per line -- replaces any existing list.\n"
-        "    done (str): text identifying a step to tick off, one per line."))
+        "then with `done` after finishing one, or with `giving_up` and `because` for one you tried "
+        "and could not settle -- writing that down is what keeps you, and anyone after you, from "
+        "trying it again. With no arguments it shows where you are. It outlives this conversation."
+        "\n\nArgs:\n    steps (str): the plan, one step per line -- replaces any existing list.\n"
+        "    done (str): text identifying a step to tick off, one per line.\n"
+        "    giving_up (str): text identifying a step to close unsolved.\n"
+        "    because (str): why that step could not be settled."))
+
+
+class FinishConfig(FunctionBaseConfig, name="finish"):
+    pass
+
+
+@register_function(config_type=FinishConfig)
+async def finish(config: FinishConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
+    """Stopping, as an action. Without one an agent keeps picking the best tool it has."""
+    from nat.middleware.agent_finish import AgentFinished
+
+    async def _run(answer: str) -> str:
+        raise AgentFinished(answer)
+
+    yield FunctionInfo.from_fn(_run, description=(
+        "Finish, giving your answer. Call this when the task is done -- checking work you have "
+        "already checked cannot change it.\n\n"
+        "Args:\n    answer (str): the complete answer, in the form the task asked for."))
