@@ -73,9 +73,15 @@ async def crewai_probe(config: CrewAIProbeConfig, builder: Builder) -> AsyncGene
             verbose=config.verbose,
             allow_delegation=False,
             max_iter=config.max_iter,
+            # A cached repeat is served without running the tool, so no guard behind it sees the
+            # call: 39 of 40 identical delegations went round the repeat breaker this way.
+            cache=False,
         )
         task = Task(description=inputs, expected_output=config.expected_output, agent=agent)
-        crew = Crew(agents=[agent], tasks=[task], process=Process.sequential, verbose=config.verbose)
+        # The crew hands its own cache to every agent it holds, so the agent's flag alone does not
+        # close that door.
+        crew = Crew(agents=[agent], tasks=[task], process=Process.sequential,
+                    verbose=config.verbose, cache=False)
 
         # Off the loop thread: the NAT CrewAI tool wrapper calls back into this loop and would deadlock.
         result = await asyncio.to_thread(crew.kickoff)
