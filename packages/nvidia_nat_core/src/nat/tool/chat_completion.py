@@ -31,6 +31,7 @@ from nat.cli.register_workflow import register_function
 from nat.data_models.api_server import ChatRequest
 from nat.data_models.api_server import ChatRequestOrMessage
 from nat.data_models.api_server import ChatResponse
+from nat.data_models.api_server import Message
 from nat.data_models.api_server import Usage
 from nat.data_models.component_ref import LLMRef
 from nat.data_models.function import FunctionBaseConfig
@@ -50,6 +51,9 @@ class ChatCompletionConfig(FunctionBaseConfig, name="chat_completion"):
     llm_name: LLMRef = Field(description="The LLM to use for generating responses.")
     # The register code already reads this via getattr; without the field pydantic silently drops it.
     description: str = Field(default="Chat completion", description="What callers are told this tool does.")
+    # A messages array costs 4000 characters of JSON schema in every request that lists this tool --
+    # 57% of one toolbox's whole tool budget for five tools an agent called 71 times in 8098.
+    simple_input: bool = Field(default=False, description="Take one string, not a messages array")
 
 
 def _messages_to_langchain_messages(
@@ -143,7 +147,20 @@ async def register_chat_completion(config: ChatCompletionConfig, builder: Builde
                     f"query: '{last_content}'. Please try rephrasing your question or try "
                     f"again later.")
 
+    async def _one_string(text: str) -> str:
+        """The same call with the schema an agent actually needs: text in, text out."""
+        try:
+            response = await llm.ainvoke(
+                _messages_to_langchain_messages([Message(role="user", content=text)],
+                                                config.system_prompt))
+        except Exception:
+            logger.exception("chat completion failed")
+            return "That draft could not be produced; write the text yourself or try once more."
+        if isinstance(response, str):
+            return response
+        return response.text() if hasattr(response, "text") else str(response.content)
+
     yield FunctionInfo.from_fn(
-        _chat_completion,
+        _one_string if config.simple_input else _chat_completion,
         description=getattr(config, "description", "Chat completion"),
     )

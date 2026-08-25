@@ -83,6 +83,34 @@ async def calculator(_config: CalculatorToolConfig, _builder: Builder) -> AsyncG
             return f"{a} is less than {b}"
         return f"{a} is equal to {b}"
 
+    async def _evaluate(expression: str) -> str:
+        """Work out an arithmetic expression and return it with its result, so a caller can see
+        which sum it got back. Example: "143 * 12.50 + 87 * 3.20"."""
+        import ast
+        import operator
+        ops = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+               ast.Div: operator.truediv, ast.Pow: operator.pow, ast.Mod: operator.mod,
+               ast.USub: operator.neg, ast.UAdd: operator.pos}
+
+        def walk(node):
+            # Arithmetic only: a name or a call would make this an eval of whatever was sent.
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+                return node.value
+            if isinstance(node, ast.BinOp) and type(node.op) in ops:
+                return ops[type(node.op)](walk(node.left), walk(node.right))
+            if isinstance(node, ast.UnaryOp) and type(node.op) in ops:
+                return ops[type(node.op)](walk(node.operand))
+            raise ValueError(f"only numbers and + - * / ** % are allowed, not {ast.dump(node)[:40]}")
+
+        try:
+            value = walk(ast.parse(expression.strip(), mode="eval").body)
+        except ZeroDivisionError:
+            return f"{expression} = undefined (division by zero)"
+        except Exception as exc:  # noqa: BLE001 -- the caller fixes the expression, not the tool
+            return f"could not work out {expression!r}: {exc}"
+        return f"{expression} = {value}"
+
+    group.add_function(name="evaluate", fn=_evaluate, description=_evaluate.__doc__)
     group.add_function(name="add", fn=_add, description=_add.__doc__)
     group.add_function(name="subtract", fn=_subtract, description=_subtract.__doc__)
     group.add_function(name="multiply", fn=_multiply, description=_multiply.__doc__)

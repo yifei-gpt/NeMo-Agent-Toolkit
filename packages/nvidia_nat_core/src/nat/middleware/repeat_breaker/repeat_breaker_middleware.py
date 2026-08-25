@@ -77,6 +77,8 @@ class _RunState:
         self.seen: OrderedDict[str, int] = OrderedDict()
         self.results: OrderedDict[str, Any] = OrderedDict()
         self.totals: dict[str, int] = defaultdict(int)
+        # Counted whether or not the calls touch: alternating two useless calls repeats neither.
+        self.lifetime: OrderedDict[str, int] = OrderedDict()
         self.last_key: str | None = None
         # Said once per run: a second warning is noise on every later observation.
         self.warned: bool = False
@@ -143,7 +145,9 @@ class RepeatBreakerMiddleware(FunctionMiddleware):
         # Re-inserting keeps a hot repeat loop at the young end, so eviction never resets it.
         count = (state.seen.pop(key, 0) + 1) if consecutive else 1
         state.seen[key] = count
+        state.lifetime[key] = state.lifetime.pop(key, 0) + 1
         _evict(state.seen, _MAX_KEYS_PER_RUN)
+        _evict(state.lifetime, _MAX_KEYS_PER_RUN)
         return count
 
     def _loop_reply(self, state: _RunState, key: str, over: int) -> str:
@@ -171,6 +175,13 @@ class RepeatBreakerMiddleware(FunctionMiddleware):
 
         key = self._key(context.name, args, kwargs)
         repeats = self._repeated(state, key)
+        # The run-long count stands in when the repeats are spread out; one URL was fetched 36
+        # times with a search between each, so no two were adjacent and none was ever broken.
+        spread = self._config.max_identical_per_run
+        if spread and state.lifetime.get(key, 0) > spread:
+            # Monotone in the lifetime count: one different call in between used to reset the
+            # ladder, and the reply at the bottom of it is the cached result -- a fixed point.
+            repeats = max(repeats, state.lifetime.get(key, 0) - spread + self._config.max_repeats)
         over = repeats - self._config.max_repeats
         if over > 0:
             # An agent that ignores every escalation would otherwise spin out the whole wall clock.

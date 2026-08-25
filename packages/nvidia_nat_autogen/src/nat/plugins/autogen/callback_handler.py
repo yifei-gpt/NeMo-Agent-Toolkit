@@ -562,10 +562,16 @@ class AutoGenProfilerHandler(BaseProfilerCallback):
             try:
                 if len(args) > 1:
                     call_data = args[1]
+                    # AutoGen hands the arguments as a model, not a mapping; reading only `.kwargs`
+                    # left every tool line empty while the args were right there.
                     if hasattr(call_data, "kwargs"):
                         tool_input = str(call_data.kwargs)
                     elif isinstance(call_data, dict):
-                        tool_input = str(call_data.get("kwargs", {}))
+                        tool_input = str(call_data.get("kwargs") or call_data)
+                    elif hasattr(call_data, "model_dump"):
+                        tool_input = str(call_data.model_dump())
+                    else:
+                        tool_input = str(call_data)
             except Exception:
                 logger.debug("Error extracting tool input")
 

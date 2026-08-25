@@ -80,6 +80,21 @@ def _as_text(body: str, limit: int) -> str:
     return body[:limit] + ("\n...[truncated]" if len(body) > limit else "")
 
 
+def _page_key(url: str, store: int) -> str:
+    return f"fetch|v2|{url}|{store}"
+
+
+def _window(page: str, offset: int, width: int) -> str:
+    """One slice of a page, told plainly enough that the next slice is asked for, not re-fetched."""
+    offset = max(0, int(offset or 0))
+    if offset >= len(page):
+        return f"Nothing at offset {offset}; this page is {len(page)} characters long."
+    end = min(offset + width, len(page))
+    tail = (f"\n\n[characters {offset}-{end} of {len(page)}; call web_fetch again with "
+            f"offset={end} to read on]" if end < len(page) else "")
+    return page[offset:end] + tail
+
+
 def _from_pdf(raw: bytes, limit: int) -> str:
     """A PDF's text, when the reader is installed; its absence is said rather than hidden."""
     try:
@@ -157,7 +172,7 @@ class WebFindConfig(FunctionBaseConfig, name="web_find_cached"):
     """Locate a phrase inside a page already opened, without opening it again."""
 
     cache_dir: str = Field(description="Directory holding cached pages")
-    max_chars: int = Field(default=12000, description="The length web_fetch was told to keep")
+    store_chars: int = Field(default=240000, description="The length web_fetch was told to keep")
     context_chars: int = Field(default=600, description="Text to return around each hit")
     max_hits: int = Field(default=5, description="Hits to return per search")
 
@@ -171,7 +186,7 @@ async def web_find_cached(tool_config: WebFindConfig, builder: Builder):
     directory = Path(tool_config.cache_dir)
 
     async def _find(url: str, phrase: str) -> str:
-        page = _read(_cache(directory, f"fetch|v1|{url.strip()}|{tool_config.max_chars}"))
+        page = _read(_cache(directory, _page_key(url.strip(), tool_config.store_chars)))
         if page is None:
             return f"{url} has not been read yet -- call web_fetch on it first."
         hits, start, width = [], 0, tool_config.context_chars
@@ -200,10 +215,11 @@ async def web_find_cached(tool_config: WebFindConfig, builder: Builder):
 
 
 class WebFetchConfig(FunctionBaseConfig, name="web_fetch_cached"):
-    """One page, as readable text, memoized on disk."""
+    """One page, as readable text, memoized on disk and read a window at a time."""
 
     cache_dir: str = Field(description="Directory holding cached pages")
-    max_chars: int = Field(default=12000, description="Truncate the page beyond this length")
+    max_chars: int = Field(default=12000, description="Characters returned per call")
+    store_chars: int = Field(default=240000, description="How much of the page is kept on disk")
     min_request_interval_s: float = Field(default=0.3, description="Throttle between live calls")
 
 
@@ -222,10 +238,10 @@ async def web_fetch_cached(tool_config: WebFetchConfig, builder: Builder):
                 kind = answer.headers.get("content-type", "")
                 if "pdf" in kind or url.lower().endswith(".pdf"):
                     # Research sources are PDFs as often as pages; refusing them loses the source.
-                    return True, _from_pdf(answer.content, tool_config.max_chars)
+                    return True, _from_pdf(answer.content, tool_config.store_chars)
                 if "html" not in kind and "text" not in kind and "json" not in kind:
                     return False, f"{url} is {kind or 'not text'}; nothing to read."
-                return True, _as_text(answer.text, tool_config.max_chars)
+                return True, _as_text(answer.text, tool_config.store_chars)
         except Exception as exc:  # noqa: BLE001
             logger.warning("web fetch failed for %s: %s", url[:80], exc)
             # Said plainly, because the common cause is a guessed URL and the agent otherwise
@@ -233,25 +249,25 @@ async def web_fetch_cached(tool_config: WebFetchConfig, builder: Builder):
             return False, (f"Could not read {url} ({type(exc).__name__}). If you guessed this "
                            "address, call web_search for the page instead of guessing again.")
 
-    async def _read_page(url: str) -> str:
+    async def _read_page(url: str, offset: int = 0) -> str:
         url = url.strip()
         if not url.lower().startswith(("http://", "https://")):
             return "Give a full http(s) URL, as web_search returns."
-        path = _cache(directory, f"fetch|v1|{url}|{tool_config.max_chars}")
-        cached = _read(path)
-        if cached is not None:
-            return cached
-        async with lock:
-            cached = _read(path)
-            if cached is not None:
-                return cached
-            ok, result = await _fetch(url)
-            _write(path, url, ok, result)
-            await asyncio.sleep(tool_config.min_request_interval_s)
-        return result
+        path = _cache(directory, _page_key(url, tool_config.store_chars))
+        page = _read(path)
+        if page is None:
+            async with lock:
+                page = _read(path)
+                if page is None:
+                    ok, page = await _fetch(url)
+                    _write(path, url, ok, page)
+                    await asyncio.sleep(tool_config.min_request_interval_s)
+        return _window(page, offset, tool_config.max_chars)
 
     yield FunctionInfo.from_fn(
         _read_page,
-        description=("Read one web page and return its text.\n\n"
-                     "Args:\n    url (str): a full http(s) URL, as web_search returns."),
+        description=("Read one web page and return its text. Long pages come back one window at "
+                     "a time; the reply says whether more is left and what offset reads it.\n\n"
+                     "Args:\n    url (str): a full http(s) URL, as web_search returns.\n"
+                     "    offset (int): character to start at, 0 for the beginning."),
     )

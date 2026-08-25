@@ -37,4 +37,7 @@ def crewai_tool_wrapper(name: str, fn: Function, builder: Builder):
 
         return asyncio.run_coroutine_threadsafe(runnable(*args, **kwargs), loop).result()
 
-    return Tool(name=name, description=fn.description or "", args_schema=fn.input_schema, func=wrapper)
+    # CrewAI caches every result by its arguments, so a repeated call never reaches the function
+    # and the loop breaker behind it never sees the repeat -- the agent asks forever.
+    return Tool(name=name, description=fn.description or "", args_schema=fn.input_schema,
+                func=wrapper, cache_function=lambda *_a, **_k: False)

@@ -23,6 +23,10 @@ class RepeatBreakerMiddlewareConfig(FunctionMiddlewareBaseConfig, name="repeat_c
     """Answers an identical repeated call with a nudge instead of running it again."""
 
     max_repeats: int = Field(default=2, ge=1, description="Identical calls allowed before the loop is broken")
+    max_identical_per_run: int = Field(default=6, ge=0,
+                                       description=("Identical calls allowed in the whole run, adjacent or not; "
+                                                    "0 disables. An agent alternating two calls never repeats "
+                                                    "back to back and so never trips max_repeats"))
     max_calls_per_run: int = Field(default=0, ge=0,
                                    description="Total calls allowed per workflow run; 0 disables the budget")
     notice: str = Field(default=("You already ran this exact call and got the same result. Do not repeat it. "

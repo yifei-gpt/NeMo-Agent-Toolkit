@@ -40,6 +40,7 @@ class AdkProbeConfig(FunctionBaseConfig, name="adk_probe"):
     llm_name: LLMRef = Field(description="Model to use via the ADK wrapper")
     tool_names: list[FunctionRef] = Field(default_factory=list, description="NAT tools exposed to the agent")
     system_prompt: str = Field(default=DEFAULT_PROMPT, description="Agent instructions")
+    max_iter: int = Field(default=250, description="Model calls before the run must end")
 
 
 class AutogenProbeConfig(FunctionBaseConfig, name="autogen_probe"):
@@ -54,6 +55,7 @@ class AutogenProbeConfig(FunctionBaseConfig, name="autogen_probe"):
 @register_function(config_type=AdkProbeConfig, framework_wrappers=[LLMFrameworkEnum.ADK])
 async def adk_probe(config: AdkProbeConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
     from google.adk.agents import Agent
+    from google.adk.agents.run_config import RunConfig
     from google.adk.artifacts import InMemoryArtifactService
     from google.adk.runners import Runner
     from google.adk.sessions import InMemorySessionService
@@ -76,7 +78,10 @@ async def adk_probe(config: AdkProbeConfig, builder: Builder) -> AsyncGenerator[
         session = await session_service.create_session(app_name="analyst", user_id="bench")
         content = types.Content(role="user", parts=[types.Part.from_text(text=inputs)])
         parts: list[str] = []
-        async for event in runner.run_async(user_id="bench", session_id=session.id, new_message=content):
+        # The only turn cap ADK offers; without it this is the one framework a run cannot bound.
+        limit = RunConfig(max_llm_calls=config.max_iter)
+        async for event in runner.run_async(user_id="bench", session_id=session.id,
+                                            new_message=content, run_config=limit):
             if event.content and event.content.parts:
                 parts.extend(p.text for p in event.content.parts if p.text)
         return "".join(parts)

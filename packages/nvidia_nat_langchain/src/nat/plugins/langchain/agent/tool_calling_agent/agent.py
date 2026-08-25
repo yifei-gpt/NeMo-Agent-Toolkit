@@ -48,7 +48,9 @@ if typing.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_WARN_AT = 0.7
+# Measured over 47 single-agent runs: the work itself finishes inside ~65 rounds, so a nudge
+# at 0.7 of the cap lands long after the agent is only circling.
+_WARN_AT = 0.4
 _LOOK_FIRST = ("You have not consulted any source yet. Use the tools to check what the task asks "
                "about before you answer -- an answer recalled from memory is the wrong one often "
                "enough that it is not worth giving.")

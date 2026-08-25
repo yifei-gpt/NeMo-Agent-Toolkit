@@ -21,9 +21,11 @@ ARG UWSGI_PROCESSES=10
 FROM python:3.13-slim-bookworm
 
 
+# R is here because a task that asks for R code cannot install its own runtime: the minutes and
+# the steps that takes are the task's budget, and they are decisions a watermark would mark.
 RUN apt update && \
     apt upgrade -y && \
-    apt install -y --no-install-recommends libexpat1 && \
+    apt install -y --no-install-recommends libexpat1 r-base-core r-cran-testthat && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 

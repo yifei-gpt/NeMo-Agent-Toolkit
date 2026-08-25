@@ -188,6 +188,8 @@ async def workspace_read(config: WorkspaceReadConfig, builder: Builder) -> Async
 
     async def _run(path: str, offset: int = 0) -> str:
         p = _resolve(path)
+        if p.is_dir():
+            return f"{path} is a directory -- list it with workspace_list, or name a file in it."
         if not p.is_file():
             return f"no such file: {path}"
         text = _extract(p)
@@ -306,13 +308,20 @@ async def workspace_write(config: WorkspaceWriteConfig, builder: Builder) -> Asy
 
     async def _run(path: str, content: str) -> str:
         p = _resolve(path)
+        # An empty or directory `path` writes onto the directory itself, and that OS error carries
+        # an absolute host path the caller can do nothing with.
+        if p == _root() or p.is_dir():
+            return f"`path` must name a file inside the workspace; {path!r} names a directory."
         p.parent.mkdir(parents=True, exist_ok=True)
         # Writing to a symlink never means editing its target; linked worlds would reject or corrupt.
         if p.is_symlink():
             p.unlink()
         build = {".docx": _write_docx, ".xlsx": _write_xlsx, ".pptx": _write_pptx}.get(p.suffix.lower())
         if build is None:
-            p.write_text(content, encoding="utf-8")
+            try:
+                p.write_text(content, encoding="utf-8")
+            except OSError as exc:
+                return f"could not write {path}: {exc.strerror or exc}."
             return f"wrote {p.relative_to(_root())} ({len(content)} chars)"
         try:
             detail = build(p, content)
@@ -381,5 +390,140 @@ async def workspace_search(config: WorkspaceSearchConfig, builder: Builder) -> A
         return ("\n".join(hits) + note) if hits else (f"(no line contains {query!r})" + note)
 
     yield FunctionInfo.from_fn(_run, description=(
-        "Search workspace file contents for a string and return matching lines with their paths. "
+        "Search workspace file contents and return matching lines with their paths. `query` is plain "
+        "text matched case-insensitively, not a regular expression -- for a regex use bash with grep. "
         "Args: `query`, optional `subdir`, and `path_contains` to restrict which files are scanned."))
+
+
+class WorkspaceEditConfig(FunctionBaseConfig, name="workspace_edit"):
+    pass
+
+
+@register_function(config_type=WorkspaceEditConfig)
+async def workspace_edit(config: WorkspaceEditConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
+    """Replace one exact passage in a file, rather than rewriting the file around it."""
+
+    async def _run(path: str, old: str, new: str) -> str:
+        p = _resolve(path)
+        if not p.is_file():
+            return f"{path} is not a file in the workspace; workspace_list shows what is."
+        try:
+            body = p.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return f"could not read {path}: {getattr(exc, 'strerror', None) or exc}."
+        hits = body.count(old)
+        if hits == 0:
+            return (f"that passage does not appear in {path}; read it first and copy the text "
+                    "exactly, whitespace included.")
+        if hits > 1:
+            # Editing the first of several is how a file quietly gets the wrong one changed.
+            return f"that passage appears {hits} times in {path}; extend `old` until it is unique."
+        p.write_text(body.replace(old, new), encoding="utf-8")
+        return f"edited {p.relative_to(_root())} ({len(old)} chars -> {len(new)})"
+
+    yield FunctionInfo.from_fn(_run, description=(
+        "Replace one exact passage inside a file, leaving the rest untouched. Use this to change an "
+        "existing file; workspace_write replaces the whole file and loses anything you did not "
+        "resend.\n\nArgs:\n    path (str): the file, relative to the workspace root.\n"
+        "    old (str): the exact text to replace, unique in the file.\n"
+        "    new (str): what to put there."))
+
+
+class WorkspaceShellConfig(FunctionBaseConfig, name="workspace_shell"):
+    uri: str = Field(default="http://127.0.0.1:6000", description="Sandbox base URL")
+    timeout: float = Field(default=60.0, description="Seconds one command may run")
+    max_output_characters: int = Field(default=4000, description="Truncate combined output here")
+
+
+@register_function(config_type=WorkspaceShellConfig)
+async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
+    """A shell in the sandbox, rooted at the workspace."""
+    import json as _json
+
+    import httpx
+
+    async def _run(command: str) -> str:
+        # Run through the sandbox, never on this host: the tool exists because agents were wrapping
+        # subprocess in run_code to get here anyway, and that path had no root and no cap.
+        wrapper = (
+            "import subprocess, os\n"
+            f"cwd = {_root().as_posix()!r}\n"
+            "os.makedirs(cwd, exist_ok=True)\n"
+            f"r = subprocess.run({command!r}, shell=True, cwd=cwd, capture_output=True,\n"
+            f"                   text=True, timeout={config.timeout})\n"
+            "print(r.stdout, end='')\n"
+            "print(r.stderr, end='')\n"
+            "print(f'\\n[exit {r.returncode}]' if r.returncode else '', end='')\n")
+        try:
+            async with httpx.AsyncClient(timeout=config.timeout + 15) as client:
+                answer = await client.post(config.uri.rstrip("/") + "/execute",
+                                           json={"generated_code": wrapper,
+                                                 "timeout": config.timeout, "language": "python"})
+                answer.raise_for_status()
+                body = answer.json()
+        except Exception as exc:  # noqa: BLE001 -- any failure to run means the same thing
+            return f"the shell is unavailable right now ({type(exc).__name__})."
+        out = (body.get("stdout") or "") + (body.get("stderr") or "")
+        if body.get("process_status") not in (None, "completed", "success"):
+            out = f"[{body['process_status']}]\n{out}"
+        out = out.strip() or "(no output)"
+        cap = config.max_output_characters
+        return out[:cap] + f"\n...[cut at {cap} characters]" if len(out) > cap else out
+
+    yield FunctionInfo.from_fn(_run, description=(
+        "Run one shell command in the workspace and return its output. The working directory is "
+        "the workspace root, so paths are relative to it.\n\n"
+        "Args:\n    command (str): the command line, e.g. `ls -la` or `python -m pytest -q`."))
+
+
+class ThinkConfig(FunctionBaseConfig, name="think"):
+    pass
+
+
+@register_function(config_type=ThinkConfig)
+async def think(config: ThinkConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
+    """Somewhere to reason mid-task. Measured by Anthropic at +54% relative on tau-bench airline."""
+
+    async def _run(thought: str) -> str:
+        return "Noted. Continue."
+
+    yield FunctionInfo.from_fn(_run, description=(
+        "Think a step through without acting. Nothing happens and nothing is fetched or changed; "
+        "use it to work out what a tool just told you, check a rule before you act on it, or plan "
+        "the next few steps.\n\nArgs:\n    thought (str): the reasoning to work through."))
+
+
+class TaskListConfig(FunctionBaseConfig, name="task_list"):
+    path: str = Field(default="_notes/tasks.md", description="Where the list is kept")
+
+
+@register_function(config_type=TaskListConfig)
+async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
+    """The plan as a file, so a long run can be resumed and audited rather than remembered."""
+
+    async def _run(steps: str = "", done: str = "") -> str:
+        p = _resolve(config.path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        lines = p.read_text(encoding="utf-8").splitlines() if p.is_file() else []
+        if steps.strip():
+            # Steps often arrive already bulleted, and "- [ ] - step" reads as a broken list.
+            lines = [f"- [ ] {s.strip().lstrip('-*0123456789. ').strip()}"
+                     for s in steps.splitlines() if s.strip()]
+        for mark in (x.strip().lower() for x in done.splitlines() if x.strip()):
+            for i, line in enumerate(lines):
+                if line.startswith("- [ ]") and mark in line.lower():
+                    lines[i] = line.replace("- [ ]", "- [x]", 1)
+                    break
+        if lines:
+            p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        if not lines:
+            return "The list is empty; send `steps` to start one."
+        left = sum(l.startswith("- [ ]") for l in lines)
+        return "\n".join(lines) + f"\n\n({left} of {len(lines)} still open)"
+
+    yield FunctionInfo.from_fn(_run, description=(
+        "Keep the plan for this task as a checklist. Call it once with `steps` to write the plan, "
+        "then with `done` after finishing one, and with neither to read where you are. It survives "
+        "the conversation, so a long task can be picked up from it.\n\n"
+        "Args:\n    steps (str): the plan, one step per line -- replaces any existing list.\n"
+        "    done (str): text identifying a step to tick off, one per line."))
