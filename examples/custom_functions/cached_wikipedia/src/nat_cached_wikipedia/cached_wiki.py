@@ -153,6 +153,8 @@ async def wiki_search_cached(tool_config: CachedWikiSearchConfig, builder: Build
 
     yield FunctionInfo.from_fn(
         _search,
-        description=("This tool retrieves relevant contexts from wikipedia search for the given question.\n\n"
-                     "Args:\n    question (str): The question to be answered."),
+        description=("Look a subject up on Wikipedia and get the opening of the matching articles. Use it "
+                     "for a definition, a date or a name you need settled; web_search covers everything "
+                     "else, and anything recent or contested belongs there instead.\n\n"
+                     "Args:\n    question (str): the subject to look up."),
     )

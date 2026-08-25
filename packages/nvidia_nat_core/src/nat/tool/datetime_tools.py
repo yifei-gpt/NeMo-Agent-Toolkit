@@ -90,16 +90,19 @@ def _get_timezone_obj(headers: Headers | None) -> zoneinfo.ZoneInfo:
 @register_function(config_type=CurrentTimeToolConfig)
 async def current_datetime(_config: CurrentTimeToolConfig, _builder: Builder):
 
-    async def _get_current_time(unused: str) -> str:
-
-        del unused  # Unused parameter to avoid linting error
+    async def _get_current_time(timezone: str = "") -> str:
 
         from nat.builder.context import Context
         nat_context = Context.get()
 
         headers: Headers | None = nat_context.metadata.headers
 
-        timezone_obj = _get_timezone_obj(headers)
+        # Honoured, not just accepted: a parameter the caller fills and the tool ignores is worse
+        # than none, because the answer looks like it came back in the zone that was asked for.
+        try:
+            timezone_obj = zoneinfo.ZoneInfo(timezone.strip()) if timezone.strip() else _get_timezone_obj(headers)
+        except Exception:  # noqa: BLE001 -- an unknown zone name falls back rather than failing
+            timezone_obj = _get_timezone_obj(headers)
 
         now = datetime.datetime.now(timezone_obj)
         now_machine_readable = now.strftime("%Y-%m-%d %H:%M:%S %z")
@@ -109,7 +112,8 @@ async def current_datetime(_config: CurrentTimeToolConfig, _builder: Builder):
 
     yield FunctionInfo.from_fn(
         _get_current_time,
-        description="Returns the current date and time in human readable format with timezone information.")
+        description=("Returns the current date and time. Args: `timezone` as an IANA name such as "
+                     "\"America/New_York\"; leave it empty for the server's own zone."))
 
 
 @register_function(config_type=CurrentTimeZoneToolConfig)
