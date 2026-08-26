@@ -6,6 +6,7 @@
 import logging
 import os
 import re
+import shlex
 import tempfile
 import subprocess
 import time
@@ -25,11 +26,45 @@ MAX_READ_CHARS = 20000
 CENSUS_ROWS = 40
 
 
+# Where a bridged session starts; the harness runs every container task set with this as its cwd.
+_CONTAINER_ROOT = "/app"
+
+
 def _root() -> Path:
     # No workspace was chosen, so scratch space -- the process cwd would hand over the whole checkout.
     if not os.environ.get("NAT_WORKSPACE_DIR"):
         os.environ["NAT_WORKSPACE_DIR"] = tempfile.mkdtemp(prefix="nat_workspace_")
     return Path(os.environ["NAT_WORKSPACE_DIR"]).resolve()
+
+
+def _bridge() -> str | None:
+    """The task's own container, when the harness opened one. The same flag run_code reads."""
+    return os.environ.get("MARKAGENTX_BRIDGE_URL") if os.environ.get("MARKAGENTX_BRIDGE_READY") else None
+
+
+def _sh(command: str, timeout: float = 60.0) -> tuple[bool, str]:
+    """One shell command where the agent's files are. -> (ran, output).
+
+    Shell and not python: six of terminalbench's fourteen local images carry no python at all, and
+    the bridged session routes a command line to bash either way. `cd` first so it routes there.
+    """
+    import json as _json
+    import urllib.request
+
+    uri = _bridge()
+    if not uri:
+        return False, ""
+    body = _json.dumps({"generated_code": f"cd {_CONTAINER_ROOT} && " + command,
+                        "language": "python", "timeout": timeout}).encode()
+    try:
+        with urllib.request.urlopen(
+                urllib.request.Request(uri.rstrip("/") + "/execute", body,
+                                       {"Content-Type": "application/json"}),
+                timeout=timeout + 15) as answer:
+            got = _json.loads(answer.read())
+    except Exception as exc:  # noqa: BLE001 -- unreachable and refusing mean the same thing here
+        return True, f"the workspace is unreachable right now ({type(exc).__name__})."
+    return True, (got.get("stdout") or "") + (got.get("stderr") or "")
 
 
 def _bare(step: str) -> str:
@@ -51,6 +86,9 @@ def _resolve(rel: str) -> Path:
 
 
 logger = logging.getLogger(__name__)
+
+# Counted where the cap middleware counts its own: a dropped match is a dropped match.
+from nat.middleware.output_limit.output_limit_middleware import FIRED
 
 # Out of process: one malformed PDF can hang pdfminer or crash the interpreter, uncatchably.
 _PDF_CHILD = ("import sys, pdfplumber\n"
@@ -142,33 +180,65 @@ class WorkspaceListConfig(FunctionBaseConfig, name="workspace_list"):
     max_entries: int = Field(default=200, description="Cap on returned paths")
 
 
+def _built(target: Path, content: str) -> str:
+    """Build `content` into `target` in the shape its extension asks for. -> what was built."""
+    build = {".docx": _write_docx, ".xlsx": _write_xlsx, ".pptx": _write_pptx}.get(target.suffix.lower())
+    if build is None:
+        target.write_text(content, encoding="utf-8")
+        return f"{content.count(chr(10)) + 1} lines"
+    return build(target, content)
+
+
+def _put(path: str, blob: bytes) -> tuple[bool, str]:
+    """Place bytes at `path` in the container. Built here and carried over as base64, because the
+    xlsx, docx and pptx writers need libraries the task's own image has no reason to hold."""
+    import base64
+    q = shlex.quote(path)
+    encoded = base64.b64encode(blob).decode()
+    return _sh(f"mkdir -p \"$(dirname {q})\" && printf %s {shlex.quote(encoded)} | base64 -d > {q} "
+               f"&& echo __WROTE__")
+
+
+def _formatted(root, pairs, contains: str, max_entries: int) -> str:
+    """One listing format for both trees, the local one and the container's: the files, or past the
+    cap a folder census, which is the only thing an arbitrary slice of them could not tell."""
+    needle = (contains or "").strip().lower()
+    hits: list[str] = []
+    census: dict[str, int] = {}
+    for rel, size in pairs:
+        if not rel or (needle and needle not in rel.lower()):
+            continue
+        census[str(Path(rel).parent)] = census.get(str(Path(rel).parent), 0) + 1
+        hits.append(f"{rel}  ({size} bytes)" if size else rel)
+    # The absolute root, so code run in a sandbox can open these files by path.
+    head = f"workspace root: {root}"
+    if not hits:
+        return head + ("\n(no file matches %r)" % contains if needle else "\n(empty)")
+    if len(hits) <= max_entries:
+        return "\n".join([head, *hits])
+    rows = sorted(census.items(), key=lambda kv: -kv[1])[:CENSUS_ROWS]
+    return (f"{head}\n{len(hits)} files match -- too many to list. Folders, largest first; "
+            f"open one with `subdir`, or filter with `contains`:\n" +
+            "\n".join(f"{d}/  ({n} files)" for d, n in rows))
+
+
+def _from_find(out: str, where: str, contains: str, max_entries: int) -> str:
+    """`find -printf '%P\\t%s'` output, formatted the way a local tree is."""
+    pairs = []
+    for line in out.splitlines():
+        name, _, size = line.partition("\t")
+        pairs.append((f"{where}/{name}".lstrip("./") if where not in (".", "") else name, size))
+    return _formatted(_CONTAINER_ROOT, pairs, contains, max_entries)
+
+
 def _listing(subdir: str = "", contains: str = "", max_entries: int = 200) -> str:
     """Module level so a test can reach it: the census branch shipped broken with nothing covering it."""
     base = _resolve(subdir) if subdir else _root()
     if not base.is_dir():
         return f"not a directory: {subdir}"
-    needle = (contains or "").strip().lower()
-    hits: list[str] = []
-    census: dict[str, int] = {}
-    for p in sorted(base.rglob("*")):
-        if not p.is_file():
-            continue
-        rel = str(p.relative_to(_root()))
-        if needle and needle not in rel.lower():
-            continue
-        census[str(Path(rel).parent)] = census.get(str(Path(rel).parent), 0) + 1
-        hits.append(f"{rel}  ({p.stat().st_size} bytes)")
-    # The absolute root, so code run in a sandbox can open these files by path.
-    head = f"workspace root: {_root()}"
-    if not hits:
-        return head + ("\n(no file matches %r)" % contains if needle else "\n(empty)")
-    if len(hits) <= max_entries:
-        return "\n".join([head, *hits])
-    # Past the cap an arbitrary slice tells nothing: the listing becomes a folder census.
-    rows = sorted(census.items(), key=lambda kv: -kv[1])[:CENSUS_ROWS]
-    return (f"{head}\n{len(hits)} files match -- too many to list. Folders, largest first; "
-            f"open one with `subdir`, or filter with `contains`:\n" +
-            "\n".join(f"{d}/  ({n} files)" for d, n in rows))
+    pairs = [(str(p.relative_to(_root())), p.stat().st_size)
+             for p in sorted(base.rglob("*")) if p.is_file()]
+    return _formatted(_root(), pairs, contains, max_entries)
 
 
 @register_function(config_type=WorkspaceListConfig)
@@ -176,6 +246,12 @@ async def workspace_list(config: WorkspaceListConfig, builder: Builder) -> Async
     """List files in the workspace."""
 
     async def _run(subdir: str = "", contains: str = "") -> str:
+        if _bridge():
+            where = subdir.strip("/ ") or "."
+            ran, out = _sh(f"find {shlex.quote(where)} -type f -printf '%P\\t%s\\n' 2>/dev/null "
+                           f"|| find {shlex.quote(where)} -type f")
+            if ran:
+                return _from_find(out, where, contains, config.max_entries)
         return _listing(subdir, contains, config.max_entries)
 
     yield FunctionInfo.from_fn(
@@ -193,6 +269,26 @@ async def workspace_read(config: WorkspaceReadConfig, builder: Builder) -> Async
     """Read one workspace file as text."""
 
     async def _run(path: str, offset: int = 0) -> str:
+        if _bridge():
+            q = shlex.quote(path)
+            ran, out = _sh(f"if [ -d {q} ]; then echo __DIR__; elif [ -f {q} ]; then "
+                           f"wc -c < {q}; echo __CUT__; tail -c +{offset + 1} {q} | head -c "
+                           f"{config.max_chars}; else echo __MISSING__; fi")
+            if ran:
+                if out.startswith("__DIR__"):
+                    return f"{path} is a directory -- list it with workspace_list, or name a file in it."
+                if out.startswith("__MISSING__"):
+                    return f"no such file: {path}"
+                total, _, chunk = out.partition("__CUT__\n")
+                try:
+                    size = int(total.strip())
+                except ValueError:
+                    return out
+                rest = size - offset - len(chunk)
+                if rest <= 0:
+                    return chunk
+                return (f"{chunk}\n... {rest} more characters, call again with "
+                        f"offset={offset + len(chunk)}")
         p = _resolve(path)
         if p.is_dir():
             return f"{path} is a directory -- list it with workspace_list, or name a file in it."
@@ -273,14 +369,24 @@ def _write_xlsx(p: Path, text: str) -> str:
     """Build a real Excel workbook out of CSV text."""
     import csv
     import io
+    import re
 
     from openpyxl import Workbook
+
+    def _typed(cell: str):
+        """A number written as text is one Excel flags and every formula skips, and a column holding
+        both sorts worse than one holding either. Plain decimals convert; a leading zero, a plus or
+        an exponent means an identifier -- 007, +1, 1e5 -- and stays the string it was sent as."""
+        body = cell.strip()
+        if not re.fullmatch(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", body):
+            return cell
+        return float(body) if "." in body else int(body)
 
     wb = Workbook()
     ws = wb.active
     # StringIO rather than splitlines(): only a real stream keeps a newline inside a quoted field.
     for row in csv.reader(io.StringIO(text)):
-        ws.append(row)
+        ws.append([_typed(c) for c in row])
     wb.save(p)
     return f"{ws.max_row} rows x {ws.max_column} columns"
 
@@ -313,6 +419,18 @@ async def workspace_write(config: WorkspaceWriteConfig, builder: Builder) -> Asy
     """Write a deliverable into the workspace."""
 
     async def _run(path: str, content: str) -> str:
+        if _bridge():
+            import tempfile as _tmp
+            with _tmp.TemporaryDirectory(prefix="ws-out-") as staging:
+                local = Path(staging) / Path(path).name
+                try:
+                    detail = _built(local, content)
+                except Exception as exc:  # noqa: BLE001 -- the builder's own words beat a traceback
+                    return f"could not build {path}: {exc}"
+                ran, out = _put(path, local.read_bytes())
+            if ran:
+                return (f"wrote {path} ({detail})" if "__WROTE__" in out
+                        else out.strip() or f"could not write {path}")
         p = _resolve(path)
         # An empty or directory `path` writes onto the directory itself, and that OS error carries
         # an absolute host path the caller can do nothing with.
@@ -371,6 +489,19 @@ async def workspace_search(config: WorkspaceSearchConfig, builder: Builder) -> A
         needle = (query or "").strip().lower()
         if not needle:
             return "give a non-empty query"
+        if _bridge():
+            where = shlex.quote(subdir.strip("/ ") or ".")
+            keep = f" | grep -F -- {shlex.quote(path_contains)}" if path_contains else ""
+            ran, out = _sh(f"grep -rniI -F -- {shlex.quote(query)} {where} 2>/dev/null{keep} "
+                           f"| head -n {config.max_hits + 1}")
+            if ran:
+                rows = [r for r in out.splitlines() if r.strip()]
+                if not rows:
+                    return f"(no line contains {query!r})"
+                if len(rows) > config.max_hits:
+                    return ("\n".join(rows[:config.max_hits])
+                            + f"\n... more than {config.max_hits} matches; narrow the query.")
+                return "\n".join(rows)
         base = _resolve(subdir) if subdir else _root()
         if not base.is_dir():
             return f"not a directory: {subdir}"
@@ -395,6 +526,7 @@ async def workspace_search(config: WorkspaceSearchConfig, builder: Builder) -> A
                     hits.append(f"{rel}:{i}: {line.strip()[:200]}")
                     if len(hits) > config.max_hits:
                         # Past the cap the agent needs a narrower query, not an arbitrary prefix.
+                        FIRED[config.type] += 1
                         return ("\n".join(hits[:config.max_hits]) +
                                 f"\n... more than {config.max_hits} matches; narrow the query.")
         # Said, not hidden: a truncated scan that reads as "no matches" sends the agent away
@@ -419,6 +551,21 @@ async def workspace_edit(config: WorkspaceEditConfig, builder: Builder) -> Async
     """Replace one exact passage in a file, rather than rewriting the file around it."""
 
     async def _run(path: str, old: str, new: str) -> str:
+        if _bridge():
+            q = shlex.quote(path)
+            ran, body = _sh(f"if [ -f {q} ]; then cat {q}; else echo __MISSING__; fi")
+            if ran:
+                if body.startswith("__MISSING__"):
+                    return f"{path} is not a file in the workspace; workspace_list shows what is."
+                seen = body.count(old)
+                if seen == 0:
+                    return f"that exact text is not in {path}; read it again and copy the passage."
+                if seen > 1:
+                    return f"that text appears {seen} times in {path}; include more of it."
+                done, out = _put(path, body.replace(old, new, 1).encode())
+                if done and "__WROTE__" in out:
+                    return f"edited {path} ({len(old)} chars -> {len(new)})"
+                return out.strip() or f"could not write {path}"
         p = _resolve(path)
         if not p.is_file():
             return f"{path} is not a file in the workspace; workspace_list shows what is."
@@ -458,17 +605,23 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
     import httpx
 
     async def _run(command: str) -> str:
-        # Run through the sandbox, never on this host: the tool exists because agents were wrapping
-        # subprocess in run_code to get here anyway, and that path had no root and no cap.
-        wrapper = (
-            "import subprocess, os\n"
-            f"cwd = {_root().as_posix()!r}\n"
-            "os.makedirs(cwd, exist_ok=True)\n"
-            f"r = subprocess.run({command!r}, shell=True, cwd=cwd, capture_output=True,\n"
-            f"                   text=True, timeout={config.timeout})\n"
-            "print(r.stdout, end='')\n"
-            "print(r.stderr, end='')\n"
-            "print(f'\\n[exit {r.returncode}]' if r.returncode else '', end='')\n")
+        # A bridged sandbox is the task's own container: its session already starts where the work
+        # is and routes a command line to bash itself, so the host path baked in below would name a
+        # directory that does not exist there. This is what run_code's own preamble check does.
+        if os.environ.get("MARKAGENTX_BRIDGE_READY"):
+            wrapper = command
+        else:
+            # Run through the sandbox, never on this host: the tool exists because agents were
+            # wrapping subprocess in run_code to get here anyway, and that path had no root and no cap.
+            wrapper = (
+                "import subprocess, os\n"
+                f"cwd = {_root().as_posix()!r}\n"
+                "os.makedirs(cwd, exist_ok=True)\n"
+                f"r = subprocess.run({command!r}, shell=True, cwd=cwd, capture_output=True,\n"
+                f"                   text=True, timeout={config.timeout})\n"
+                "print(r.stdout, end='')\n"
+                "print(r.stderr, end='')\n"
+                "print(f'\\n[exit {r.returncode}]' if r.returncode else '', end='')\n")
         try:
             async with httpx.AsyncClient(timeout=config.timeout + 15) as client:
                 answer = await client.post(config.uri.rstrip("/") + "/execute",
@@ -485,6 +638,7 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
         cap = config.max_output_characters
         if len(out) <= cap:
             return out
+        FIRED[config.type] += 1
         return out[:cap] + (f"\n...[cut at {cap} characters. Send the output to a file and read it, "
                             "or filter it here with head, tail or grep -- running this again returns "
                             "the same cut.]")
@@ -532,6 +686,7 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
         p = _resolve(config.path)
         p.parent.mkdir(parents=True, exist_ok=True)
         lines = p.read_text(encoding="utf-8").splitlines() if p.is_file() else []
+        before = list(lines)
         if steps.strip():
             # A closed step stays closed: each specialist rewrites this list, and a plain replace
             # reopened what the one before it had already finished.
@@ -555,7 +710,10 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
         left = sum(l.startswith("- [ ]") for l in lines)
         gave = sum(l.startswith("- [-]") for l in lines)
         tail = f"({left} of {len(lines)} still open" + (f", {gave} given up on)" if gave else ")")
-        # Saying nothing changed is the whole point: a silent no-op reads as success and gets retried.
+        # Saying nothing changed is the whole point: a silent no-op reads as success and gets
+        # retried -- one run sent the same plan 19 times and read back the same words every time.
+        if lines == before and (steps.strip() or done.strip() or giving_up.strip()):
+            tail += "\nNothing changed: this is the list as it already stood."
         if missed:
             tail += ("\nNo open step matches " + ", ".join(repr(m) for m in missed)
                      + " -- already closed, or never on the list.")

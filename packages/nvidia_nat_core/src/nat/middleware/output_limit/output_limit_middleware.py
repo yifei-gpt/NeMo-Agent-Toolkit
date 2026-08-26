@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import collections
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
@@ -27,6 +28,10 @@ from nat.middleware.middleware import InvocationContext
 from nat.middleware.output_limit.output_limit_middleware_config import OutputLimitMiddlewareConfig
 
 logger = logging.getLogger(__name__)
+
+# Counted, not just logged: a run cut on half its calls reads exactly like one that
+# was never cut, and the summary is where anyone would look.
+FIRED: "collections.Counter[str]" = collections.Counter()
 
 
 class OutputLimitMiddleware(FunctionMiddleware):
@@ -42,7 +47,9 @@ class OutputLimitMiddleware(FunctionMiddleware):
         cap = self._config.max_chars
         if len(text) <= cap:
             return None
-        logger.info("Truncated %s output from %d to %d chars", context.function_context.name, len(text), cap)
+        FIRED[context.function_context.name or "?"] += 1
+        logger.info("Truncated %s output from %d to %d chars",
+                    context.function_context.name, len(text), cap)
         context.output = text[:cap] + self._config.notice
         return context
 
@@ -54,6 +61,7 @@ class OutputLimitMiddleware(FunctionMiddleware):
         async for chunk in call_next(*args, **kwargs):
             text = chunk if isinstance(chunk, str) else str(chunk)
             if len(text) > remaining:
+                FIRED[context.name or "?"] += 1
                 logger.info("Truncated %s stream at its remaining budget", context.name)
                 yield text[:remaining] + self._config.notice
                 return

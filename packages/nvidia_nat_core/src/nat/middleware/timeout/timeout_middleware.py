@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 from collections.abc import AsyncIterator
 from typing import Any
@@ -29,6 +30,9 @@ from nat.middleware.middleware import FunctionMiddlewareContext
 from nat.middleware.timeout.timeout_middleware_config import TimeoutMiddlewareConfig
 
 logger = logging.getLogger(__name__)
+
+# Same reason as the output cap: a guard that fires silently is a guard nobody sizes.
+FIRED: "collections.Counter[str]" = collections.Counter()
 
 
 class TimeoutMiddleware(DynamicFunctionMiddleware):
@@ -71,6 +75,7 @@ class TimeoutMiddleware(DynamicFunctionMiddleware):
                 timeout=timeout,
             )
         except TimeoutError:
+            FIRED[context.name or "?"] += 1
             logger.error("Function '%s' exceeded timeout of %ss", context.name, timeout)
             msg: str = f"Execution exceeded the configured timeout of {timeout}s."
             if self._timeout_config.timeout_message:
@@ -110,6 +115,7 @@ class TimeoutMiddleware(DynamicFunctionMiddleware):
                                                                       **kwargs):
                     yield chunk
         except TimeoutError:
+            FIRED[context.name or "?"] += 1
             logger.error("Streaming function '%s' exceeded timeout of %ss", context.name, timeout)
             msg: str = f"Execution exceeded the configured timeout of {timeout}s."
             if self._timeout_config.timeout_message:
