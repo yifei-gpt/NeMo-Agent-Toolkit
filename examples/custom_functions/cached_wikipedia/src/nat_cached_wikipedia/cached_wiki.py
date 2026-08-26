@@ -24,6 +24,7 @@ import os
 import re
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 from pydantic import Field
@@ -72,7 +73,9 @@ async def wiki_search_cached(tool_config: CachedWikiSearchConfig, builder: Build
             text = pattern.sub(repl, text)
         text = text.strip()
         if len(text) > tool_config.max_chars_per_article:
-            text = text[:tool_config.max_chars_per_article] + "\n...[truncated]"
+            text = text[:tool_config.max_chars_per_article] + (
+                "\n...[the article is longer than this; web_fetch on the url in this "
+                "Document tag reads the whole of it a window at a time]")
         return text
 
     async def _get(client: httpx.AsyncClient, params: dict) -> dict:
@@ -108,12 +111,15 @@ async def wiki_search_cached(tool_config: CachedWikiSearchConfig, builder: Build
             if not revisions:
                 continue
             text = revisions[0].get("slots", {}).get("main", {}).get("content", "")
+            # The url is here so the truncation notice has something real to point at.
+            url = "https://en.wikipedia.org/wiki/" + quote(page["title"].replace(" ", "_"))
             # Titles carry quotes and ampersands ('"Weird Al" Yankovic'), which would end the tag early.
-            docs.append(f'<Document title="{html.escape(page["title"])}">\n{_clean(text)}\n</Document>')
+            docs.append(f'<Document title="{html.escape(page["title"])}" url="{html.escape(url)}">\n'
+                        f'{_clean(text)}\n</Document>')
         return bool(docs), "\n\n---\n\n".join(docs)
 
     def _cache_path(question: str) -> Path:
-        key = f"v3|{question}|{tool_config.max_results}|{tool_config.max_chars_per_article}"
+        key = f"v4|{question}|{tool_config.max_results}|{tool_config.max_chars_per_article}"
         return cache_dir / f"{hashlib.sha256(key.encode()).hexdigest()[:32]}.json"
 
     def _read(path: Path) -> str | None:

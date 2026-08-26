@@ -110,7 +110,16 @@ def autogen_tool_wrapper(
         Returns:
             Any: The result of invoking the NAT function.
         """
-        return await fn.acall_invoke(*args, **kwargs)
+        from nat.middleware.agent_finish import AgentFinished
+        try:
+            return await fn.acall_invoke(*args, **kwargs)
+        except AgentFinished as done:
+            # AutoGen ends a turn when the model sends a message with no tool call, and its stream
+            # sentinel is posted after the gather over tool calls -- so raising out of one hangs it
+            # (8 runs in 8) and merely returning the answer had the model call `finish` 95 more
+            # times. Said outright is what stops it.
+            return (f"{done.answer}\n\n[Recorded as the answer. Call no further tool: reply to the "
+                    "user with the text above as your message.]")
 
     async def callable_astream(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
         """Async generator to stream results from the NAT function.
@@ -121,8 +130,12 @@ def autogen_tool_wrapper(
         Yields:
             Any: Streamed items from the NAT function.
         """
-        async for item in fn.acall_stream(*args, **kwargs):
-            yield item
+        from nat.middleware.agent_finish import AgentFinished
+        try:
+            async for item in fn.acall_stream(*args, **kwargs):
+                yield item
+        except AgentFinished as done:
+            yield done.answer
 
     def nat_function(
         func: Callable[..., Any] | None = None,

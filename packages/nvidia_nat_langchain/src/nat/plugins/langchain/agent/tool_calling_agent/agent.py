@@ -51,9 +51,6 @@ logger = logging.getLogger(__name__)
 # Measured over 47 single-agent runs: the work itself finishes inside ~65 rounds, so a nudge
 # at 0.7 of the cap lands long after the agent is only circling.
 _WARN_AT = 0.4
-_LOOK_FIRST = ("You have not consulted any source yet. Use the tools to check what the task asks "
-               "about before you answer -- an answer recalled from memory is the wrong one often "
-               "enough that it is not worth giving.")
 _LOW = ("You have used {used} of your {total} turns. Bring what you have to a finished state and "
         "write the answer or the deliverable now; do not start anything you cannot complete.")
 _CLOSING = ("You have used all of your tool calls. Do not call any more tools. Write your "
@@ -85,7 +82,6 @@ class ToolCallAgentGraph(DualNodeAgent):
         truncation_scaling_fn: typing.Callable[[int], int] | None = None,
         max_empty_response_retries: int = 0,
         max_tool_rounds: int | None = None,
-        min_tool_rounds: int = 0,
     ):
         super().__init__(llm=llm,
                          tools=tools,
@@ -120,8 +116,6 @@ class ToolCallAgentGraph(DualNodeAgent):
         self.closing_agent = prompt_runnable | llm
         self.max_tool_rounds = max_tool_rounds
         self._warned_low = False
-        self.min_tool_rounds = min_tool_rounds
-        self._pushed_back = False
         self.tool_caller = ToolNode(tools, handle_tool_errors=handle_tool_errors)
         self.return_direct = [tool.name for tool in return_direct] if return_direct else []
 
@@ -182,14 +176,6 @@ class ToolCallAgentGraph(DualNodeAgent):
                 state.messages = state.messages + [HumanMessage(
                     content=_LOW.format(used=rounds, total=self.max_tool_rounds))]
             response = await self._invoke_llm(state, closing=closing)
-            # Asked once, and only where the task set says looking things up is the job: a run
-            # that answered with zero lookups got the surname right and the first name wrong.
-            if (self.min_tool_rounds and not self._pushed_back and not closing
-                    and rounds < self.min_tool_rounds and not getattr(response, "tool_calls", None)):
-                self._pushed_back = True
-                state.messages = state.messages + [HumanMessage(content=_LOOK_FIRST)]
-                response = await self._invoke_llm(state)
-
             if isinstance(response, AIMessageChunk):
                 response = _chunk_to_message(response)
 

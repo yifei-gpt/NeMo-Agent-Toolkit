@@ -447,7 +447,7 @@ async def workspace_edit(config: WorkspaceEditConfig, builder: Builder) -> Async
 class WorkspaceShellConfig(FunctionBaseConfig, name="workspace_shell"):
     uri: str = Field(default="http://127.0.0.1:6000", description="Sandbox base URL")
     timeout: float = Field(default=60.0, description="Seconds one command may run")
-    max_output_characters: int = Field(default=4000, description="Truncate combined output here")
+    max_output_characters: int = Field(default=16000, description="Truncate combined output here")
 
 
 @register_function(config_type=WorkspaceShellConfig)
@@ -483,13 +483,18 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
             out = f"[{body['process_status']}]\n{out}"
         out = out.strip() or "(no output)"
         cap = config.max_output_characters
-        return out[:cap] + f"\n...[cut at {cap} characters]" if len(out) > cap else out
+        if len(out) <= cap:
+            return out
+        return out[:cap] + (f"\n...[cut at {cap} characters. Send the output to a file and read it, "
+                            "or filter it here with head, tail or grep -- running this again returns "
+                            "the same cut.]")
 
+    # Named, not just described: agents guessed /app, the image's own workdir, and lost 3 steps.
     yield FunctionInfo.from_fn(_run, description=(
         "Run one shell command in the workspace and return its output. The working directory is "
-        "the workspace root, so paths are relative to it. For anything on the web use web_search "
-        "and web_fetch rather than curl or urllib here: those keep what they read where the rest "
-        "of the run can see it.\n\n"
+        f"the workspace root, {_root().as_posix()}, so paths are relative to it. For anything on "
+        "the web use web_search and web_fetch rather than curl or urllib here: those keep what "
+        "they read where the rest of the run can see it.\n\n"
         "Args:\n    command (str): the command line, e.g. `ls -la` or `python -m pytest -q`."))
 
 
@@ -528,15 +533,21 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
         p.parent.mkdir(parents=True, exist_ok=True)
         lines = p.read_text(encoding="utf-8").splitlines() if p.is_file() else []
         if steps.strip():
+            # A closed step stays closed: each specialist rewrites this list, and a plain replace
+            # reopened what the one before it had already finished.
+            shut = {l[6:].split("  (")[0].strip().lower(): l for l in lines if not l.startswith("- [ ]")}
             # Steps often arrive already bulleted, and "- [ ] - step" reads as a broken list.
-            lines = [f"- [ ] {_bare(s)}"
+            lines = [shut.get(_bare(s).strip().lower(), f"- [ ] {_bare(s)}")
                      for s in steps.splitlines() if s.strip()]
+        missed = []
         for mark, box, why in ([(x, "- [x]", "") for x in done.splitlines() if x.strip()]
                                + [(x, "- [-]", because) for x in giving_up.splitlines() if x.strip()]):
             for i, line in enumerate(lines):
                 if line.startswith("- [ ]") and mark.strip().lower() in line.lower():
                     lines[i] = line.replace("- [ ]", box, 1) + (f"  ({why.strip()})" if why.strip() else "")
                     break
+            else:
+                missed.append(mark.strip())
         if lines:
             p.write_text("\n".join(lines) + "\n", encoding="utf-8")
         if not lines:
@@ -544,6 +555,10 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
         left = sum(l.startswith("- [ ]") for l in lines)
         gave = sum(l.startswith("- [-]") for l in lines)
         tail = f"({left} of {len(lines)} still open" + (f", {gave} given up on)" if gave else ")")
+        # Saying nothing changed is the whole point: a silent no-op reads as success and gets retried.
+        if missed:
+            tail += ("\nNo open step matches " + ", ".join(repr(m) for m in missed)
+                     + " -- already closed, or never on the list.")
         return "\n".join(lines) + "\n\n" + tail
 
     yield FunctionInfo.from_fn(_run, description=(
