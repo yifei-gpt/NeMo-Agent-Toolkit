@@ -20,14 +20,10 @@ from nat.data_models.middleware import FunctionMiddlewareBaseConfig
 
 
 class OutputLimitMiddlewareConfig(FunctionMiddlewareBaseConfig, name="tool_output_limit"):
-    """Truncates tool output so a long transcript cannot exceed the context window."""
+    """Truncates what one tool call returns, so no single result floods the transcript."""
 
     max_chars: int = Field(default=8000, gt=0, description="Maximum characters returned by an intercepted call")
-    max_chars_per_run: int = Field(default=0, ge=0,
-                                   description="Total characters of tool output per run; 0 disables")
-    notice: str = Field(default="\n...[output truncated; narrow your query to see more]",
+    notice: str = Field(default=("\n...[cut here at the output limit. Asking again the same way "
+                                 "returns the same cut: ask for one part at a time, or have the "
+                                 "tool write to a file and read that.]"),
                         description="Appended when output is truncated")
-    spent_notice: str = Field(default=("[This run has read as much tool output as it is allowed. "
-                                       "Reading more will return nothing, however the query is "
-                                       "written. Answer now with what you already have.]"),
-                              description="Returned instead once the run's whole budget is spent")
