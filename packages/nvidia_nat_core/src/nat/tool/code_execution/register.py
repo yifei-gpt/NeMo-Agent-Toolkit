@@ -29,6 +29,9 @@ from nat.data_models.function import FunctionBaseConfig
 
 logger = logging.getLogger(__name__)
 
+# The same counter the output cap keeps: a tool that cuts itself loses just as much.
+from nat.middleware.output_limit.output_limit_middleware import FIRED
+
 
 class CodeExecutionToolConfig(FunctionBaseConfig, name="code_execution"):
     """
@@ -39,6 +42,9 @@ class CodeExecutionToolConfig(FunctionBaseConfig, name="code_execution"):
     sandbox_type: Literal["local", "piston"] = Field(default="local", description="The type of code execution sandbox")
     timeout: float = Field(default=10.0, description="Number of seconds to wait for a code execution request")
     max_output_characters: int = Field(default=1000, description="Maximum number of characters that can be returned")
+    # Declared, because pydantic ignores what it does not declare: a task set's own wording for
+    # this tool was being dropped without a word, and the model read the default instead.
+    description: str | None = Field(default=None, description="What the model is told this tool is")
 
 
 @register_function(config_type=CodeExecutionToolConfig)
@@ -111,16 +117,18 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
             output["stdout"] = text
         cap = config.max_output_characters
         if output.get("process_status") == "timeout" and not text:
+            FIRED[config.type] += 1
             output["stdout"] = ("No output: the sandbox times out when a single run prints more than "
                                 "about 60000 characters. Print a summary, not the whole thing.")
         elif len(text) > cap:
+            FIRED[config.type] += 1
             output["stdout"] = text[:cap] + f"\n... {len(text) - cap} more characters, print less"
         return output
 
     yield FunctionInfo.from_fn(
         fn=_execute_code,
         input_schema=CodeExecutionInputSchema,
-        description=("Runs `generated_code` in the task's own container and returns its stdout, "
+        description=(config.description or ("Runs `generated_code` in the task's own container and returns its stdout, "
                      "stderr and status. A shell command line works as well as python -- send "
                      "whichever suits the step. The session persists, so a directory you enter "
                      "and a file you write are still there on the next call."
@@ -128,4 +136,4 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
                      """Runs `generated_code` as python and returns its stdout, stderr and status.
         Print what you want to see -- nothing is returned otherwise, and no variable survives to the
         next call. The workspace is the working directory, so relative paths read and write the same
-        files the workspace tools see."""))
+        files the workspace tools see.""")))

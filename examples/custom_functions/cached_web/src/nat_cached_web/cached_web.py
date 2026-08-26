@@ -76,6 +76,41 @@ async def _ask(question: str, key: str, want: int, url: str) -> list[dict] | Non
     return rows[:want]
 
 
+# Every reply the metasearch makes carries this. It was taken out once for returning landing pages
+# silently, and a fallback nobody can see is the loop it caused: over six questions with known
+# answers it carried the answer none of six times, against six of six for the keyed API.
+_DEGRADED = ("\n\n[searched without a key, through the local metasearch. Most engines refuse this "
+             "host, and what answers tends to return pages ABOUT the subject rather than pages "
+             "holding the answer -- so treat a missing answer as a search that failed, not as a "
+             "fact that does not exist, and do not reword the same question against it. Set a "
+             "Serper key in ~/.config/markagentx/serper.key for real results.]")
+
+
+async def _searx(question: str, base_url: str, want: int, chars: int) -> tuple[bool, str] | None:
+    """The unkeyed path. -> (found anything, text), or None when the metasearch is not there."""
+    try:
+        async with httpx.AsyncClient(headers={"User-Agent": _USER_AGENT}, timeout=45.0) as client:
+            answer = await client.get(base_url.rstrip("/") + "/search",
+                                      params={"q": question, "format": "json", "safesearch": 0})
+            answer.raise_for_status()
+            body = answer.json()
+    except Exception as exc:  # noqa: BLE001 -- not reachable and not answering mean the same here
+        logger.warning("metasearch at %s did not answer: %s", base_url, exc)
+        return None
+    # Which engines refused: dropping this once turned a CAPTCHA'd Google and a rate-limited Brave
+    # into ten sign-in pages served as ordinary results, and agents reworded the same question
+    # forty times against them.
+    down = [str(e[0]) for e in (body.get("unresponsive_engines") or []) if e]
+    refused = ("\n[these engines refused this search: " + ", ".join(sorted(set(down))) + "]") if down else ""
+    found = body.get("results") or []
+    if not found:
+        return False, _NO_RESULTS + question + _DEGRADED + refused
+    lines = [f"[{i}] {r.get('title', '')}\n    {r.get('url', '')}\n    "
+             + " ".join((r.get("content") or "").split())[:chars]
+             for i, r in enumerate(found[:want], 1)]
+    return True, "\n".join(lines) + _DEGRADED + refused
+
+
 def _key_from(path: str) -> str:
     try:
         return Path(path).expanduser().read_text().strip()
@@ -176,15 +211,25 @@ def _from_pdf(raw: bytes, limit: int) -> str:
 class WebSearchConfig(FunctionBaseConfig, name="web_search_cached"):
     """Web search through a keyed API, memoized on disk.
 
-    A self-hosted metasearch stood here and was removed: seven of its eight engines refuse this
-    host -- four on the first request we ever sent, so it is the address and not our rate -- and
-    the one that answered returned landing pages. Over six questions with known answers it carried
-    the answer none of six times. An agent handed python.org for "Python 3.0 release year" rewords
-    the question, and that is the loop, so a search that cannot answer now says so instead.
+    A keyed API when there is a key, and a self-hosted metasearch when there is not, so the tool
+    works on a machine nobody has configured. They are not equals: seven of the metasearch's eight
+    engines refuse this host -- four on the first request we ever sent, so it is the address and
+    not our rate -- and the one that answers returns landing pages. Over six questions with known
+    answers it carried the answer none of six times, against six of six for the keyed API. An agent
+    handed python.org for "Python 3.0 release year" rewords the question, and that is the loop, so
+    every reply from the unkeyed path says which path it came from and what follows from it.
     """
 
-    key_file: str = Field(default="~/.config/markagentx/serper.key", description="API key file")
-    api_url: str = Field(default="https://google.serper.dev/search", description="Search endpoint")
+    key_file: str = Field(default="~/.config/markagentx/serper.key", description="Serper API key file")
+    # Without a key the tool would be dead on a fresh machine, so the metasearch stands behind it --
+    # loudly, because it is the weaker search and a reply that does not say so is the loop.
+    searx_url: str = Field(default="http://127.0.0.1:8888",
+                           description="Local SearxNG, used only when there is no key")
+    # Serper's, and only Serper's: the request carries its header and its parameter names, and the
+    # reply is read for `answerBox` and `organic`. Another provider answers 200 with nothing this
+    # can parse, which arrives as a search that found no results rather than as an error.
+    api_url: str = Field(default="https://google.serper.dev/search",
+                         description="Serper search endpoint")
     cache_dir: str = Field(description="Directory holding cached query results")
     max_results: int = Field(default=8, description="Results to return per query")
     max_chars_per_result: int = Field(default=400, description="Truncate each snippet here")
@@ -200,8 +245,13 @@ async def web_search_cached(tool_config: WebSearchConfig, builder: Builder):
     async def _fetch(question: str) -> tuple[bool, str]:
         key = _key_from(tool_config.key_file)
         if not key:
-            return False, ("Web search is not configured on this machine; work from what you have "
-                           "and say which parts you could not look up.")
+            thin = await _searx(question, tool_config.searx_url, tool_config.max_results,
+                                tool_config.max_chars_per_result)
+            if thin is not None:
+                return thin
+            return False, ("Web search is not configured on this machine: no key in "
+                           f"{tool_config.key_file} and no metasearch at {tool_config.searx_url}. "
+                           "Work from what you have and say which parts you could not look up.")
         rows = await _ask(question, key, tool_config.max_results, tool_config.api_url)
         if rows is None:
             return False, "Web search is unavailable right now; try again later or work without it."
