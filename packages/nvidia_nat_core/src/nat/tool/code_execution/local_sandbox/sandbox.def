@@ -1,0 +1,51 @@
+# Apptainer translation of Dockerfile.sandbox, for hosts with no container daemon.
+# Kept beside it so the two are edited together; every RUN/ENV/CMD below mirrors one there.
+Bootstrap: docker
+From: python:3.13-slim-bookworm
+
+%files
+    sandbox.requirements.txt /app/requirements.txt
+    local_sandbox_server.py /app/main.py
+
+%post
+    set -e
+    # Two namespace workarounds, one cause: a host with no /etc/subuid entry maps a single UID,
+    # so anything naming a second one fails with EINVAL.
+    #   1. apt drops to _apt to fetch. Off, or every package is "unable to locate".
+    #   2. fontconfig-config's postinst chowns /usr/local/share/fonts to root:staff -- gid 50,
+    #      unmappable -- and every R graphics dependency behind it stays unconfigured. fakeroot
+    #      does not reach it (dpkg runs the script's own chown), and a /usr/local/bin shim is not
+    #      on the PATH dpkg gives maintainer scripts, so /usr/bin/chown itself stands aside for
+    #      the one apt call that needs it, and is put back immediately after.
+    echo 'APT::Sandbox::User "root";' > /etc/apt/apt.conf.d/00-no-sandbox
+    apt update
+    apt upgrade -y
+
+    mv /usr/bin/chown /usr/bin/chown.real
+    printf '#!/bin/sh\nexit 0\n' > /usr/bin/chown && chmod +x /usr/bin/chown
+    # R is here because a task that asks for R code cannot install its own runtime, and the minutes
+    # that takes come out of the task's own budget.
+    apt install -y --no-install-recommends libexpat1 r-base-core r-cran-testthat
+    mv -f /usr/bin/chown.real /usr/bin/chown
+
+    apt clean && rm -rf /var/lib/apt/lists/*
+    pip install --no-cache-dir -r /app/requirements.txt
+    mkdir -p /workspace
+
+%environment
+    export UWSGI_CHEAPER="${UWSGI_CHEAPER:-5}"
+    export UWSGI_PROCESSES="${UWSGI_PROCESSES:-10}"
+    # uwsgi's own default is 60s, which cut every call at a minute whatever the tool asked for.
+    export UWSGI_HTTP_TIMEOUT=1200
+    export LISTEN_PORT="${LISTEN_PORT:-6000}"
+
+# What `apptainer instance start` runs -- the CMD line, verbatim.
+%startscript
+    cd /app && exec uwsgi --http 0.0.0.0:${LISTEN_PORT} --http-timeout ${UWSGI_HTTP_TIMEOUT} \
+        --socket-timeout ${UWSGI_HTTP_TIMEOUT} --harakiri ${UWSGI_HTTP_TIMEOUT} --master \
+        -p ${UWSGI_PROCESSES} --force-cwd /workspace -w main:app
+
+%runscript
+    cd /app && exec uwsgi --http 0.0.0.0:${LISTEN_PORT} --http-timeout ${UWSGI_HTTP_TIMEOUT} \
+        --socket-timeout ${UWSGI_HTTP_TIMEOUT} --harakiri ${UWSGI_HTTP_TIMEOUT} --master \
+        -p ${UWSGI_PROCESSES} --force-cwd /workspace -w main:app
