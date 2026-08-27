@@ -56,9 +56,9 @@ def _let_repeats_through() -> None:
         from crewai.tools.tool_usage import ToolUsage
     except Exception:  # noqa: BLE001 -- a crewai without it needs no patch
         return
-    if getattr(ToolUsage._check_tool_repeated_usage, "_markagentx", False):
+    if getattr(ToolUsage._check_tool_repeated_usage, "_nat_patched", False):
         return
     def _never(self, calling):  # noqa: ANN001, ARG001
         return False
-    _never._markagentx = True
+    _never._nat_patched = True
     ToolUsage._check_tool_repeated_usage = _never

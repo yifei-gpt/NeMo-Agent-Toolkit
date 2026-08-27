@@ -70,7 +70,7 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
         # python; a host chdir prepended there is both the wrong path and the wrong language.
         # Only a bridge the harness actually opened counts: the placeholder set for config
         # validation would otherwise skip the chdir and claim a container session that is not there.
-        bridge = os.environ.get("MARKAGENTX_BRIDGE_URL") if os.environ.get("MARKAGENTX_BRIDGE_READY") else None
+        bridge = os.environ.get("NAT_BRIDGE_URL") if os.environ.get("NAT_BRIDGE_READY") else None
         if not root or bridge:
             logger.info("sandbox preamble off (root=%s bridge=%s uri=%s)", bool(root), bridge, config.uri)
             return code
@@ -80,7 +80,7 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
     def _record(code: str, output: dict | None) -> None:
         """What the agent actually submitted, when asked for. The decision journal records which
         tool was chosen and never the code, and that is where a stuck or mistaken run hides."""
-        trail = os.environ.get("MARKAGENTX_CODE_LOG")
+        trail = os.environ.get("NAT_CODE_LOG")
         if not trail:
             return
         entry = {"code": code[:800]} if output is None else {
@@ -118,8 +118,8 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
         cap = config.max_output_characters
         if output.get("process_status") == "timeout" and not text:
             FIRED[config.type] += 1
-            output["stdout"] = ("No output: the sandbox times out when a single run prints more than "
-                                "about 60000 characters. Print a summary, not the whole thing.")
+            output["stdout"] = (f"No output: the run was stopped at the {config.timeout:g}s limit, and "
+                                "anything it printed is lost with it. Do less in one call.")
         elif len(text) > cap:
             FIRED[config.type] += 1
             output["stdout"] = text[:cap] + f"\n... {len(text) - cap} more characters, print less"
@@ -132,7 +132,7 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
                      "stderr and status. A shell command line works as well as python -- send "
                      "whichever suits the step. The session persists, so a directory you enter "
                      "and a file you write are still there on the next call."
-                     if os.environ.get("MARKAGENTX_BRIDGE_READY") else
+                     if os.environ.get("NAT_BRIDGE_READY") else
                      """Runs `generated_code` as python and returns its stdout, stderr and status.
         Print what you want to see -- nothing is returned otherwise, and no variable survives to the
         next call. The workspace is the working directory, so relative paths read and write the same
