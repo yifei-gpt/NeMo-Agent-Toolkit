@@ -39,7 +39,7 @@ def _root() -> Path:
 
 def _bridge() -> str | None:
     """The task's own container, when the harness opened one. The same flag run_code reads."""
-    return os.environ.get("MARKAGENTX_BRIDGE_URL") if os.environ.get("MARKAGENTX_BRIDGE_READY") else None
+    return os.environ.get("NAT_BRIDGE_URL") if os.environ.get("NAT_BRIDGE_READY") else None
 
 
 def _sh(command: str, timeout: float = 60.0) -> tuple[bool, str]:
@@ -608,20 +608,31 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
         # A bridged sandbox is the task's own container: its session already starts where the work
         # is and routes a command line to bash itself, so the host path baked in below would name a
         # directory that does not exist there. This is what run_code's own preamble check does.
-        if os.environ.get("MARKAGENTX_BRIDGE_READY"):
+        if os.environ.get("NAT_BRIDGE_READY"):
             wrapper = command
         else:
             # Run through the sandbox, never on this host: the tool exists because agents were
             # wrapping subprocess in run_code to get here anyway, and that path had no root and no cap.
+            # The cut is caught here, not left to surface as a TimeoutExpired traceback: that reads
+            # as a crash, and it throws away what the command had already printed.
             wrapper = (
                 "import subprocess, os\n"
                 f"cwd = {_root().as_posix()!r}\n"
                 "os.makedirs(cwd, exist_ok=True)\n"
-                f"r = subprocess.run({command!r}, shell=True, cwd=cwd, capture_output=True,\n"
-                f"                   text=True, timeout={config.timeout})\n"
-                "print(r.stdout, end='')\n"
-                "print(r.stderr, end='')\n"
-                "print(f'\\n[exit {r.returncode}]' if r.returncode else '', end='')\n")
+                "try:\n"
+                f"    r = subprocess.run({command!r}, shell=True, cwd=cwd, capture_output=True,\n"
+                f"                       text=True, timeout={config.timeout})\n"
+                "except subprocess.TimeoutExpired as cut:\n"
+                # TimeoutExpired carries the output as bytes even under text=True, and stderr as None.
+                "    got = [cut.stdout, cut.stderr]\n"
+                "    print(''.join(p.decode(errors='replace') if isinstance(p, bytes) else (p or '')\n"
+                "                  for p in got), end='')\n"
+                f"    print('\\n[stopped at the {config.timeout:g}s limit -- anything after this "
+                "was not run]', end='')\n"
+                "else:\n"
+                "    print(r.stdout, end='')\n"
+                "    print(r.stderr, end='')\n"
+                "    print(f'\\n[exit {r.returncode}]' if r.returncode else '', end='')\n")
         try:
             async with httpx.AsyncClient(timeout=config.timeout + 15) as client:
                 answer = await client.post(config.uri.rstrip("/") + "/execute",
@@ -645,7 +656,9 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
 
     # Named, not just described: agents guessed /app, the image's own workdir, and lost 3 steps.
     yield FunctionInfo.from_fn(_run, description=(
-        "Run one shell command in the workspace and return its output. The working directory is "
+        "Run one shell command in the workspace and return its output. Each call is a new shell, "
+        "so a `cd` or an exported variable is gone by the next one -- chain them in one command "
+        "line instead. The working directory is "
         f"the workspace root, {_root().as_posix()}, so paths are relative to it. For anything on "
         "the web use web_search and web_fetch rather than curl or urllib here: those keep what "
         "they read where the rest of the run can see it.\n\n"

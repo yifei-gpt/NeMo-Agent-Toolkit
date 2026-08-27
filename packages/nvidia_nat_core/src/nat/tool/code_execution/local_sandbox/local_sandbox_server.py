@@ -19,8 +19,10 @@ import logging
 import multiprocessing
 import os
 import resource
+import time
 from enum import StrEnum
 from io import StringIO
+from queue import Empty
 
 from flask import Flask
 from flask import Request
@@ -94,13 +96,37 @@ def execute_python(generated_code: str, timeout: float) -> CodeExecutionResult:
     process = multiprocessing.Process(target=execute_code_subprocess, args=(generated_code, queue))
 
     process.start()
-    # wait until the process finishes or the timeout expires
-    process.join(timeout=timeout)
+    # Drained before it is joined: `queue.put` blocks in the child until a reader takes the object,
+    # so joining first deadlocks on any output past the pipe buffer and loses all of it.
+    result, deadline = None, time.monotonic() + timeout
+    while result is None and time.monotonic() < deadline:
+        try:
+            result = queue.get(timeout=0.2)
+        except Empty:
+            if not process.is_alive():
+                try:                    # a child can exit with its result still in the pipe
+                    result = queue.get(timeout=0.5)
+                except Empty:
+                    pass
+                break
+    if result is None and process.exitcode is None:
+        process.kill()          # nothing came back, so ending it now loses nothing and saves the wait
+    process.join(timeout=5)
     if process.exitcode is None:
         process.kill()
+    if result is None:
         return CodeExecutionResult(process_status=CodeExecutionStatus.TIMEOUT, stdout="", stderr="Timed out\n")
+    return result
 
-    return queue.get()
+
+WIRE_LIMIT = 1_000_000
+
+
+def _bounded(capture):
+    """Far above what any caller keeps, and low enough that a runaway print cannot flood the wire."""
+    text = capture.getvalue()
+    return text if len(text) <= WIRE_LIMIT else (
+        text[:WIRE_LIMIT] + f"\n...[{len(text) - WIRE_LIMIT} more characters produced, not returned]")
 
 
 # need to memory-limit to avoid common errors of allocating too much
@@ -129,7 +155,7 @@ def execute_code_subprocess(generated_code: str, queue):
         with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
             exec(generated_code, {})
         logger.debug("execute_code_subprocess finished, PID: %s", os.getpid())
-        queue.put(CodeExecutionResult(stdout=stdout_capture.getvalue(), stderr=stderr_capture.getvalue()))
+        queue.put(CodeExecutionResult(stdout=_bounded(stdout_capture), stderr=_bounded(stderr_capture)))
     except Exception as e:
         import traceback
         with contextlib.redirect_stderr(stderr_capture):
@@ -137,8 +163,8 @@ def execute_code_subprocess(generated_code: str, queue):
         logger.debug("execute_code_subprocess failed, PID: %s, error: %s", os.getpid(), e)
         queue.put(
             CodeExecutionResult(process_status=CodeExecutionStatus.ERROR,
-                                stdout=stdout_capture.getvalue(),
-                                stderr=stderr_capture.getvalue()))
+                                stdout=_bounded(stdout_capture),
+                                stderr=_bounded(stderr_capture)))
 
 
 def do_execute(request: Request) -> CodeExecutionResponse:

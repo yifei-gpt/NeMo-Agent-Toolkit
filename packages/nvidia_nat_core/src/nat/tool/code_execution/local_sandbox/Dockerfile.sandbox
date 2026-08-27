@@ -21,8 +21,8 @@ ARG UWSGI_PROCESSES=10
 FROM python:3.13-slim-bookworm
 
 
-# R is here because a task that asks for R code cannot install its own runtime: the minutes and
-# the steps that takes are the task's budget, and they are decisions a watermark would mark.
+# R is here because a task that asks for R code cannot install its own runtime, and the minutes
+# that takes come out of the task's own budget.
 RUN apt update && \
     apt upgrade -y && \
     apt install -y --no-install-recommends libexpat1 r-base-core r-cran-testthat && \
@@ -42,8 +42,12 @@ ENV UWSGI_CHEAPER=$UWSGI_CHEAPER
 ARG UWSGI_PROCESSES
 ENV UWSGI_PROCESSES=$UWSGI_PROCESSES
 
+# uwsgi's own default is 60s, which cut every call at a minute whatever the tool asked for -- the
+# 900s the coding task sets was never reachable. Above the largest tool timeout, not equal to it.
+ENV UWSGI_HTTP_TIMEOUT=1200
+
 ENV LISTEN_PORT=6000
 EXPOSE 6000
 
 WORKDIR /app
-CMD uwsgi --http 0.0.0.0:${LISTEN_PORT} --master -p ${UWSGI_PROCESSES} --force-cwd /workspace -w main:app
+CMD uwsgi --http 0.0.0.0:${LISTEN_PORT} --http-timeout ${UWSGI_HTTP_TIMEOUT} --socket-timeout ${UWSGI_HTTP_TIMEOUT} --harakiri ${UWSGI_HTTP_TIMEOUT} --master -p ${UWSGI_PROCESSES} --force-cwd /workspace -w main:app

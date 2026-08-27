@@ -38,7 +38,7 @@ from nat.data_models.function import FunctionBaseConfig
 
 logger = logging.getLogger(__name__)
 
-_USER_AGENT = "markagentx-benchmarks (local research agent)"
+_USER_AGENT = "nat-agent (local benchmark run)"
 # A miss is usually throttling, so it expires instead of poisoning the query for every later run.
 _FAILURE_TTL_S = 86400.0
 _NO_RESULTS = "No web results for: "
@@ -83,7 +83,7 @@ _DEGRADED = ("\n\n[searched without a key, through the local metasearch. Most en
              "host, and what answers tends to return pages ABOUT the subject rather than pages "
              "holding the answer -- so treat a missing answer as a search that failed, not as a "
              "fact that does not exist, and do not reword the same question against it. Set a "
-             "Serper key in ~/.config/markagentx/serper.key for real results.]")
+             "Serper key in ~/.config/nat/serper.key for real results.]")
 
 
 async def _searx(question: str, base_url: str, want: int, chars: int) -> tuple[bool, str] | None:
@@ -220,7 +220,7 @@ class WebSearchConfig(FunctionBaseConfig, name="web_search_cached"):
     every reply from the unkeyed path says which path it came from and what follows from it.
     """
 
-    key_file: str = Field(default="~/.config/markagentx/serper.key", description="Serper API key file")
+    key_file: str = Field(default="~/.config/nat/serper.key", description="Serper API key file")
     # Without a key the tool would be dead on a fresh machine, so the metasearch stands behind it --
     # loudly, because it is the weaker search and a reply that does not say so is the loop.
     searx_url: str = Field(default="http://127.0.0.1:8888",

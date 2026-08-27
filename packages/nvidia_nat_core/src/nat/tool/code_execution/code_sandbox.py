@@ -59,7 +59,9 @@ class Sandbox(abc.ABC):
         output = self.http_session.post(
             url=self.url,
             data=json.dumps(request),
-            timeout=timeout_seconds,
+            # Headroom over the sandbox's own limit: given exactly it, the client gives up in the
+            # same moment the sandbox is returning, and its answer is lost to a client-side timeout.
+            timeout=timeout_seconds + 15,
             headers={"Content-Type": "application/json"},
         )
         # retrying 502 errors
