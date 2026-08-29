@@ -31,15 +31,17 @@ class AgentFinished(BaseException):
 
 
 def _usable(value: Any) -> Any:
-    """An agent out of turns hands back its last raw ReAct block, and a caller reads that monologue
-    as an answer, gets nothing from it, and sends the same request again. Say what it is instead."""
+    """A ReAct block is a monologue, not an answer: read as one it yields nothing and the caller
+    asks again. Said with an Action the agent ran out of turns; said without one it never acted --
+    under load CrewAI returned a bare Thought as the final answer, and the run produced no file."""
     if not isinstance(value, str):
         return value
     body = value.strip().strip("`").strip()
-    if body.startswith("Thought:") and "Action:" in body:
-        return ("[this specialist ran out of steps and did not finish; what it had established is "
-                "below. Treat it as partial -- sending it the same request returns the same thing.]"
-                "\n\n" + body)
+    if body.startswith("Thought:"):
+        note = ("ran out of steps and did not finish" if "Action:" in body
+                else "answered with its plan and never called a tool")
+        return (f"[this specialist {note}; what it had established is below. Treat it as partial "
+                "-- sending it the same request returns the same thing.]\n\n" + body)
     return value
 
 

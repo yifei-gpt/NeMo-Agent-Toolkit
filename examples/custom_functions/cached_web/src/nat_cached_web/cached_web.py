@@ -262,21 +262,32 @@ async def web_search_cached(tool_config: WebSearchConfig, builder: Builder):
             + " ".join(r["text"].split())[: tool_config.max_chars_per_result]
             for i, r in enumerate(rows, 1))
 
+    # Per run, since the closure is built per workflow: the cache is shared with other runs on
+    # purpose, so a hit says nothing, but the same question asked twice HERE does. One run asked
+    # the same search 132 times, each answer byte-identical, until the context window gave out.
+    asked: dict[str, int] = {}
+
+    def _said_before(question: str, result: str) -> str:
+        asked[question] = n = asked.get(question, 0) + 1
+        if n == 1:
+            return result
+        return f"{result}\n\n[you have asked this {n} times in this run; the answer is the same]"
+
     async def _search(question: str) -> str:
         question = " ".join(question.split())[:400]  # noqa: E501
         path = _cache(directory, f"search|v1|{question}|{tool_config.max_results}")
         cached = _read(path)
         if cached is not None:
-            return cached
+            return _said_before(question, cached)
         # Serialised: a fan-out of agents would otherwise look like a scraper to the upstreams.
         async with lock:
             cached = _read(path)
             if cached is not None:
-                return cached
+                return _said_before(question, cached)
             await _pace(directory, tool_config.min_request_interval_s)
             ok, result = await _fetch(question)
             _write(path, question, ok, result)
-        return result
+        return _said_before(question, result)
 
     yield FunctionInfo.from_fn(
         _search,
