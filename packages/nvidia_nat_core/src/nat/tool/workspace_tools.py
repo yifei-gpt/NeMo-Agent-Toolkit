@@ -584,6 +584,10 @@ async def workspace_edit(config: WorkspaceEditConfig, builder: Builder) -> Async
         if hits > 1:
             # Editing the first of several is how a file quietly gets the wrong one changed.
             return f"that passage appears {hits} times in {path}; extend `old` until it is unique."
+        # As workspace_write does: a staged world is symlinks into the shared dataset, and writing
+        # through one edits the dataset for every run after this.
+        if p.is_symlink():
+            p.unlink()
         p.write_text(body.replace(old, new), encoding="utf-8")
         return f"edited {p.relative_to(_root())} ({len(old)} chars -> {len(new)})"
 

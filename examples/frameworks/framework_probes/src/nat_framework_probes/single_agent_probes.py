@@ -55,6 +55,7 @@ class AutogenProbeConfig(FunctionBaseConfig, name="autogen_probe"):
 @register_function(config_type=AdkProbeConfig, framework_wrappers=[LLMFrameworkEnum.ADK])
 async def adk_probe(config: AdkProbeConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
     from google.adk.agents import Agent
+    from google.adk.agents.invocation_context import LlmCallsLimitExceededError
     from google.adk.agents.run_config import RunConfig
     from google.adk.artifacts import InMemoryArtifactService
     from google.adk.runners import Runner
@@ -80,10 +81,16 @@ async def adk_probe(config: AdkProbeConfig, builder: Builder) -> AsyncGenerator[
         parts: list[str] = []
         # The only turn cap ADK offers; without it this is the one framework a run cannot bound.
         limit = RunConfig(max_llm_calls=config.max_iter)
-        async for event in runner.run_async(user_id="bench", session_id=session.id,
-                                            new_message=content, run_config=limit):
-            if event.content and event.content.parts:
-                parts.extend(p.text for p in event.content.parts if p.text)
+        try:
+            async for event in runner.run_async(user_id="bench", session_id=session.id,
+                                                new_message=content, run_config=limit):
+                if event.content and event.content.parts:
+                    parts.extend(p.text for p in event.content.parts if p.text)
+        except LlmCallsLimitExceededError:
+            # The other three hand back what they have when the cap lands; raising threw the work
+            # away and graded as no answer at all.
+            logger.warning("adk stopped at its %d-call cap; returning the work so far",
+                           config.max_iter)
         return "".join(parts)
 
     yield FunctionInfo.from_fn(_run, description="Run a single Google ADK agent over the configured NAT tools")
