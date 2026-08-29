@@ -37,12 +37,16 @@ def _usable(value: Any) -> Any:
     if not isinstance(value, str):
         return value
     body = value.strip().strip("`").strip()
-    if body.startswith("Thought:"):
-        note = ("ran out of steps and did not finish" if "Action:" in body
-                else "answered with its plan and never called a tool")
-        return (f"[this specialist {note}; what it had established is below. Treat it as partial "
-                "-- sending it the same request returns the same thing.]\n\n" + body)
-    return value
+    if not body.startswith(("Thought:", "Action:", "Action Input:")):
+        return value
+    # `Action:` alone is the one a zero-argument tool provokes: CrewAI's parser wants an
+    # `Action Input:` line beside it, the model leaves it off for a tool that needs none, and
+    # after its retries the fragment comes back as the answer.
+    note = ("ran out of steps and did not finish" if body.startswith("Thought:") and "Action:" in body
+            else "answered with its plan and never called a tool" if body.startswith("Thought:")
+            else "named an action its framework could not parse and never called a tool")
+    return (f"[this specialist {note}; what it had established is below. Treat it as partial "
+            "-- sending it the same request returns the same thing.]\n\n" + body)
 
 
 class AgentFinishMiddleware(FunctionMiddleware):
