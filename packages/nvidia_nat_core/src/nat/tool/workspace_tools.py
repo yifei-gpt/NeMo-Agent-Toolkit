@@ -111,6 +111,10 @@ def _pdf_text(p: Path) -> str | None:
         stamp = (str(p), -1, -1.0)
     if stamp in _PDF_REFUSED:
         return None
+    # A workspace tree carries empty placeholder files; an empty one is not a broken PDF, and
+    # warning per file per search buried the reads that did fail.
+    if stamp[1] == 0:
+        return None
     try:
         done = subprocess.run([sys.executable, "-c", _PDF_CHILD, str(p)],
                               capture_output=True, timeout=60, check=False)
@@ -682,13 +686,19 @@ async def think(config: ThinkConfig, builder: Builder) -> AsyncGenerator[Functio
         "the next few steps.\n\nArgs:\n    thought (str): the reasoning to work through."))
 
 
+# Keyed by workspace, which is per task, so one process running a batch keeps them apart.
+_PLANS: dict[str, list[str]] = {}
+
+
 class TaskListConfig(FunctionBaseConfig, name="task_list"):
-    path: str = Field(default="_notes/tasks.md", description="Where the list is kept")
+    pass
 
 
 @register_function(config_type=TaskListConfig)
 async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
-    """The plan as a file, so a long run can be resumed and audited rather than remembered.
+    """The plan as run state, shared by every agent on this task.
+
+    State, not a workspace file: one there was searched, graded, and half-visible over the bridge.
 
     Three states, not two: closing a step by SOLVING it is the only way an agent had, so a step it
     could not solve stayed open and it kept trying. `giving_up` closes one and says why, and the
@@ -696,9 +706,8 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
     """
 
     async def _run(steps: str = "", done: str = "", giving_up: str = "", because: str = "") -> str:
-        p = _resolve(config.path)
-        p.parent.mkdir(parents=True, exist_ok=True)
-        lines = p.read_text(encoding="utf-8").splitlines() if p.is_file() else []
+        key = str(_root())
+        lines = list(_PLANS.get(key, []))
         before = list(lines)
         if steps.strip():
             # A closed step stays closed: each specialist rewrites this list, and a plain replace
@@ -717,7 +726,7 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
             else:
                 missed.append(mark.strip())
         if lines:
-            p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            _PLANS[key] = lines
         if not lines:
             return "The list is empty; send `steps` to start one."
         left = sum(l.startswith("- [ ]") for l in lines)
@@ -736,7 +745,7 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
         "Keep the plan for this task as a checklist. Call it once with `steps` to write the plan, "
         "then with `done` after finishing one, or with `giving_up` and `because` for one you tried "
         "and could not settle -- writing that down is what keeps you, and anyone after you, from "
-        "trying it again. With no arguments it shows where you are. It outlives this conversation."
+        "trying it again. With no arguments it shows where you are. Every agent here shares it."
         "\n\nArgs:\n    steps (str): the plan, one step per line -- replaces any existing list.\n"
         "    done (str): text identifying a step to tick off, one per line.\n"
         "    giving_up (str): text identifying a step to close unsolved.\n"
