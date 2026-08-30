@@ -43,6 +43,15 @@ class AdkProbeConfig(FunctionBaseConfig, name="adk_probe"):
     max_iter: int = Field(default=250, description="Model calls before the run must end")
 
 
+class StrandsProbeConfig(FunctionBaseConfig, name="strands_probe"):
+    """Single Strands agent over NAT tools."""
+
+    llm_name: LLMRef = Field(description="Model to use via the Strands wrapper")
+    tool_names: list[FunctionRef] = Field(default_factory=list, description="NAT tools exposed to the agent")
+    system_prompt: str = Field(default=DEFAULT_PROMPT, description="Agent instructions")
+    max_iter: int = Field(default=250, description="Model calls before the run must end")
+
+
 class AutogenProbeConfig(FunctionBaseConfig, name="autogen_probe"):
     """Single AutoGen assistant over NAT tools."""
 
@@ -50,6 +59,27 @@ class AutogenProbeConfig(FunctionBaseConfig, name="autogen_probe"):
     tool_names: list[FunctionRef] = Field(default_factory=list, description="NAT tools exposed to the agent")
     system_prompt: str = Field(default=DEFAULT_PROMPT, description="Agent instructions")
     max_turns: int = Field(default=20, description="Maximum assistant turns")
+
+
+@register_function(config_type=StrandsProbeConfig, framework_wrappers=[LLMFrameworkEnum.STRANDS])
+async def strands_probe(config: StrandsProbeConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
+    from strands import Agent
+    from strands.agent.conversation_manager import SlidingWindowConversationManager
+
+    llm = await builder.get_llm(config.llm_name, wrapper_type=LLMFrameworkEnum.STRANDS)
+    tools = await builder.get_tools(config.tool_names, wrapper_type=LLMFrameworkEnum.STRANDS)
+
+    async def _run(inputs: str) -> str:
+        # An agent per question: Strands keeps the conversation on the object, and a benchmark
+        # item that inherits the last one's history is not the item the grader poses.
+        agent = Agent(model=llm, tools=tools, system_prompt=config.system_prompt,
+                      callback_handler=None,
+                      conversation_manager=SlidingWindowConversationManager(
+                          window_size=config.max_iter))
+        result = await agent.invoke_async(inputs)
+        return str(result)
+
+    yield FunctionInfo.from_fn(_run, description="Answer the task with one Strands agent")
 
 
 @register_function(config_type=AdkProbeConfig, framework_wrappers=[LLMFrameworkEnum.ADK])
