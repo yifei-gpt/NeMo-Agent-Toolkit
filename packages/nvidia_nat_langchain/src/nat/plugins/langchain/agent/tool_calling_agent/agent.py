@@ -264,6 +264,14 @@ class ToolCallAgentGraph(DualNodeAgent):
                 raw_calls,
                 metadata,
             )
+            # Asked again, as an empty response and a truncated one already are: all three end
+            # the turn with nothing to act on, and only this one used to end the run with it.
+            for attempt in range(1, self._max_empty_response_retries + 1):
+                response = await self._invoke_llm(state)
+                if response.tool_calls:
+                    logger.info("%s Invalid tool call retry succeeded on attempt %d",
+                                AGENT_LOG_PREFIX, attempt)
+                    break
 
         # Content filter — LLM provider blocked the response
         if finish_reason == LLMFinishReason.CONTENT_FILTER:
