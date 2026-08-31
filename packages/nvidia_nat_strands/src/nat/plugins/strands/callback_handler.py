@@ -128,8 +128,16 @@ class StrandsToolInstrumentationHook:
                 content = result.get('content', [])
                 if isinstance(content, list):
                     for item in content:
-                        if isinstance(item, dict) and 'text' in item:
+                        if not isinstance(item, dict):
+                            continue
+                        # A tool that returns a dict is carried in a `json` block, not a `text`
+                        # one, and reading only text left every such result blank in the trace --
+                        # run_code's whole output, on every run. The model is not missing it:
+                        # models/openai.py json.dumps() the same block on its way out.
+                        if 'text' in item:
                             tool_output += item['text']
+                        elif 'json' in item:
+                            tool_output += json.dumps(item['json'], default=str)
 
             # Handle errors
             if exception:

@@ -63,6 +63,7 @@ class AutogenProbeConfig(FunctionBaseConfig, name="autogen_probe"):
 
 @register_function(config_type=StrandsProbeConfig, framework_wrappers=[LLMFrameworkEnum.STRANDS])
 async def strands_probe(config: StrandsProbeConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
+    from nat.plugins.strands.tool_wrapper import FINISHED_ON
     from strands import Agent
     from strands.agent.conversation_manager import SlidingWindowConversationManager
 
@@ -76,8 +77,20 @@ async def strands_probe(config: StrandsProbeConfig, builder: Builder) -> AsyncGe
                       callback_handler=None,
                       conversation_manager=SlidingWindowConversationManager(
                           window_size=config.max_iter))
-        result = await agent.invoke_async(inputs)
-        return str(result)
+        # Streamed rather than awaited, so the loop can be left the moment a tool says the run is
+        # over: Strands has no way for a tool to stop it, and the exception that stops the other
+        # three frameworks dies inside the task Strands runs each tool in.
+        events = agent.stream_async(inputs)
+        last = None
+        try:
+            async for event in events:
+                answered = getattr(agent, FINISHED_ON, None)
+                if answered is not None:
+                    return answered
+                last = event.get("result", last) if isinstance(event, dict) else last
+        finally:
+            await events.aclose()
+        return str(last if last is not None else "")
 
     yield FunctionInfo.from_fn(_run, description="Answer the task with one Strands agent")
 

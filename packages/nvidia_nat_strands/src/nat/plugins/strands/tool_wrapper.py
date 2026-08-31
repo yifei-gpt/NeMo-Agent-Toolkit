@@ -30,6 +30,15 @@ from strands.types.tools import ToolUse  # type: ignore
 
 logger = logging.getLogger(__name__)
 
+from nat.middleware.agent_finish import AgentFinished
+
+# Where a tool leaves the answer it raised. Set on the agent because Strands runs each tool in its
+# own task, and a task gets a COPY of the context: anything a context variable holds there is
+# invisible outside it. The agent is one object shared by reference, and a fresh one per question.
+FINISHED_ON = "_nat_finished"
+
+
+
 
 def _json_schema_from_pydantic(model: type[BaseModel]) -> dict[str, Any]:
     try:
@@ -91,7 +100,7 @@ class NATFunctionAgentTool(AgentTool):
     def tool_type(self) -> str:
         return "function"
 
-    async def stream(self, tool_use: ToolUse, _invocation_state: dict[str, Any],
+    async def stream(self, tool_use: ToolUse, invocation_state: dict[str, Any],
                      **_kwargs: Any) -> AsyncGenerator[Any, None]:
         """
         Stream tool events and return the final result.
@@ -127,6 +136,16 @@ class NATFunctionAgentTool(AgentTool):
 
             result = await self._fn.acall_invoke(**tool_input)
             yield ToolResultEvent(_to_tool_result(tool_use_id, result))
+        except AgentFinished as done:
+            # Strands runs each tool in its own asyncio task and catches only Exception there
+            # (tools/executors/concurrent.py), so a BaseException raised to stop the run dies with
+            # that task and the loop reads it as a tool that returned nothing -- the model calls
+            # finish again, and again. Left on the agent for the caller to see, and answered so the
+            # transcript is not holding a tool_use with no result.
+            agent = (invocation_state or {}).get("agent")
+            if agent is not None:
+                setattr(agent, FINISHED_ON, str(done))
+            yield ToolResultEvent(_to_tool_result(tool_use_id, "The run is over; stop now."))
         except Exception as exc:  # noqa: BLE001
             logger.exception("Strands tool '%s' failed", self.tool_name)
             yield ToolResultEvent(_to_error_result(tool_use_id, exc))
