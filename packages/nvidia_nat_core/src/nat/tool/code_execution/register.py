@@ -115,6 +115,15 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
             tail = str(output.get("stderr") or "").strip()[-600:]
             text = (text + "\n\n[the run raised after this output]\n" + tail).strip()
             output["stdout"] = text
+        # Code that only assigns returns an empty string, which reads exactly like a broken tool:
+        # one run called this 211 times with the same body and was told nothing each time, because
+        # nothing distinguished "it worked and printed nothing" from "it did not run".
+        if output.get("process_status") == "completed" and not text:
+            said = str(output.get("stderr") or "").strip()[-400:]
+            output["stdout"] = ("The code ran to the end and printed nothing, so there is nothing "
+                                "to show. Print what you want to see -- run again unchanged and "
+                                "this is what comes back."
+                                + (f"\n\n[it wrote to stderr]\n{said}" if said else ""))
         cap = config.max_output_characters
         if output.get("process_status") == "timeout" and not text:
             FIRED[config.type] += 1

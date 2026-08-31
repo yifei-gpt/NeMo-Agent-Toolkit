@@ -115,6 +115,14 @@ def execute_python(generated_code: str, timeout: float) -> CodeExecutionResult:
     if process.exitcode is None:
         process.kill()
     if result is None:
+        # A child that died without answering is not a child that ran too long: the OOM killer,
+        # a segfault and an interpreter abort all land here, and calling them a timeout sends back
+        # "do less in one call" for something doing less will not fix.
+        if process.exitcode is not None and process.exitcode < 0:
+            return CodeExecutionResult(
+                process_status=CodeExecutionStatus.ERROR, stdout="",
+                stderr=f"The process was killed by signal {-process.exitcode} before it could "
+                       f"answer -- it did not run out of time. Memory is the usual cause.\n")
         return CodeExecutionResult(process_status=CodeExecutionStatus.TIMEOUT, stdout="", stderr="Timed out\n")
     return result
 
