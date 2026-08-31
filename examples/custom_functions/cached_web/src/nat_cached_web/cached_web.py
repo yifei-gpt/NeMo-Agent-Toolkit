@@ -148,14 +148,20 @@ def _cache(directory: Path, key: str) -> Path:
     return directory / f"{hashlib.sha256(key.encode()).hexdigest()[:32]}.json"
 
 
-def _read(path: Path) -> str | None:
+def _entry(path: Path) -> tuple[bool, str] | None:
+    """(the fetch succeeded, what was stored), or None when nothing usable is cached."""
     try:
         entry = json.loads(path.read_text())
         age = time.time() - path.stat().st_mtime
     except (OSError, ValueError):
         return None
-    result = entry.get("result", "")
-    return result if entry.get("ok") or age < _FAILURE_TTL_S else None
+    ok = bool(entry.get("ok"))
+    return (ok, entry.get("result", "")) if ok or age < _FAILURE_TTL_S else None
+
+
+def _read(path: Path) -> str | None:
+    got = _entry(path)
+    return got[1] if got else None
 
 
 def _write(path: Path, question: str, ok: bool, result: str) -> None:
@@ -315,9 +321,11 @@ async def web_find_cached(tool_config: WebFindConfig, builder: Builder):
     directory = Path(tool_config.cache_dir)
 
     async def _find(url: str, phrase: str) -> str:
-        page = _read(_cache(directory, _page_key(url.strip(), tool_config.store_chars)))
-        if page is None:
+        got = _entry(_cache(directory, _page_key(url.strip(), tool_config.store_chars)))
+        # A cached failure is not a page: searched as one, every phrase "does not appear" in it.
+        if got is None or not got[0]:
             return f"{url} has not been read yet -- call web_fetch on it first."
+        page = got[1]
         hits, start, width = [], 0, tool_config.context_chars
         lowered, needle = page.lower(), " ".join(phrase.split()).lower()
         if not needle:
@@ -372,9 +380,19 @@ async def web_fetch_cached(tool_config: WebFetchConfig, builder: Builder):
                     return False, f"{url} is {kind or 'not text'}; nothing to read."
                 return True, _as_text(answer.text, tool_config.store_chars)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("web fetch failed for %s: %s", url[:80], exc)
-            # Said plainly, because the common cause is a guessed URL and the agent otherwise
-            # guesses a second one instead of searching for the real address.
+            code = getattr(getattr(exc, "response", None), "status_code", None)
+            logger.warning("web fetch failed for %s: %s", url[:80], exc or type(exc).__name__)
+            # Which advice is right turns on the code: re-searching a 403 returns the same blocked
+            # address, and the agent re-searched it until its step budget ran out.
+            if code in (401, 403):
+                return False, (f"Could not read {url} ({code}): this site refuses automated "
+                               "readers. The address is fine -- find the same fact somewhere else "
+                               "rather than searching for this page again.")
+            if code == 429:
+                return False, f"Could not read {url} (429): asked too often. Come back to it later."
+            if code == 404:
+                return False, (f"Could not read {url} (404): nothing is there. If you guessed this "
+                               "address, call web_search for the page instead of guessing again.")
             return False, (f"Could not read {url} ({type(exc).__name__}). If you guessed this "
                            "address, call web_search for the page instead of guessing again.")
 
