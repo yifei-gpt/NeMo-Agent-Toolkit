@@ -3,6 +3,7 @@
 
 """Workspace file tools for benchmarks that hand an agent a directory and a brief."""
 
+import contextlib
 import logging
 import os
 import re
@@ -67,9 +68,26 @@ def _sh(command: str, timeout: float = 60.0) -> tuple[bool, str]:
     return True, (got.get("stdout") or "") + (got.get("stderr") or "")
 
 
+def _where() -> str:
+    """Container briefs name their files absolutely, and the root IS that directory: `x` and
+    `/app/x` are one file. Unsaid, the model reads the mismatch as "these tools cannot reach it"
+    and writes through bash heredocs instead."""
+    return (f" This task's workspace root is {_CONTAINER_ROOT}, so `x` and {_CONTAINER_ROOT}/x name "
+            f"the same file; either form works here." if _bridge() else "")
+
+
 def _bare(step: str) -> str:
     """A step as text: agents send them bulleted, numbered, or already boxed."""
     return re.sub(r"^[-*\d.)\s]*(\[[ xX-]\])?\s*", "", step.strip())
+
+
+def _nothing_read(path: str, size: int, offset: int) -> str:
+    """An empty read means an empty file or an offset past the end, and the bare "" it returned
+    means those and a broken tool alike -- one run asked for the same empty file twice over."""
+    if size <= 0:
+        return f"{path} exists and is empty; there is nothing in it to read."
+    return (f"nothing at offset {offset}: {path} is {size} characters long, so that is past its "
+            f"end. Read it from 0, or from an offset below {size}.")
 
 
 def _resolve(rel: str) -> Path:
@@ -87,13 +105,18 @@ def _resolve(rel: str) -> Path:
 
 logger = logging.getLogger(__name__)
 
+_PART_OF = ("\n\n[only the first {kept} {unit} were read, of {whole}; the rest is not shown and searching this file will not find it]")
+
 # Counted where the cap middleware counts its own: a dropped match is a dropped match.
 from nat.middleware.output_limit.output_limit_middleware import FIRED
 
 # Out of process: one malformed PDF can hang pdfminer or crash the interpreter, uncatchably.
 _PDF_CHILD = ("import sys, pdfplumber\n"
               "with pdfplumber.open(sys.argv[1]) as pdf:\n"
-              "    sys.stdout.write('\\n'.join((p.extract_text() or '') for p in pdf.pages[:40]))\n")
+              "    sys.stdout.write('\\n'.join((p.extract_text() or '') for p in pdf.pages[:40]))\n"
+              # Said, not guessed: without the count the parent cannot tell 40 pages from 400,
+              # and workspace_read then reports the head of a long document as the whole of it.
+              "    sys.stderr.write(str(len(pdf.pages)))\n")
 
 
 # A PDF that could not be parsed cannot be parsed the next time either, and each attempt costs
@@ -126,7 +149,15 @@ def _pdf_text(p: Path) -> str | None:
         logger.warning("PDF %s could not be parsed (exit %s)", p.name, done.returncode)
         _PDF_REFUSED[stamp] = None
         return None
-    return done.stdout.decode("utf-8", "ignore").strip() or None
+    text = done.stdout.decode("utf-8", "ignore").strip() or None
+    # The child wrote the page census to stderr: 40 pages of a 266-page filing is not the filing,
+    # and workspace_read reports a head it was never told was a head as the whole document.
+    if text:
+        with contextlib.suppress(ValueError):
+            whole = int(done.stderr.decode("utf-8", "ignore").strip() or 0)
+            if whole > 40:
+                text += _PART_OF.format(kept=40, whole=whole, unit="pages of this PDF")
+    return text
 
 
 def _extract(p: Path) -> str | None:
@@ -160,7 +191,12 @@ def _extract_uncached(p: Path) -> str | None:
                 for name in parts[:40]:
                     raw = z.read(name).decode("utf-8", errors="ignore")
                     chunks.append(re.sub(r"<[^>]+>", " ", raw))
-                return re.sub(r"\s+", " ", " ".join(chunks)).strip() or None
+                text = re.sub(r"\s+", " ", " ".join(chunks)).strip() or None
+                # A document read down to its first 40 parts is not the document, and silence here
+                # reads downstream as "this is all of it".
+                if text and len(parts) > 40:
+                    text += _PART_OF.format(kept=40, whole=len(parts), unit="parts of this file")
+                return text
         except Exception:
             return None
     if suffix == ".pdf":
@@ -288,6 +324,8 @@ async def workspace_read(config: WorkspaceReadConfig, builder: Builder) -> Async
                     size = int(total.strip())
                 except ValueError:
                     return out
+                if not chunk:
+                    return _nothing_read(path, size, offset)
                 rest = size - offset - len(chunk)
                 if rest <= 0:
                     return chunk
@@ -302,6 +340,8 @@ async def workspace_read(config: WorkspaceReadConfig, builder: Builder) -> Async
         if text is None:
             return f"{path} is a binary file ({p.stat().st_size} bytes) with no text extractor."
         chunk = text[offset:offset + config.max_chars]
+        if not chunk:
+            return _nothing_read(path, len(text), offset)
         rest = len(text) - offset - len(chunk)
         if rest <= 0:
             return chunk
@@ -310,7 +350,7 @@ async def workspace_read(config: WorkspaceReadConfig, builder: Builder) -> Async
 
     yield FunctionInfo.from_fn(_run, description=(
         "Read a workspace file as text. Args: `path` relative to the root, and `offset` to continue "
-        "a long file from where the last call stopped."))
+        "a long file from where the last call stopped." + _where()))
 
 
 def _add_table(doc, rows: list[str]) -> None:
@@ -474,7 +514,7 @@ async def workspace_write(config: WorkspaceWriteConfig, builder: Builder) -> Asy
         "`.docx` wants markdown-ish prose -- a blank line ends a paragraph, a leading `#`, `##` or `###` "
         "makes a heading of that level, and a run of `| a | b |` rows becomes a real table; "
         "`.pptx` wants one blank-line-separated block per slide, first line the title and the rest bullets. "
-        "Every other extension is stored as the exact text you send."))
+        "Every other extension is stored as the exact text you send." + _where()))
 
 
 class WorkspaceSearchConfig(FunctionBaseConfig, name="workspace_search"):
@@ -527,7 +567,13 @@ async def workspace_search(config: WorkspaceSearchConfig, builder: Builder) -> A
             rel = str(p.relative_to(_root()))
             for i, line in enumerate(text.splitlines(), 1):
                 if needle in line.lower():
-                    hits.append(f"{rel}:{i}: {line.strip()[:200]}")
+                    said = line.strip()
+                    # A CSV row or a minified file is one long line, and its first 200 characters
+                    # read exactly like all of it. The bridged grep does not cut at all, so
+                    # unmarked this tool answers differently depending on whether a container is up.
+                    hits.append(f"{rel}:{i}: {said[:200]}"
+                                + (f"  ...[+{len(said) - 200} more on this line]"
+                                   if len(said) > 200 else ""))
                     if len(hits) > config.max_hits:
                         # Past the cap the agent needs a narrower query, not an arbitrary prefix.
                         FIRED[config.type] += 1
@@ -543,7 +589,7 @@ async def workspace_search(config: WorkspaceSearchConfig, builder: Builder) -> A
     yield FunctionInfo.from_fn(_run, description=(
         "Search workspace file contents and return matching lines with their paths. `query` is plain "
         "text matched case-insensitively, not a regular expression -- for a regex use bash with grep. "
-        "Args: `query`, optional `subdir`, and `path_contains` to restrict which files are scanned."))
+        "Args: `query`, optional `subdir`, and `path_contains` to restrict which files are scanned." + _where()))
 
 
 class WorkspaceEditConfig(FunctionBaseConfig, name="workspace_edit"):
@@ -596,7 +642,7 @@ async def workspace_edit(config: WorkspaceEditConfig, builder: Builder) -> Async
         "existing file; workspace_write replaces the whole file and loses anything you did not "
         "resend.\n\nArgs:\n    path (str): the file, relative to the workspace root.\n"
         "    old (str): the exact text to replace, unique in the file.\n"
-        "    new (str): what to put there."))
+        "    new (str): what to put there." + _where()))
 
 
 class WorkspaceShellConfig(FunctionBaseConfig, name="workspace_shell"):
