@@ -695,7 +695,12 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
                 answer.raise_for_status()
                 body = answer.json()
         except Exception as exc:  # noqa: BLE001 -- any failure to run means the same thing
-            return f"the shell is unavailable right now ({type(exc).__name__})."
+            # Not "right now": that reads as a wait, and an agent told to wait re-sends the same
+            # command until its budget is gone -- thirty-six times in one run measured here. What
+            # it cannot work out for itself is that nothing it types will change this answer.
+            return (f"the shell is not running ({type(exc).__name__}). This is the sandbox, not "
+                    f"your command: the same command will get this same answer, so use the other "
+                    f"tools and say so in your answer if the task needed a shell.")
         out = (body.get("stdout") or "") + (body.get("stderr") or "")
         if body.get("process_status") not in (None, "completed", "success"):
             out = f"[{body['process_status']}]\n{out}"
