@@ -266,7 +266,9 @@ class ToolCallAgentGraph(DualNodeAgent):
             )
             # Asked again, as an empty response and a truncated one already are: all three end
             # the turn with nothing to act on, and only this one used to end the run with it.
-            for attempt in range(1, self._max_empty_response_retries + 1):
+            # Its own count, not max_empty_response_retries: that one defaults to 0 and governs a
+            # different failure, so borrowing it would leave this branch doing nothing at all.
+            for attempt in range(1, 3):
                 response = await self._invoke_llm(state)
                 if response.tool_calls:
                     logger.info("%s Invalid tool call retry succeeded on attempt %d",
