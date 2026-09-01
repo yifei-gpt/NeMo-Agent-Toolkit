@@ -704,7 +704,12 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
         out = (body.get("stdout") or "") + (body.get("stderr") or "")
         if body.get("process_status") not in (None, "completed", "success"):
             out = f"[{body['process_status']}]\n{out}"
-        out = out.strip() or "(no output)"
+        # A command that succeeds and prints nothing -- a heredoc, a bare `#` comment the model
+        # meant as a thought -- otherwise returns "", which reads as a tool that did nothing and
+        # gets re-sent. One run re-sent the same comment 95 times. Say the command ran and left
+        # no output, so re-running it is pointless; think() is where a thought belongs.
+        out = out.strip() or ("the command ran and exited 0 with no output -- re-running it will "
+                              "return this again. If you meant to reason, use think; otherwise move on.")
         cap = config.max_output_characters
         if len(out) <= cap:
             return out
@@ -741,8 +746,15 @@ async def think(config: ThinkConfig, builder: Builder) -> AsyncGenerator[Functio
         "the next few steps.\n\nArgs:\n    thought (str): the reasoning to work through."))
 
 
-# Keyed by workspace, which is per task, so one process running a batch keeps them apart.
+# Keyed by workspace and shared by every agent on one task. A process running tasks in turn reuses
+# one workspace, so the key alone does not keep them apart -- reset_task_plan drops the plan at each
+# task boundary rather than carrying one task's steps into the next.
 _PLANS: dict[str, list[str]] = {}
+
+
+def reset_task_plan(workspace: str = "") -> None:
+    """Drop the task_list plan for a workspace, at a task boundary."""
+    _PLANS.pop(str(Path(workspace).resolve()) if workspace else str(_root()), None)
 
 
 class TaskListConfig(FunctionBaseConfig, name="task_list"):
