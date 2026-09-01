@@ -58,7 +58,10 @@ class AutogenProbeConfig(FunctionBaseConfig, name="autogen_probe"):
     llm_name: LLMRef = Field(description="Model to use via the AutoGen wrapper")
     tool_names: list[FunctionRef] = Field(default_factory=list, description="NAT tools exposed to the agent")
     system_prompt: str = Field(default=DEFAULT_PROMPT, description="Agent instructions")
-    max_turns: int = Field(default=20, description="Maximum assistant turns")
+    # 250 like its three siblings: worker_config injects the topology's number over this, so a
+    # smaller default never bites at run time -- it only misleads whoever reads it, and it does
+    # bite anyone who builds this config directly.
+    max_turns: int = Field(default=250, description="Model rounds before the run must end")
 
 
 @register_function(config_type=StrandsProbeConfig, framework_wrappers=[LLMFrameworkEnum.STRANDS])
@@ -81,16 +84,34 @@ async def strands_probe(config: StrandsProbeConfig, builder: Builder) -> AsyncGe
         # over: Strands has no way for a tool to stop it, and the exception that stops the other
         # three frameworks dies inside the task Strands runs each tool in.
         events = agent.stream_async(inputs)
-        last = None
+        # `spoken` because only a run that ends on its own emits a result: breaking on the cap
+        # below leaves `last` unset, and returning "" there throws away every step it took.
+        last, spoken, taken = None, "", 0
         try:
             async for event in events:
                 answered = getattr(agent, FINISHED_ON, None)
                 if answered is not None:
                     return answered
-                last = event.get("result", last) if isinstance(event, dict) else last
+                if not isinstance(event, dict):
+                    continue
+                last = event.get("result", last)
+                # Counted here because Strands has no cap of its own: window_size above bounds the
+                # history it keeps, not the turns it takes, so without this the other three stop at
+                # max_iter and this one runs until the wall clock does -- which is a budget
+                # difference, not a capability one.
+                said = event.get("message")
+                if isinstance(said, dict) and said.get("role") == "assistant":
+                    text = "".join(b.get("text", "") for b in said.get("content") or []
+                                   if isinstance(b, dict)).strip()
+                    spoken = text or spoken
+                    taken += 1
+                    if taken >= config.max_iter:
+                        logger.warning("strands reached its %d-turn cap; returning what it has",
+                                       config.max_iter)
+                        break
         finally:
             await events.aclose()
-        return str(last if last is not None else "")
+        return str(last if last is not None else spoken)
 
     yield FunctionInfo.from_fn(_run, description="Answer the task with one Strands agent")
 
