@@ -14,6 +14,7 @@
 # limitations under the License.
 """Tool wrapper for AutoGen integration with NAT."""
 
+import contextvars
 import logging
 from collections.abc import AsyncIterator
 from collections.abc import Callable
@@ -37,6 +38,13 @@ from nat.cli.register_workflow import register_tool_wrapper
 from nat.utils.type_utils import DecomposedType
 
 logger = logging.getLogger(__name__)
+
+# Where `finish` leaves its answer for the caller to end the run on. A ContextVar holding a mutable
+# list, not a value: AutoGen runs tool calls in their own tasks, and a task gets a COPY of the
+# context -- rebinding there is invisible outside, but appending to the object it already holds is
+# not. The caller sets it per question, so concurrent questions never share one.
+FINISHED_ON: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "nat_autogen_finished", default=None)
 
 
 def resolve_type(t: Any) -> Any:
@@ -114,10 +122,14 @@ def autogen_tool_wrapper(
         try:
             return await fn.acall_invoke(*args, **kwargs)
         except AgentFinished as done:
-            # AutoGen ends a turn when the model sends a message with no tool call, and its stream
-            # sentinel is posted after the gather over tool calls -- so raising out of one hangs it
-            # (8 runs in 8) and merely returning the answer had the model call `finish` 95 more
-            # times. Said outright is what stops it.
+            # Raising here hangs AutoGen: its stream sentinel is posted after the gather over tool
+            # calls, so an exception out of one never reaches the sentinel (8 runs in 8). Telling
+            # the model to stop does not stop it either -- it called `finish` a mean of 27 times a
+            # run and 236 in one, against 0-1 on the other three frameworks. So the answer is left
+            # where the caller can see it, and the caller ends the run: the Strands pattern.
+            held = FINISHED_ON.get()
+            if held is not None:
+                held.append(str(done.answer))
             return (f"{done.answer}\n\n[Recorded as the answer. Call no further tool: reply to the "
                     "user with the text above as your message.]")
 

@@ -164,6 +164,8 @@ async def adk_probe(config: AdkProbeConfig, builder: Builder) -> AsyncGenerator[
 async def autogen_probe(config: AutogenProbeConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
     from autogen_agentchat.agents import AssistantAgent
 
+    from nat.plugins.autogen.tool_wrapper import FINISHED_ON
+
     llm = await builder.get_llm(config.llm_name, wrapper_type=LLMFrameworkEnum.AUTOGEN)
     tools = await builder.get_tools(config.tool_names, wrapper_type=LLMFrameworkEnum.AUTOGEN)
 
@@ -174,9 +176,20 @@ async def autogen_probe(config: AutogenProbeConfig, builder: Builder) -> AsyncGe
                                system_message=config.system_prompt,
                                max_tool_iterations=config.max_turns,
                                reflect_on_tool_use=True)
-        result = await agent.run(task=inputs)
-        messages = getattr(result, "messages", None) or []
-        return str(messages[-1].content) if messages else ""
+        # A holder per question, set before the run so every tool task inherits the same object.
+        held: list[str] = []
+        FINISHED_ON.set(held)
+        # Streamed rather than awaited, so the run can be left the moment `finish` answers. Awaited,
+        # AutoGen has no point at which to stop: a tool cannot raise out of it, and telling the model
+        # to stop did not -- it called `finish` 236 times in one run, 27 on average.
+        last = ""
+        async for message in agent.run_stream(task=inputs):
+            if held:
+                return held[0]
+            said = getattr(message, "content", None)
+            if isinstance(said, str) and said:
+                last = said
+        return held[0] if held else last
 
     yield FunctionInfo.from_fn(_run, description="Run a single AutoGen assistant over the configured NAT tools")
 
