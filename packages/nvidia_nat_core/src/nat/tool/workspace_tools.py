@@ -821,12 +821,8 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
         tail = f"({left} of {len(lines)} still open" + (f", {gave} given up on)" if gave else ")")
         # Saying nothing changed is the whole point: a silent no-op reads as success and gets
         # retried -- one run sent the same plan 19 times and read back the same words every time.
-        # Naming the next move matters as much: told only that nothing changed, an agent sends the
-        # same plan again, which is 8 of the 16 steps one run spent here.
         if lines == before and (asked or done.strip() or giving_up.strip()):
             tail += "\nNothing changed: this is the list as it already stood."
-            if asked and left:
-                tail += " To record progress, send `done` with the text of a step you have finished."
         if missed:
             tail += ("\nNo open step matches " + ", ".join(repr(m) for m in missed)
                      + " -- already closed, or never on the list.")
