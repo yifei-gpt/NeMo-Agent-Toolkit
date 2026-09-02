@@ -212,10 +212,12 @@ def google_adk_tool_wrapper(
             params: list[inspect.Parameter] = []
             degraded: list[str] = []
             if input_schema is not None:
-                annotations = getattr(input_schema, "__annotations__", {}) or {}
+                # model_fields, not __annotations__: the latter holds only what this class
+                # declares, so an inherited field vanished from the signature.
                 fields = getattr(input_schema, "model_fields", {}) or {}
                 needed, optional = [], []
-                for param_name, param_annotation in annotations.items():
+                for param_name, field in fields.items():
+                    param_annotation = field.annotation
                     usable = _expressible(resolve_type(param_annotation), name)
                     # Compared by value, not identity: `resolve_type` builds its own permissive
                     # object for a union, and an identity test would miss that one silently.
@@ -225,8 +227,7 @@ def google_adk_tool_wrapper(
                     # default is one it will refuse the call for. Synthesised without defaults,
                     # every optional parameter became mandatory, and a model that correctly left
                     # one out was told to try again -- 25 of 142 task_list calls on ADK.
-                    field = fields.get(param_name)
-                    if field is not None and not field.is_required():
+                    if not field.is_required():
                         optional.append(
                             inspect.Parameter(param_name,
                                               inspect.Parameter.POSITIONAL_OR_KEYWORD,

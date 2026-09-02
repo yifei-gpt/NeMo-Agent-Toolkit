@@ -209,7 +209,8 @@ def autogen_tool_wrapper(
                             name,
                         )
 
-                    default = inspect.Parameter.empty if model_field.is_required() else model_field.default
+                    default = (inspect.Parameter.empty if model_field.is_required()
+                               else model_field.get_default(call_default_factory=True))
                     params.append(
                         inspect.Parameter(param_name,
                                           inspect.Parameter.POSITIONAL_OR_KEYWORD,
