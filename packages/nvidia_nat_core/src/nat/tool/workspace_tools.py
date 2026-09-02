@@ -133,7 +133,7 @@ _PDF_CHILD = ("import sys, pdfplumber\n"
               "with pdfplumber.open(sys.argv[1]) as pdf:\n"
               "    sys.stdout.write('\\n'.join((p.extract_text() or '') for p in pdf.pages[:40]))\n"
               # Said, not guessed: without the count the parent cannot tell 40 pages from 400,
-              # and workspace_read then reports the head of a long document as the whole of it.
+              # and read_file then reports the head of a long document as the whole of it.
               "    sys.stderr.write(str(len(pdf.pages)))\n")
 
 
@@ -169,7 +169,7 @@ def _pdf_text(p: Path) -> str | None:
         return None
     text = done.stdout.decode("utf-8", "ignore").strip() or None
     # The child wrote the page census to stderr: 40 pages of a 266-page filing is not the filing,
-    # and workspace_read reports a head it was never told was a head as the whole document.
+    # and read_file reports a head it was never told was a head as the whole document.
     if text:
         with contextlib.suppress(ValueError):
             whole = int(done.stderr.decode("utf-8", "ignore").strip() or 0)
@@ -234,7 +234,7 @@ def _extract_uncached(p: Path) -> str | None:
     return data.decode("utf-8", errors="replace")
 
 
-class WorkspaceListConfig(FunctionBaseConfig, name="workspace_list"):
+class WorkspaceListConfig(FunctionBaseConfig, name="list_directory"):
     max_entries: int = Field(default=200, description="Cap on returned paths")
 
 
@@ -300,7 +300,7 @@ def _listing(subdir: str = "", contains: str = "", max_entries: int = 200) -> st
 
 
 @register_function(config_type=WorkspaceListConfig)
-async def workspace_list(config: WorkspaceListConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
+async def list_directory(config: WorkspaceListConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
     """List files in the workspace."""
 
     async def _run(subdir: str = "", contains: str = "") -> str:
@@ -318,12 +318,12 @@ async def workspace_list(config: WorkspaceListConfig, builder: Builder) -> Async
                      "to keep only paths holding that substring -- use it, the tree is large."))
 
 
-class WorkspaceReadConfig(FunctionBaseConfig, name="workspace_read"):
+class WorkspaceReadConfig(FunctionBaseConfig, name="read_file"):
     max_chars: int = Field(default=MAX_READ_CHARS, description="Cap on returned characters")
 
 
 @register_function(config_type=WorkspaceReadConfig)
-async def workspace_read(config: WorkspaceReadConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
+async def read_file(config: WorkspaceReadConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
     """Read one workspace file as text."""
 
     async def _run(path: str, offset: int = 0) -> str:
@@ -334,7 +334,7 @@ async def workspace_read(config: WorkspaceReadConfig, builder: Builder) -> Async
                            f"{config.max_chars}; else echo __MISSING__; fi")
             if ran:
                 if out.startswith("__DIR__"):
-                    return f"{path} is a directory -- list it with workspace_list, or name a file in it."
+                    return f"{path} is a directory -- list it with list_directory, or name a file in it."
                 if out.startswith("__MISSING__"):
                     return f"no such file: {path}"
                 total, _, chunk = out.partition("__CUT__\n")
@@ -351,7 +351,7 @@ async def workspace_read(config: WorkspaceReadConfig, builder: Builder) -> Async
                         f"offset={offset + len(chunk)}")
         p = _resolve(path)
         if p.is_dir():
-            return f"{path} is a directory -- list it with workspace_list, or name a file in it."
+            return f"{path} is a directory -- list it with list_directory, or name a file in it."
         if not p.is_file():
             return f"no such file: {path}"
         text = _extract(p)
@@ -472,12 +472,12 @@ def _write_pptx(p: Path, text: str) -> str:
     return f"{len(prs.slides)} slides"
 
 
-class WorkspaceWriteConfig(FunctionBaseConfig, name="workspace_write"):
+class WorkspaceWriteConfig(FunctionBaseConfig, name="write_file"):
     pass
 
 
 @register_function(config_type=WorkspaceWriteConfig)
-async def workspace_write(config: WorkspaceWriteConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
+async def write_file(config: WorkspaceWriteConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
     """Write a deliverable into the workspace."""
 
     async def _run(path: str, content: str) -> str:
@@ -505,7 +505,7 @@ async def workspace_write(config: WorkspaceWriteConfig, builder: Builder) -> Asy
         build = {".docx": _write_docx, ".xlsx": _write_xlsx, ".pptx": _write_pptx}.get(p.suffix.lower())
         if build is None:
             # Said at the moment the lines go: a description telling the agent to prefer
-            # workspace_edit moved 1 framework in 4, and the loss is silent otherwise.
+            # edit_file moved 1 framework in 4, and the loss is silent otherwise.
             before = p.read_text(encoding="utf-8", errors="ignore").count("\n") + 1 if p.is_file() else 0
             try:
                 p.write_text(content, encoding="utf-8")
@@ -513,7 +513,7 @@ async def workspace_write(config: WorkspaceWriteConfig, builder: Builder) -> Asy
                 return f"could not write {path}: {exc.strerror or exc}."
             after = content.count("\n") + 1
             note = (f" It held {before} lines and now holds {after}; the other {before - after} are "
-                    "gone. If that was not intended, workspace_edit changes one passage and leaves "
+                    "gone. If that was not intended, edit_file changes one passage and leaves "
                     "the rest." if before > after + max(5, before // 10) else "")
             return f"wrote {p.relative_to(_root())} ({len(content)} chars){note}"
         try:
@@ -525,7 +525,7 @@ async def workspace_write(config: WorkspaceWriteConfig, builder: Builder) -> Asy
 
     yield FunctionInfo.from_fn(_run, description=(
         "Write a deliverable into the workspace, replacing whatever was there. To change part of a "
-        "file that already exists, use workspace_edit instead -- everything you do not resend here "
+        "file that already exists, use edit_file instead -- everything you do not resend here "
         "is lost. Args: `path` relative to the root, and `content`. "
         "The extension picks the format that gets built, so send `content` in the shape it expects: "
         "`.xlsx` wants CSV text -- header row first, one line per row, fields holding a comma quoted; "
@@ -535,7 +535,7 @@ async def workspace_write(config: WorkspaceWriteConfig, builder: Builder) -> Asy
         "Every other extension is stored as the exact text you send." + _where()))
 
 
-class WorkspaceSearchConfig(FunctionBaseConfig, name="workspace_search"):
+class WorkspaceSearchConfig(FunctionBaseConfig, name="grep_files"):
     max_hits: int = Field(default=60, description="Cap on returned matching lines")
     # max_hits bounds the answer, not the work: a query that matches nothing still opened every
     # PDF in the tree. One workspace holds 1950 of them and the scan measured 81 minutes.
@@ -544,7 +544,7 @@ class WorkspaceSearchConfig(FunctionBaseConfig, name="workspace_search"):
 
 
 @register_function(config_type=WorkspaceSearchConfig)
-async def workspace_search(config: WorkspaceSearchConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
+async def grep_files(config: WorkspaceSearchConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
     """Find which workspace files hold a string, without reading each one whole."""
 
     async def _run(query: str, subdir: str = "", path_contains: str = "") -> str:
@@ -610,12 +610,12 @@ async def workspace_search(config: WorkspaceSearchConfig, builder: Builder) -> A
         "Args: `query`, optional `subdir`, and `path_contains` to restrict which files are scanned." + _where()))
 
 
-class WorkspaceEditConfig(FunctionBaseConfig, name="workspace_edit"):
+class WorkspaceEditConfig(FunctionBaseConfig, name="edit_file"):
     pass
 
 
 @register_function(config_type=WorkspaceEditConfig)
-async def workspace_edit(config: WorkspaceEditConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
+async def edit_file(config: WorkspaceEditConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
     """Replace one exact passage in a file, rather than rewriting the file around it."""
 
     async def _run(path: str, old: str, new: str) -> str:
@@ -624,7 +624,7 @@ async def workspace_edit(config: WorkspaceEditConfig, builder: Builder) -> Async
             ran, body = _sh(f"if [ -f {q} ]; then cat {q}; else echo __MISSING__; fi")
             if ran:
                 if body.startswith("__MISSING__"):
-                    return f"{path} is not a file in the workspace; workspace_list shows what is."
+                    return f"{path} is not a file in the workspace; list_directory shows what is."
                 seen = body.count(old)
                 if seen == 0:
                     return f"that exact text is not in {path}; read it again and copy the passage."
@@ -636,7 +636,7 @@ async def workspace_edit(config: WorkspaceEditConfig, builder: Builder) -> Async
                 return out.strip() or f"could not write {path}"
         p = _resolve(path)
         if not p.is_file():
-            return f"{path} is not a file in the workspace; workspace_list shows what is."
+            return f"{path} is not a file in the workspace; list_directory shows what is."
         try:
             body = p.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
@@ -648,7 +648,7 @@ async def workspace_edit(config: WorkspaceEditConfig, builder: Builder) -> Async
         if hits > 1:
             # Editing the first of several is how a file quietly gets the wrong one changed.
             return f"that passage appears {hits} times in {path}; extend `old` until it is unique."
-        # As workspace_write does: a staged world is symlinks into the shared dataset, and writing
+        # As write_file does: a staged world is symlinks into the shared dataset, and writing
         # through one edits the dataset for every run after this.
         if p.is_symlink():
             p.unlink()
@@ -657,7 +657,7 @@ async def workspace_edit(config: WorkspaceEditConfig, builder: Builder) -> Async
 
     yield FunctionInfo.from_fn(_run, description=(
         "Replace one exact passage inside a file, leaving the rest untouched. Use this to change an "
-        "existing file; workspace_write replaces the whole file and loses anything you did not "
+        "existing file; write_file replaces the whole file and loses anything you did not "
         "resend.\n\nArgs:\n    path (str): the file, relative to the workspace root.\n"
         "    old (str): the exact text to replace, unique in the file.\n"
         "    new (str): what to put there." + _where()))
@@ -742,7 +742,7 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
         "so a `cd` or an exported variable is gone by the next one -- chain them in one command "
         "line instead. The working directory is "
         f"the workspace root, {_root().as_posix()}, so paths are relative to it. For anything on "
-        "the web use web_search and web_fetch rather than curl or urllib here: those keep what "
+        "the web use search_web and fetch_url rather than curl or urllib here: those keep what "
         "they read where the rest of the run can see it.\n\n"
         "Args:\n    command (str): the command line, e.g. `ls -la` or `python -m pytest -q`."))
 
