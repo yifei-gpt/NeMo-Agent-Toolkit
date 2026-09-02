@@ -194,7 +194,7 @@ def _window(page: str, offset: int, width: int, store: int = 0) -> str:
     if offset >= len(page):
         return f"Nothing at offset {offset}; this page is {len(page)} characters long.{cut}"
     end = min(offset + width, len(page))
-    tail = (f"\n\n[characters {offset}-{end} of {len(page)}; call web_fetch again with "
+    tail = (f"\n\n[characters {offset}-{end} of {len(page)}; call fetch_url again with "
             f"offset={end} to read on]" if end < len(page) else "")
     return page[offset:end] + tail + cut
 
@@ -298,7 +298,7 @@ async def web_search_cached(tool_config: WebSearchConfig, builder: Builder):
     yield FunctionInfo.from_fn(
         _search,
         description=("Search the web and return the top results as numbered title/URL/snippet "
-                     "entries. Use web_fetch on a URL to read the page itself.\n\n"
+                     "entries. Use fetch_url on a URL to read the page itself.\n\n"
                      "Args:\n    question (str): what to search for."),
     )
 
@@ -307,7 +307,7 @@ class WebFindConfig(FunctionBaseConfig, name="web_find_cached"):
     """Locate a phrase inside a page already opened, without opening it again."""
 
     cache_dir: str = Field(description="Directory holding cached pages")
-    store_chars: int = Field(default=240000, description="The length web_fetch was told to keep")
+    store_chars: int = Field(default=240000, description="The length fetch_url was told to keep")
     context_chars: int = Field(default=600, description="Text to return around each hit")
     max_hits: int = Field(default=5, description="Hits to return per search")
 
@@ -324,7 +324,7 @@ async def web_find_cached(tool_config: WebFindConfig, builder: Builder):
         got = _entry(_cache(directory, _page_key(url.strip(), tool_config.store_chars)))
         # A cached failure is not a page: searched as one, every phrase "does not appear" in it.
         if got is None or not got[0]:
-            return f"{url} has not been read yet -- call web_fetch on it first."
+            return f"{url} has not been read yet -- call fetch_url on it first."
         page = got[1]
         hits, start, width = [], 0, tool_config.context_chars
         lowered, needle = page.lower(), " ".join(phrase.split()).lower()
@@ -344,9 +344,9 @@ async def web_find_cached(tool_config: WebFindConfig, builder: Builder):
 
     yield FunctionInfo.from_fn(
         _find,
-        description=("Find a phrase inside a page you have already read with web_fetch, and get "
+        description=("Find a phrase inside a page you have already read with fetch_url, and get "
                      "the text around each place it appears.\n\n"
-                     "Args:\n    url (str): the page, as passed to web_fetch.\n"
+                     "Args:\n    url (str): the page, as passed to fetch_url.\n"
                      "    phrase (str): the words to look for."),
     )
 
@@ -392,14 +392,14 @@ async def web_fetch_cached(tool_config: WebFetchConfig, builder: Builder):
                 return False, f"Could not read {url} (429): asked too often. Come back to it later."
             if code == 404:
                 return False, (f"Could not read {url} (404): nothing is there. If you guessed this "
-                               "address, call web_search for the page instead of guessing again.")
+                               "address, call search_web for the page instead of guessing again.")
             return False, (f"Could not read {url} ({type(exc).__name__}). If you guessed this "
-                           "address, call web_search for the page instead of guessing again.")
+                           "address, call search_web for the page instead of guessing again.")
 
     async def _read_page(url: str, offset: int = 0) -> str:
         url = url.strip()
         if not url.lower().startswith(("http://", "https://")):
-            return "Give a full http(s) URL, as web_search returns."
+            return "Give a full http(s) URL, as search_web returns."
         path = _cache(directory, _page_key(url, tool_config.store_chars))
         page = _read(path)
         if page is None:
@@ -415,6 +415,6 @@ async def web_fetch_cached(tool_config: WebFetchConfig, builder: Builder):
         _read_page,
         description=("Read one web page and return its text. Long pages come back one window at "
                      "a time; the reply says whether more is left and what offset reads it.\n\n"
-                     "Args:\n    url (str): a full http(s) URL, as web_search returns.\n"
+                     "Args:\n    url (str): a full http(s) URL, as search_web returns.\n"
                      "    offset (int): character to start at, 0 for the beginning."),
     )
