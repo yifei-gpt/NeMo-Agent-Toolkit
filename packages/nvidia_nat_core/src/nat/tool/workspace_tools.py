@@ -81,6 +81,24 @@ def _bare(step: str) -> str:
     return re.sub(r"^[-*\d.)\s]*(\[[ xX-]\])?\s*", "", step.strip())
 
 
+def _steps_in(text) -> list[str]:
+    """The steps an agent sent, whether as a list or a line per step.
+
+    `steps` is `list[str] = []`, and the missing `| None` is the whole point. A tool call arrives
+    as XML, where every parameter is text; the qwen3_xml parser turns the text back into a list by
+    reading `properties["steps"]["type"]`, and an optional list is `anyOf: [array, null]`, which
+    has no `type` at that level. The parser then falls back to string and hands the JSON array
+    through as its own source text. That is how this went wrong the first time: splitlines() read
+    the array as one step, the agent could not find its own plan in what came back, and one run
+    rewrote it 245 times without ever writing the file it was asked for. Measured against the
+    server: optional gives a string three times in three, plain `list[str]` a list three in three.
+    `done` and `giving_up` are genuinely strings, and take the line-per-item path.
+    """
+    if isinstance(text, list):
+        return [str(x).strip() for x in text if str(x).strip()]
+    return [line for line in (text or "").splitlines() if line.strip()]
+
+
 def _nothing_read(path: str, size: int, offset: int) -> str:
     """An empty read means an empty file or an offset past the end, and the bare "" it returned
     means those and a broken tool alike -- one run asked for the same empty file twice over."""
@@ -772,20 +790,22 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
     reason is what stops the next agent -- or the next turn of this one -- repeating the attempt.
     """
 
-    async def _run(steps: str = "", done: str = "", giving_up: str = "", because: str = "") -> str:
+    async def _run(steps: list[str] = [], done: str = "", giving_up: str = "",
+                   because: str = "") -> str:
         key = str(_root())
         lines = list(_PLANS.get(key, []))
         before = list(lines)
-        if steps.strip():
+        asked = _steps_in(steps)
+        if asked:
             # A closed step stays closed: each specialist rewrites this list, and a plain replace
             # reopened what the one before it had already finished.
             shut = {l[6:].split("  (")[0].strip().lower(): l for l in lines if not l.startswith("- [ ]")}
             # Steps often arrive already bulleted, and "- [ ] - step" reads as a broken list.
             lines = [shut.get(_bare(s).strip().lower(), f"- [ ] {_bare(s)}")
-                     for s in steps.splitlines() if s.strip()]
+                     for s in asked]
         missed = []
-        for mark, box, why in ([(x, "- [x]", "") for x in done.splitlines() if x.strip()]
-                               + [(x, "- [-]", because) for x in giving_up.splitlines() if x.strip()]):
+        for mark, box, why in ([(x, "- [x]", "") for x in _steps_in(done)]
+                               + [(x, "- [-]", because) for x in _steps_in(giving_up)]):
             for i, line in enumerate(lines):
                 if line.startswith("- [ ]") and mark.strip().lower() in line.lower():
                     lines[i] = line.replace("- [ ]", box, 1) + (f"  ({why.strip()})" if why.strip() else "")
@@ -801,7 +821,7 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
         tail = f"({left} of {len(lines)} still open" + (f", {gave} given up on)" if gave else ")")
         # Saying nothing changed is the whole point: a silent no-op reads as success and gets
         # retried -- one run sent the same plan 19 times and read back the same words every time.
-        if lines == before and (steps.strip() or done.strip() or giving_up.strip()):
+        if lines == before and (asked or done.strip() or giving_up.strip()):
             tail += "\nNothing changed: this is the list as it already stood."
         if missed:
             tail += ("\nNo open step matches " + ", ".join(repr(m) for m in missed)
@@ -813,7 +833,8 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
         "then with `done` after finishing one, or with `giving_up` and `because` for one you tried "
         "and could not settle -- writing that down is what keeps you, and anyone after you, from "
         "trying it again. With no arguments it shows where you are. Every agent here shares it."
-        "\n\nArgs:\n    steps (str): the plan, one step per line -- replaces any existing list.\n"
+        "\n\nArgs:\n    steps (list[str]): the plan, one step per item -- replaces any existing "
+        "list.\n"
         "    done (str): text identifying a step to tick off, one per line.\n"
         "    giving_up (str): text identifying a step to close unsolved.\n"
         "    because (str): why that step could not be settled."))
