@@ -43,15 +43,6 @@ class AdkProbeConfig(FunctionBaseConfig, name="adk_probe"):
     max_iter: int = Field(default=250, description="Model calls before the run must end")
 
 
-class StrandsProbeConfig(FunctionBaseConfig, name="strands_probe"):
-    """Single Strands agent over NAT tools."""
-
-    llm_name: LLMRef = Field(description="Model to use via the Strands wrapper")
-    tool_names: list[FunctionRef] = Field(default_factory=list, description="NAT tools exposed to the agent")
-    system_prompt: str = Field(default=DEFAULT_PROMPT, description="Agent instructions")
-    max_iter: int = Field(default=250, description="Model calls before the run must end")
-
-
 class AutogenProbeConfig(FunctionBaseConfig, name="autogen_probe"):
     """Single AutoGen assistant over NAT tools."""
 
@@ -62,58 +53,6 @@ class AutogenProbeConfig(FunctionBaseConfig, name="autogen_probe"):
     # smaller default never bites at run time -- it only misleads whoever reads it, and it does
     # bite anyone who builds this config directly.
     max_turns: int = Field(default=250, description="Model rounds before the run must end")
-
-
-@register_function(config_type=StrandsProbeConfig, framework_wrappers=[LLMFrameworkEnum.STRANDS])
-async def strands_probe(config: StrandsProbeConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
-    from nat.plugins.strands.tool_wrapper import FINISHED_ON
-    from strands import Agent
-    from strands.agent.conversation_manager import SlidingWindowConversationManager
-
-    llm = await builder.get_llm(config.llm_name, wrapper_type=LLMFrameworkEnum.STRANDS)
-    tools = await builder.get_tools(config.tool_names, wrapper_type=LLMFrameworkEnum.STRANDS)
-
-    async def _run(inputs: str) -> str:
-        # An agent per question: Strands keeps the conversation on the object, and a benchmark
-        # item that inherits the last one's history is not the item the grader poses.
-        agent = Agent(model=llm, tools=tools, system_prompt=config.system_prompt,
-                      callback_handler=None,
-                      conversation_manager=SlidingWindowConversationManager(
-                          window_size=config.max_iter))
-        # Streamed rather than awaited, so the loop can be left the moment a tool says the run is
-        # over: Strands has no way for a tool to stop it, and the exception that stops the other
-        # three frameworks dies inside the task Strands runs each tool in.
-        events = agent.stream_async(inputs)
-        # `spoken` because only a run that ends on its own emits a result: breaking on the cap
-        # below leaves `last` unset, and returning "" there throws away every step it took.
-        last, spoken, taken = None, "", 0
-        try:
-            async for event in events:
-                answered = getattr(agent, FINISHED_ON, None)
-                if answered is not None:
-                    return answered
-                if not isinstance(event, dict):
-                    continue
-                last = event.get("result", last)
-                # Counted here because Strands has no cap of its own: window_size above bounds the
-                # history it keeps, not the turns it takes, so without this the other three stop at
-                # max_iter and this one runs until the wall clock does -- which is a budget
-                # difference, not a capability one.
-                said = event.get("message")
-                if isinstance(said, dict) and said.get("role") == "assistant":
-                    text = "".join(b.get("text", "") for b in said.get("content") or []
-                                   if isinstance(b, dict)).strip()
-                    spoken = text or spoken
-                    taken += 1
-                    if taken >= config.max_iter:
-                        logger.warning("strands reached its %d-turn cap; returning what it has",
-                                       config.max_iter)
-                        break
-        finally:
-            await events.aclose()
-        return str(last if last is not None else spoken)
-
-    yield FunctionInfo.from_fn(_run, description="Answer the task with one Strands agent")
 
 
 @register_function(config_type=AdkProbeConfig, framework_wrappers=[LLMFrameworkEnum.ADK])
