@@ -106,6 +106,15 @@ wheels = [
 ]
 
 [[package]]
+name = "aiorwlock"
+version = "1.5.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6b/65/316cdc82c1b92953235ced1c71a3763f0cd9273c3bec5db60bdb5ad59bfe/aiorwlock-1.5.1.tar.gz", hash = "sha256:2729c77ec736c8d85ec305aa3827a50394fd8c6d823f4404d301cc8c59a4b7f5", size = 7288, upload-time = "2026-02-20T17:42:17.164Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e7/23/dc60c00fb9178e356d7f5fb009aabae4625ce79c3e63ed4ef3bcc73d949c/aiorwlock-1.5.1-py3-none-any.whl", hash = "sha256:a28e534a5fce4dabe437055db141369a0803c69fe61c406b6fc5cdfa8f3dda13", size = 8016, upload-time = "2026-02-20T17:42:18.095Z" },
+]
+
+[[package]]
 name = "aiosignal"
 version = "1.4.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3100,6 +3109,9 @@ gunicorn = [
 langchain = [
     { name = "nvidia-nat-langchain", extra = ["all"] },
 ]
+mcp = [
+    { name = "nvidia-nat-mcp" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -3138,8 +3150,9 @@ requires-dist = [
     { name = "nvidia-nat-core", extras = ["async-endpoints"], marker = "extra == 'async-endpoints'", editable = "packages/nvidia_nat_core" },
     { name = "nvidia-nat-core", extras = ["gunicorn"], marker = "extra == 'gunicorn'", editable = "packages/nvidia_nat_core" },
     { name = "nvidia-nat-langchain", extras = ["all"], marker = "extra == 'langchain'", editable = "packages/nvidia_nat_langchain" },
+    { name = "nvidia-nat-mcp", marker = "extra == 'mcp'", editable = "packages/nvidia_nat_mcp" },
 ]
-provides-extras = ["adk", "autogen", "core", "langchain", "async-endpoints", "gunicorn"]
+provides-extras = ["adk", "autogen", "core", "langchain", "mcp", "async-endpoints", "gunicorn"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -3396,6 +3409,25 @@ requires-dist = [
     { name = "wikipedia", marker = "extra == 'community'", specifier = "~=1.4" },
 ]
 provides-extras = ["aws", "community", "exa", "huggingface", "judge", "litellm", "milvus", "nvidia", "oci", "openai", "all", "test"]
+
+[[package]]
+name = "nvidia-nat-mcp"
+source = { editable = "packages/nvidia_nat_mcp" }
+dependencies = [
+    { name = "aiorwlock" },
+    { name = "mcp" },
+    { name = "nvidia-nat-core" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aiorwlock", specifier = "~=1.5" },
+    { name = "mcp", specifier = "~=1.25" },
+    { name = "nvidia-nat-core", editable = "packages/nvidia_nat_core" },
+    { name = "nvidia-nat-core", extras = ["async-endpoints"], marker = "extra == 'test'", editable = "packages/nvidia_nat_core" },
+    { name = "nvidia-nat-test", marker = "extra == 'test'", editable = "packages/nvidia_nat_test" },
+]
+provides-extras = ["test"]
 
 [[package]]
 name = "nvidia-nat-opentelemetry"
