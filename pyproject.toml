@@ -54,6 +54,7 @@ adk = ["nvidia-nat-adk == {version}"]
 autogen = ["nvidia-nat-autogen == {version}"]
 core = ["nvidia-nat-core == {version}"]
 langchain = ["nvidia-nat-langchain[all] == {version}"]
+mcp = ["nvidia-nat-mcp == {version}"]
 
 # define any dependency extras in core so we can easily propagate to most
 async_endpoints = [ "nvidia-nat-core[async_endpoints] == {version}" ]
@@ -107,6 +108,7 @@ nvidia-nat-test = { path = "packages/nvidia_nat_test", editable = true }
 nvidia-nat-autogen = { path = "packages/nvidia_nat_autogen", editable = true }
 nvidia-nat-core = { path = "packages/nvidia_nat_core", editable = true }
 nvidia-nat-langchain = { path = "packages/nvidia_nat_langchain", editable = true }
+nvidia-nat-mcp = { path = "packages/nvidia_nat_mcp", editable = true }
 
 # Examples
 nat_framework_probes = { path = "examples/frameworks/framework_probes", editable = true }
