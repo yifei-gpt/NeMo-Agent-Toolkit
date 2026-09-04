@@ -269,7 +269,12 @@ class ToolCallAgentGraph(DualNodeAgent):
             # Its own count, not max_empty_response_retries: that one defaults to 0 and governs a
             # different failure, so borrowing it would leave this branch doing nothing at all.
             for attempt in range(1, 3):
-                response = await self._invoke_llm(state)
+                # With the error in view: the same prompt to a deterministic model returns the same malformed call.
+                nudged = ToolCallAgentGraphState(messages=state.messages + [HumanMessage(content=(
+                    "Your last tool call did not run because its arguments could not be parsed: "
+                    + "; ".join(f"{c.get('name')}: {str(c.get('error'))[:500]}" for c in raw_calls)
+                    + " Send the call again with valid JSON arguments."))])
+                response = await self._invoke_llm(nudged)
                 if response.tool_calls:
                     logger.info("%s Invalid tool call retry succeeded on attempt %d",
                                 AGENT_LOG_PREFIX, attempt)
