@@ -82,19 +82,27 @@ async def adk_probe(config: AdkProbeConfig, builder: Builder) -> AsyncGenerator[
         session = await session_service.create_session(app_name="analyst", user_id="bench")
         content = types.Content(role="user", parts=[types.Part.from_text(text=inputs)])
         parts: list[str] = []
+        answered = ""
         # The only turn cap ADK offers; without it this is the one framework a run cannot bound.
         limit = RunConfig(max_llm_calls=config.max_iter)
         try:
             async for event in runner.run_async(user_id="bench", session_id=session.id,
                                                 new_message=content, run_config=limit):
-                if event.content and event.content.parts:
-                    parts.extend(p.text for p in event.content.parts if p.text)
+                if not (event.content and event.content.parts):
+                    continue
+                said = "".join(p.text for p in event.content.parts if p.text)
+                if not said:
+                    continue
+                parts.append(said)
+                # Text beside a function call is the preamble to it; only a final turn is an answer.
+                if event.is_final_response():
+                    answered = said
         except LlmCallsLimitExceededError:
             # The other three hand back what they have when the cap lands; raising threw the work
             # away and graded as no answer at all.
             logger.warning("adk stopped at its %d-call cap; returning the work so far",
                            config.max_iter)
-        return "".join(parts)
+        return answered or "".join(parts)
 
     yield FunctionInfo.from_fn(_run, description="Run a single Google ADK agent over the configured NAT tools")
 
