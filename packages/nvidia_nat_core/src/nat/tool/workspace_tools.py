@@ -775,6 +775,12 @@ def reset_task_plan(workspace: str = "") -> None:
     _PLANS.pop(str(Path(workspace).resolve()) if workspace else str(_root()), None)
 
 
+def open_steps(workspace: str = "") -> list[str]:
+    """The steps still open, for a caller that must show them without spending a turn reading the list."""
+    key = str(Path(workspace).resolve()) if workspace else str(_root())
+    return [l[6:].split("  (")[0].strip() for l in _PLANS.get(key, []) if l.startswith("- [ ]")]
+
+
 class TaskListConfig(FunctionBaseConfig, name="task_list"):
     pass
 
