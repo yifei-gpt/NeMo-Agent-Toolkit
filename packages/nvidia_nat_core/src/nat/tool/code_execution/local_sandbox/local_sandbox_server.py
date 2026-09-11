@@ -161,7 +161,10 @@ def execute_code_subprocess(generated_code: str, queue):
     stderr_capture = StringIO()
     try:
         with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
-            exec(generated_code, {})
+            # `python -c` semantics: with no __name__ the guard every idiomatic script ends
+            # on is false, so the script defines its functions, calls none, and prints
+            # nothing -- silently, which reads to the caller as code that simply did nothing.
+            exec(generated_code, {"__name__": "__main__"})
         logger.debug("execute_code_subprocess finished, PID: %s", os.getpid())
         queue.put(CodeExecutionResult(stdout=_bounded(stdout_capture), stderr=_bounded(stderr_capture)))
     except Exception as e:
