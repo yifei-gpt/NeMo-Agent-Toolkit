@@ -28,6 +28,12 @@ RUN apt update \
 # turns a score into a reason; biopython handles the PDB the receptor arrives as.
 RUN pip install --no-cache-dir rdkit meeko biopython prolif
 
+# What a molecule does to a body, which docking and affinity say nothing about: absorption,
+# distribution, metabolism, excretion and toxicity, predicted rather than measured. A candidate
+# that binds well and is cleared in minutes is not a candidate. chemprop is the model under it.
+RUN pip install --no-cache-dir admet-ai chemprop \
+ && echo "admet-ai installed" || echo "admet-ai unavailable"
+
 # The learned layer, which is what has changed since this stack was rdkit and vina alone.
 # boltz predicts an all-atom complex AND its binding affinity in about a minute on one
 # consumer card, near the accuracy of free-energy perturbation at a thousandth of the cost;

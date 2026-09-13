@@ -11,21 +11,59 @@
 FROM nat-sandbox
 
 # iverilog simulates the source directly; verilator compiles it to C++ and needs a host
-# compiler and make to build what it emits; yosys synthesises to gates and reports the cell
-# count and the longest path. gtkwave is left out: a waveform viewer needs a display.
+# compiler and make to build what it emits. yosys, magic, netgen and klayout are deliberately
+# absent: they arrive from the nix store below, newer, and Debian's would only be shadowed.
+# gtkwave is here for its command-line converters; the viewer itself needs a display.
 RUN apt update \
  && apt install -y --no-install-recommends \
-      iverilog verilator yosys make gcc g++ libc6-dev git \
+      iverilog verilator make gcc g++ libc6-dev git \
       ghdl \
-      opensta \
       z3 boolector \
       nextpnr-ice40 fpga-icestorm \
       gcc-riscv64-unknown-elf \
       gtkwave \
  && apt clean && rm -rf /var/lib/apt/lists/*
+
+# The rest of the flow: yosys ends at a gate netlist, and a netlist is not a chip. OpenROAD
+# places and routes it, magic and netgen check the result against the rules and the schematic,
+# klayout reads the GDSII that comes out.
+#
+# Taken from OpenLane's own image rather than installed: OpenROAD is not packaged for Debian,
+# the .deb Precision Innovations publishes wants libpython3.9 which bookworm does not carry,
+# and the relocatable tarball needs glibc 2.38 against this base's 2.36. OpenLane's build is
+# Nix, so every dependency it has is inside /nix/store and the whole store copies across and
+# runs -- 4.3 GB for a toolchain that would otherwise need a different base image.
+COPY --from=ghcr.io/efabless/openlane2:2.0.3 /nix/store /nix/store
+
+# Nix addresses a tool by a hash no one can type, so each one gets a name on PATH. The store's
+# yosys is 0.38 against Debian's 0.23 and its sta is current where Debian's is from 2019, so
+# the links go in /usr/local/bin, which precedes /usr/bin: the newer pair wins for everything,
+# and nothing that already ran against the older ones has to change.
+RUN set -eu; for t in openroad klayout magic netgen; do \
+      f=$(ls -d /nix/store/*/bin/$t 2>/dev/null | head -1); \
+      [ -n "$f" ] && ln -sf "$f" /usr/local/bin/$t; \
+    done; \
+    ln -sf "$(ls -d /nix/store/*yosys-with-plugins/bin/yosys | head -1)" /usr/local/bin/yosys; \
+    ln -sf "$(ls -d /nix/store/*opensta/bin/sta | head -1)" /usr/local/bin/sta; \
+    openroad -version && yosys -V && sta -version
+
+# The whole sky130 process, not the one liberty file synthesis alone wanted: placement needs
+# the cells' shapes and the metal stack, which live in LEF and the technology files. volare is
+# the PDK manager that fetches a known-good build of them.
+#
+# OpenLane's own Python package is deliberately absent: its libparse dependency builds from
+# source and wants a Rust toolchain, and it is a wrapper over the flow rather than the flow --
+# OpenROAD reads the same TCL with or without it.
+RUN pip install --no-cache-dir volare \
+ && volare enable --pdk sky130 $(volare ls-remote --pdk sky130 | head -1) \
+ && test "$(find /root/.volare -name '*.tlef' | wc -l)" -gt 0 \
+ && echo "sky130 pdk enabled with $(find /root/.volare -name '*.lef' | wc -l) lef files"
+# volare nests a directory of its own name under the root it reports, and the tools want the
+# one holding sky130A. Named here so a flow script does not have to go looking.
+ENV PDK_ROOT=/root/.volare/volare/sky130/versions PDK=sky130A
 # ghdl: VHDL, so a design is not required to be Verilog to be simulated.
-# opensta: the one that turns a netlist plus a .lib into nanoseconds. yosys counts cells and
-#   reports area; it does not report a critical path, and a path is what pipelining moves.
+# (OpenSTA is not installed from Debian: OpenROAD below carries its own, newer, and the two
+#   packages both own /usr/bin/sta, which makes dpkg refuse the second one outright.)
 # z3, boolector: the solvers yosys-smtbmc drives, so equivalence between two versions of a
 #   design can be PROVED rather than sampled with random vectors.
 # nextpnr-ice40 + fpga-icestorm: place and route to a real FPGA, which answers "how many LUTs
