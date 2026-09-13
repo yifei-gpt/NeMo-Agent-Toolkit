@@ -1,0 +1,81 @@
+# The sandbox with a CUDA stack, for tasks that ask the agent to write GPU code.
+#
+# A layer on top of nat-sandbox rather than a rewrite of it: the default image keeps every byte
+# it had, so a run that asks for no GPU meets exactly the sandbox every collected run met.
+# Built and used only when MARKAGENTX_SANDBOX_GPUS is set.
+#
+#   docker build -t nat-sandbox-gpu -f Dockerfile.sandbox.gpu .
+#
+# The driver and nvidia-smi arrive from the host through nvidia-container-toolkit at `run`;
+# what an image has to carry is the runtime and the compilers, which the wheels below bring.
+FROM nat-sandbox
+
+# Triton compiles its launcher with the host compiler at first use and says only "Failed to
+# find C compiler" without one; the slim base has no toolchain at all. nvcc is here so a .cu
+# file can be compiled as a file -- cupy and triton both compile from strings at runtime and
+# need none of this. Four packages, not the toolkit: the compiler, its NVVM and CRT, and the
+# runtime headers. 12.4 to match the CUDA torch was built against.
+RUN apt update \
+ && apt install -y --no-install-recommends gcc g++ libc6-dev ca-certificates git \
+ && python -c "import urllib.request as u; u.urlretrieve('https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb', '/tmp/k.deb')" \
+ && dpkg -i /tmp/k.deb && rm /tmp/k.deb && apt update \
+ && apt install -y --no-install-recommends \
+      cuda-nvcc-12-4 \
+      cuda-sanitizer-12-4 \
+      cuda-gdb-12-4 \
+      cuda-cccl-12-4 \
+      cuda-nvdisasm-12-4 \
+      nsight-compute-2024.1.0 \
+ && apt clean && rm -rf /var/lib/apt/lists/*
+# cuda-sanitizer: compute-sanitizer finds the out-of-bounds write and the unsynchronised race
+#   that a wrong sum only hints at. The first reduction written here returned -30 and a
+#   bandwidth above the card's peak; both are what this tool names directly.
+# cuda-gdb: breakpoints inside a kernel, for when the sanitizer says where but not why.
+# cuda-cccl: Thrust and CUB, the reference implementations a hand-written kernel is worth
+#   comparing against -- CUB's reduction is what a good one should approach.
+# cuda-nvdisasm: the SASS the compiler actually emitted, which is the only place register
+#   pressure and instruction selection can be read.
+# nsight-compute: occupancy, memory throughput and where the warps stalled -- the difference
+#   between knowing a kernel is slow and knowing why. It needs CAP_SYS_ADMIN and a root
+#   process, which this host requires because its driver has RmProfilingAdminOnly set;
+#   MARKAGENTX_SANDBOX_PROFILE is what grants that, and it is off by default.
+
+# cupy for RawKernel: CUDA C written as a string and compiled at first call, which is the
+# closest thing here to writing a kernel by hand. Triton, the other authoring path, rides along
+# with torch below. numba-cuda is deliberately absent: it overloads np.row_stack, which numpy 2
+# removed, so it cannot import beside the numpy the rest of this image is built on.
+RUN pip install --no-cache-dir cupy-cuda12x
+
+# Torch last and on its own layer: it is the largest of these and the one most likely to be
+# dropped, and a separate layer keeps the rest cached when it is. Triton rides along with it.
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu124
+
+# pynvml reads the clocks, power cap and temperature a benchmark has to be read against: a
+# kernel is not slow if the card is thermally capped. nvtx marks regions for a profiler.
+RUN pip install --no-cache-dir nvidia-ml-py nvtx
+
+# CUTLASS is headers only, and the reference every hand-written GEMM is measured against.
+# Shallow, and without its tests, which are most of the repository.
+RUN git clone --depth 1 --filter=blob:none --sparse https://github.com/NVIDIA/cutlass.git /opt/cutlass \
+ && cd /opt/cutlass && git sparse-checkout set include tools/util/include \
+ || echo "cutlass unavailable; the rest of the image is unaffected"
+ENV CUTLASS_DIR=/opt/cutlass
+
+# KernelBench is the standard this work is measured by: 270 PyTorch problems in four levels,
+# each a reference implementation the agent must beat while staying correct. Having it here
+# turns "the agent wrote a kernel" into a number comparable with published ones.
+RUN git clone --depth 1 https://github.com/ScalingIntelligence/KernelBench.git /opt/kernelbench \
+ || echo "KernelBench unavailable; the rest of the image is unaffected"
+ENV KERNELBENCH_DIR=/opt/kernelbench
+
+# CuTe is the DSL CUTLASS 4 exposes to Python, and one of the four the MLSys 2026 kernel
+# tracks accept alongside CUDA, Triton and cuTile. nvmath binds the libraries a kernel is
+# measured against without going through torch.
+RUN pip install --no-cache-dir nvidia-cutlass-dsl nvmath-python \
+ || echo "CuTe DSL unavailable; CUDA, Triton and CUTLASS headers are unaffected"
+
+# The runtime rides in wheels and the compiler in /usr/local/cuda-12.4; neither puts itself
+# where the loader or the shell would find it.
+ENV CUDA_HOME=/usr/local/cuda-12.4
+ENV PATH=/usr/local/cuda-12.4/bin:$PATH
+ENV LD_LIBRARY_PATH=/usr/local/cuda-12.4/lib64:/usr/local/lib/python3.13/site-packages/nvidia/cuda_runtime/lib

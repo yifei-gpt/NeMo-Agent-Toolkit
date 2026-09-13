@@ -1,0 +1,63 @@
+# The sandbox with an open-source RTL toolchain, for tasks that ask the agent to design
+# hardware. A layer on top of nat-sandbox rather than a rewrite of it, so the default image
+# keeps every byte it had and a run that asks for nothing meets the sandbox every collected
+# run met. Selected with MARKAGENTX_SANDBOX_IMAGE=nat-sandbox-eda.
+#
+#   docker build -t nat-sandbox-eda -f Dockerfile.sandbox.eda .
+#
+# The loop this exists for is write -> simulate -> read the failure -> fix -> synthesise ->
+# read the gate count and the critical path -> optimise. Every number in it comes off a tool
+# rather than out of the model, which is the only kind an agent cannot talk itself into.
+FROM nat-sandbox
+
+# iverilog simulates the source directly; verilator compiles it to C++ and needs a host
+# compiler and make to build what it emits; yosys synthesises to gates and reports the cell
+# count and the longest path. gtkwave is left out: a waveform viewer needs a display.
+RUN apt update \
+ && apt install -y --no-install-recommends \
+      iverilog verilator yosys make gcc g++ libc6-dev git \
+      ghdl \
+      opensta \
+      z3 boolector \
+      nextpnr-ice40 fpga-icestorm \
+      gcc-riscv64-unknown-elf \
+      gtkwave \
+ && apt clean && rm -rf /var/lib/apt/lists/*
+# ghdl: VHDL, so a design is not required to be Verilog to be simulated.
+# opensta: the one that turns a netlist plus a .lib into nanoseconds. yosys counts cells and
+#   reports area; it does not report a critical path, and a path is what pipelining moves.
+# z3, boolector: the solvers yosys-smtbmc drives, so equivalence between two versions of a
+#   design can be PROVED rather than sampled with random vectors.
+# nextpnr-ice40 + fpga-icestorm: place and route to a real FPGA, which answers "how many LUTs
+#   and what Fmax" -- numbers a synthesis estimate cannot give.
+# gcc-riscv64-unknown-elf: a CPU design is only as verified as the programs run on it.
+# gtkwave: for its command-line converters; the viewer itself needs a display this has no use for.
+
+# cocotb drives a simulation from Python, which is the language the agent writes best, so a
+# testbench and its assertions are ordinary code rather than another language to get right.
+RUN pip install --no-cache-dir cocotb cocotb-bus pyuvm pytest pyvcd amaranth
+
+# SymbiYosys drives yosys-smtbmc and the solvers above. It installs with a Makefile rather
+# than a wheel -- pip reads the repository and finds no Python project in it.
+RUN git clone --depth 1 https://github.com/YosysHQ/sby.git /tmp/sby \
+ && make -C /tmp/sby install \
+ && rm -rf /tmp/sby \
+ && sby --help >/dev/null 2>&1 && echo "sby installed"
+
+# The two benchmarks this field reports against: VerilogEval (NVIDIA, specification to RTL)
+# and RTLLM. Published frontier numbers are 89.74% and 96.08%, so a run here is comparable
+# rather than anecdotal, and both ship their own testbenches.
+RUN git clone --depth 1 https://github.com/NVlabs/verilog-eval.git /opt/verilog-eval \
+ ; git clone --depth 1 https://github.com/hkust-zhiyao/RTLLM.git /opt/rtllm \
+ ; true
+ENV VERILOG_EVAL_DIR=/opt/verilog-eval RTLLM_DIR=/opt/rtllm
+
+# A standard cell library with real timing and area, so synthesis reports square micrometres
+# and a critical path rather than a count of abstract gates. Without it yosys maps to generic
+# cells and an optimisation has nothing to move: this adder is 20 generic gates and 11 sky130
+# ones, because sky130 has a majority gate and the generic library does not. One PVT corner
+# (typical, 25C, 1.8V) of the high-density library is 12 MB; the whole PDK is gigabytes.
+ADD https://raw.githubusercontent.com/efabless/skywater-pdk-libs-sky130_fd_sc_hd/master/timing/sky130_fd_sc_hd__tt_025C_1v80.lib /usr/share/pdk/sky130_fd_sc_hd__tt_025C_1v80.lib
+ENV SKY130_LIB=/usr/share/pdk/sky130_fd_sc_hd__tt_025C_1v80.lib
+
+ENV COCOTB_REDUCED_LOG_FMT=1

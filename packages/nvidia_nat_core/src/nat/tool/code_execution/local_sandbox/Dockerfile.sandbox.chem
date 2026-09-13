@@ -1,0 +1,86 @@
+# The sandbox with a computational-chemistry stack, for tasks that ask the agent to design or
+# evaluate molecules. Selected with MARKAGENTX_SANDBOX_IMAGE=nat-sandbox-chem, and it wants
+# MARKAGENTX_SANDBOX_GPUS too: the models below are the reason it is built on the CUDA image
+# rather than the plain one, and on CPU they are hours where on a 3090 they are seconds.
+#
+#   docker build -t nat-sandbox-chem -f Dockerfile.sandbox.chem .
+#
+# The loop is the one the CUDA and RTL images serve: propose, run a tool, read a number that
+# came off the tool rather than out of the model, improve it. Here that number is a docking
+# score or a predicted affinity in kcal/mol, and a set of filters a chemist would apply.
+FROM nat-sandbox-gpu
+
+# vina scores a pose by physics and is the baseline every learned method is compared against;
+# its pip build fails, so the packaged binary is what gets used. openbabel converts between the
+# formats each tool insists on, and pymol manipulates structures with no display.
+# gfortran is not for chemistry: something in boltz's dependency tree builds from source with
+# meson and stops at "Unknown compiler(s): gfortran". git is here because this image predates
+# the layer that added it to the CUDA one below it.
+RUN apt update \
+ && apt install -y --no-install-recommends \
+      autodock-vina openbabel python3-openbabel pymol \
+      gfortran git cmake pkg-config \
+ && apt clean && rm -rf /var/lib/apt/lists/*
+
+# The classical layer. rdkit is the whole of cheminformatics -- parse SMILES, compute
+# descriptors, enumerate modifications, check Lipinski and QED. meeko prepares a ligand for
+# vina and reads its poses back; prolif names the interactions a pose makes, which is what
+# turns a score into a reason; biopython handles the PDB the receptor arrives as.
+RUN pip install --no-cache-dir rdkit meeko biopython prolif
+
+# The learned layer, which is what has changed since this stack was rdkit and vina alone.
+# boltz predicts an all-atom complex AND its binding affinity in about a minute on one
+# consumer card, near the accuracy of free-energy perturbation at a thousandth of the cost;
+# openmm relaxes a pose with real physics afterwards; PyTDC carries the datasets and oracles
+# an optimisation needs a target to optimise against. Weights are fetched on first use rather
+# than baked in, which keeps this image from doubling.
+RUN pip install --no-cache-dir openmm || echo "openmm unavailable"
+
+# boltz declares requires_python <3.13 and pins numpy<2 with scipy==1.13.1, none of which this
+# image's Python or its rdkit and torch can give it. It is a command-line program, so it gets
+# its own interpreter instead of the image bending around it -- the agent reaches it by path,
+# and nothing in the main environment moves. PyTDC is here for the same reason: the scipy it
+# pins has no wheel for 3.13 and building it from source stops at a missing OpenBLAS.
+# 3.11 because that is what Debian bookworm under this image carries; 3.12 is not packaged
+# for it, and boltz accepts anything from 3.10 up to but not including 3.13.
+RUN apt update \
+ && apt install -y --no-install-recommends python3.11-venv \
+ && apt clean && rm -rf /var/lib/apt/lists/* \
+ && python3.11 -m venv /opt/boltz-env \
+ && /opt/boltz-env/bin/pip install --no-cache-dir -q \
+      "torch==2.6.0+cu124" --extra-index-url https://download.pytorch.org/whl/cu124 \
+ && printf "torch==2.6.0+cu124\nrdkit>=2024.3.2\n" > /opt/boltz-env/constraints.txt \
+ && /opt/boltz-env/bin/pip install --no-cache-dir -q -c /opt/boltz-env/constraints.txt "boltz[cuda]" \
+ && /opt/boltz-env/bin/boltz --help >/dev/null 2>&1 && echo "boltz installed under 3.11" \
+ || echo "boltz unavailable; the rest of the image is unaffected"
+# torch pinned, and held there by a constraints file: the default wheel is built against a
+# newer CUDA than this driver and says so only at run time, as "the NVIDIA driver is too old".
+# Installing it first is not enough -- boltz asks for torch>=2.2, which pip satisfies by
+# upgrading the pinned one straight back off PyPI. --extra-index-url rather than --index-url,
+# which REPLACES PyPI: torch's own build needs flit_core, and that lives only on PyPI.
+# [cuda] rather than bare boltz: the triangular-multiplication layer imports
+# cuequivariance_torch on the forward pass, and without the extra that is a ModuleNotFoundError
+# raised after the MSA search, the weight download and the first batch -- roughly four minutes
+# in, with nothing earlier to suggest it.
+# rdkit is in the constraints for the opposite reason: resolving around the pinned torch pulled
+# it back to 2023.09, older than boltz's own rdkit>=2024.3.2, and the molecule cache boltz
+# downloads is pickled by a newer one -- which surfaces as "Bad pickle format: ENDMOL tag not
+# found" in preprocessing, four minutes into a run, long after the install looked clean.
+ENV BOLTZ=/opt/boltz-env/bin/boltz
+
+# PyTDC is deliberately NOT in boltz's environment. It depends on rdkit-pypi, an old
+# redistribution of rdkit under a second name: both provide the `rdkit` module, pip sees no
+# conflict, and the older files win. boltz then reads a molecule cache pickled by a newer
+# rdkit and stops at "Bad pickle format: ENDMOL tag not found" four minutes into a run.
+# Forcing rdkit up does not help, because the import still resolves to rdkit-pypi's copy.
+RUN /opt/boltz-env/bin/pip install --no-cache-dir -q "rdkit>=2024.3.2" \
+ && /opt/boltz-env/bin/python -c "import rdkit,sys; sys.exit(rdkit.__version__ < '2024')" \
+ && echo "boltz env rdkit is new enough" || echo "boltz env rdkit is TOO OLD"
+
+# REINVENT proposes molecules rather than scoring the ones it was handed: de novo, scaffold
+# decoration, linker design, R-group replacement, under reinforcement learning against any
+# scorer above. It is the generative half of the loop.
+RUN git clone --depth 1 https://github.com/MolecularAI/REINVENT4.git /opt/reinvent4 \
+ && pip install --no-cache-dir /opt/reinvent4 \
+ || echo "REINVENT4 unavailable; the rest of the image is unaffected"
+ENV REINVENT_DIR=/opt/reinvent4
