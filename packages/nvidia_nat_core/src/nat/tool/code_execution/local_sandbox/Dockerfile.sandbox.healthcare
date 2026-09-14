@@ -1,9 +1,9 @@
 # The sandbox with a computational-chemistry stack, for tasks that ask the agent to design or
-# evaluate molecules. Selected with MARKAGENTX_SANDBOX_IMAGE=nat-sandbox-chem, and it wants
+# evaluate molecules. Selected with MARKAGENTX_SANDBOX_IMAGE=nat-sandbox-healthcare, and it wants
 # MARKAGENTX_SANDBOX_GPUS too: the models below are the reason it is built on the CUDA image
 # rather than the plain one, and on CPU they are hours where on a 3090 they are seconds.
 #
-#   docker build -t nat-sandbox-chem -f Dockerfile.sandbox.chem .
+#   docker build -t nat-sandbox-healthcare -f Dockerfile.sandbox.healthcare .
 #
 # The loop is the one the CUDA and RTL images serve: propose, run a tool, read a number that
 # came off the tool rather than out of the model, improve it. Here that number is a docking
