@@ -4,7 +4,11 @@
 # it had, so a run that asks for no GPU meets exactly the sandbox every collected run met.
 # Built and used only when MARKAGENTX_SANDBOX_GPUS is set.
 #
-#   docker build -t nat-sandbox-gpu -f Dockerfile.sandbox.gpu .
+#   docker build --network host -t nat-sandbox-gpu -f Dockerfile.sandbox.gpu .
+#
+# --network host, because the builder's own network corrupts a large download: torch's
+# 768 MB wheel arrived with the wrong sha256 under `docker build` and the right one under
+# `docker run`, same URL, same daemon, a minute apart.
 #
 # The driver and nvidia-smi arrive from the host through nvidia-container-toolkit at `run`;
 # what an image has to carry is the runtime and the compilers, which the wheels below bring.

@@ -3,7 +3,11 @@
 # keeps every byte it had and a run that asks for nothing meets the sandbox every collected
 # run met. Selected with MARKAGENTX_SANDBOX_IMAGE=nat-sandbox-eda.
 #
-#   docker build -t nat-sandbox-eda -f Dockerfile.sandbox.eda .
+#   docker build --network host -t nat-sandbox-eda -f Dockerfile.sandbox.eda .
+#
+# --network host, because the builder's own network corrupts a large download: torch's
+# 768 MB wheel arrived with the wrong sha256 under `docker build` and the right one under
+# `docker run`, same URL, same daemon, a minute apart.
 #
 # The loop this exists for is write -> simulate -> read the failure -> fix -> synthesise ->
 # read the gate count and the critical path -> optimise. Every number in it comes off a tool

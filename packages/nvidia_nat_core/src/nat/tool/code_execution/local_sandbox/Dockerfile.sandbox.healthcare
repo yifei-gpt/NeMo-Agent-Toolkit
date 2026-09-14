@@ -3,7 +3,11 @@
 # MARKAGENTX_SANDBOX_GPUS too: the models below are the reason it is built on the CUDA image
 # rather than the plain one, and on CPU they are hours where on a 3090 they are seconds.
 #
-#   docker build -t nat-sandbox-healthcare -f Dockerfile.sandbox.healthcare .
+#   docker build --network host -t nat-sandbox-healthcare -f Dockerfile.sandbox.healthcare .
+#
+# --network host, because the builder's own network corrupts a large download: torch's
+# 768 MB wheel arrived with the wrong sha256 under `docker build` and the right one under
+# `docker run`, same URL, same daemon, a minute apart.
 #
 # The loop is the one the CUDA and RTL images serve: propose, run a tool, read a number that
 # came off the tool rather than out of the model, improve it. Here that number is a docking
