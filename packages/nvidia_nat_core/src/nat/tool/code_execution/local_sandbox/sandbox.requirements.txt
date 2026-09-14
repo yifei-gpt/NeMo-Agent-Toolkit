@@ -19,3 +19,29 @@ tabulate
 beautifulsoup4
 lxml
 pypdf
+# What the runs installed for themselves. One sandbox serves every concurrent run and its writable
+# layer outlives them all, so the first run's install is simply there for the last -- the runs stop
+# being identically provisioned, and each install is minutes off a task's own budget.
+reportlab
+fpdf2
+xhtml2pdf
+pymupdf
+pdfplumber
+pypdf2
+seaborn
+statsmodels
+pyarrow
+rapidfuzz
+python-Levenshtein
+fuzzywuzzy
+xlrd
+xlwt
+markdown
+tqdm
+pyyaml
+nbformat
+nbconvert
+pytest
+hypothesis
+setuptools
+wheel
