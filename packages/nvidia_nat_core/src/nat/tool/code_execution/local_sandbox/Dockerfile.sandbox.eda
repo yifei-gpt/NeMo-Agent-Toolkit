@@ -54,13 +54,15 @@ RUN set -eu; for t in openroad klayout magic netgen; do \
 # OpenLane's own Python package is deliberately absent: its libparse dependency builds from
 # source and wants a Rust toolchain, and it is a wrapper over the flow rather than the flow --
 # OpenROAD reads the same TCL with or without it.
+# Under $HOME, which the base image points at a world-writable /home/sandbox: volare follows it,
+# and a PDK left in root's home is one the sandbox's own user cannot read.
 RUN pip install --no-cache-dir volare \
  && volare enable --pdk sky130 $(volare ls-remote --pdk sky130 | head -1) \
- && test "$(find /root/.volare -name '*.tlef' | wc -l)" -gt 0 \
- && echo "sky130 pdk enabled with $(find /root/.volare -name '*.lef' | wc -l) lef files"
+ && test "$(find "$HOME/.volare" -name '*.tlef' | wc -l)" -gt 0 \
+ && echo "sky130 pdk enabled with $(find "$HOME/.volare" -name '*.lef' | wc -l) lef files"
 # volare nests a directory of its own name under the root it reports, and the tools want the
 # one holding sky130A. Named here so a flow script does not have to go looking.
-ENV PDK_ROOT=/root/.volare/volare/sky130/versions PDK=sky130A
+ENV PDK_ROOT=${HOME}/.volare/volare/sky130/versions PDK=sky130A
 # ghdl: VHDL, so a design is not required to be Verilog to be simulated.
 # (OpenSTA is not installed from Debian: OpenROAD below carries its own, newer, and the two
 #   packages both own /usr/bin/sta, which makes dpkg refuse the second one outright.)
