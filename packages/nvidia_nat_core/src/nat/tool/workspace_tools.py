@@ -38,6 +38,13 @@ def _root() -> Path:
     return Path(os.environ["NAT_WORKSPACE_DIR"]).resolve()
 
 
+def _staged() -> bool:
+    """A world a run built, not one the user named. Both sides resolve: /home/yifei/data links to
+    /mnt/data, and the two spellings would read a staged world as the user's."""
+    sweep = os.environ.get("MARKAGENTX_WORKSPACES")
+    return bool(sweep and _root().is_relative_to(Path(sweep).resolve()))
+
+
 def _bridge() -> str | None:
     """The task's own container, when the harness opened one. The same flag run_code reads."""
     return os.environ.get("NAT_BRIDGE_URL") if os.environ.get("NAT_BRIDGE_READY") else None
@@ -114,10 +121,12 @@ def _resolve(rel: str) -> Path:
     parts = Path(rel.strip()).parts
     parts = parts[parts.index(root.name) + 1:] if root.name in parts else tuple(
         x for x in parts if x not in ("/", "", "."))
-    # Lexical containment: resolve() would follow the links the workspace itself placed.
     p = Path(os.path.normpath(root.joinpath(*parts)))
-    if p != root and root not in p.parents:
-        raise ValueError(f"path escapes workspace: {rel}")
+    # Lexical, so a staged world's links into the benchmark's data still open; elsewhere the
+    # target must land inside too.
+    for q in (p,) if _staged() else (p, p.resolve()):
+        if not q.is_relative_to(root):
+            raise ValueError(f"path escapes workspace: {rel}")
     return p
 
 
@@ -289,7 +298,14 @@ def _from_find(out: str, where: str, contains: str, max_entries: int) -> str:
     return _formatted(_CONTAINER_ROOT, pairs, contains, max_entries)
 
 
-_NOISE = {".git", ".hg", ".svn", "node_modules", ".venv", ".mypy_cache", ".pytest_cache"}
+_NOISE = {".git", "node_modules", ".venv", ".mypy_cache", ".pytest_cache"}
+
+
+def _shown(p: Path, staged: bool) -> bool:
+    """A staged world is walked whole; one the user named drops its metadata, .git alone filling
+    a listing, and whatever its links reach outside."""
+    return staged or (not _NOISE & set(p.relative_to(_root()).parts)
+                      and p.resolve().is_relative_to(_root()))
 
 
 def _listing(subdir: str = "", contains: str = "", max_entries: int = 200) -> str:
@@ -297,12 +313,9 @@ def _listing(subdir: str = "", contains: str = "", max_entries: int = 200) -> st
     base = _resolve(subdir) if subdir else _root()
     if not base.is_dir():
         return f"not a directory: {subdir}"
-    # A run's staged world is listed whole. A repo the user named is not: .git alone fills the cap
-    # before one source file is reached.
-    sweep = os.environ.get("MARKAGENTX_WORKSPACES")
-    skip = set() if sweep and str(_root()).startswith(sweep.rstrip("/") + os.sep) else _NOISE
-    pairs = [(str(rel), p.stat().st_size) for p in sorted(base.rglob("*")) if p.is_file()
-             and not skip & set((rel := p.relative_to(_root())).parts)]
+    staged = _staged()
+    pairs = [(str(p.relative_to(_root())), p.stat().st_size)
+             for p in sorted(base.rglob("*")) if p.is_file() and _shown(p, staged)]
     return _formatted(_root(), pairs, contains, max_entries)
 
 
@@ -576,8 +589,10 @@ async def grep_files(config: WorkspaceSearchConfig, builder: Builder) -> AsyncGe
             return f"not a directory: {subdir}"
         hits: list[str] = []
         started, opened, seen, skipped = time.time(), 0, 0, 0
+        staged = _staged()
         for p in sorted(base.rglob("*")):
-            if not p.is_file() or (path_contains and path_contains.lower() not in str(p).lower()):
+            if not p.is_file() or not _shown(p, staged) \
+                    or (path_contains and path_contains.lower() not in str(p).lower()):
                 continue
             seen += 1
             costly = p.suffix.lower() in {".pdf", ".docx", ".xlsx", ".pptx"}
