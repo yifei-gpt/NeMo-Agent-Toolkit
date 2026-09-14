@@ -289,13 +289,20 @@ def _from_find(out: str, where: str, contains: str, max_entries: int) -> str:
     return _formatted(_CONTAINER_ROOT, pairs, contains, max_entries)
 
 
+_NOISE = {".git", ".hg", ".svn", "node_modules", ".venv", ".mypy_cache", ".pytest_cache"}
+
+
 def _listing(subdir: str = "", contains: str = "", max_entries: int = 200) -> str:
     """Module level so a test can reach it: the census branch shipped broken with nothing covering it."""
     base = _resolve(subdir) if subdir else _root()
     if not base.is_dir():
         return f"not a directory: {subdir}"
-    pairs = [(str(p.relative_to(_root())), p.stat().st_size)
-             for p in sorted(base.rglob("*")) if p.is_file()]
+    # A run's staged world is listed whole. A repo the user named is not: .git alone fills the cap
+    # before one source file is reached.
+    sweep = os.environ.get("MARKAGENTX_WORKSPACES")
+    skip = set() if sweep and str(_root()).startswith(sweep.rstrip("/") + os.sep) else _NOISE
+    pairs = [(str(rel), p.stat().st_size) for p in sorted(base.rglob("*")) if p.is_file()
+             and not skip & set((rel := p.relative_to(_root())).parts)]
     return _formatted(_root(), pairs, contains, max_entries)
 
 
