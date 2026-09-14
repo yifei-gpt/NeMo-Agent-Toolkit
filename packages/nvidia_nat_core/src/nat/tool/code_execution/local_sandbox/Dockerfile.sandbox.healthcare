@@ -91,5 +91,11 @@ RUN git clone --depth 1 https://github.com/MolecularAI/REINVENT4.git /opt/reinve
  || echo "REINVENT4 unavailable; the rest of the image is unaffected"
 ENV REINVENT_DIR=/opt/reinvent4
 
+# The chem stack resolves a torch of its own and leaves a cu130 wheel behind, which a CUDA 12
+# driver cannot load -- and the CUDA base is this image's whole reason. Put the base's torch back,
+# and fail the build rather than ship an image whose GPU is dead.
+RUN pip install --no-cache-dir --force-reinstall torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124 \
+ && python -c "import torch; assert torch.__version__ == '2.6.0+cu124', torch.__version__"
+
 # Last layer: this image's own installs land as root. Directories only; see the base image.
 RUN find /usr/local/lib/python3.13/site-packages /usr/local/bin -type d -exec chmod a+w {} +
