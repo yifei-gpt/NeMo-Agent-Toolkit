@@ -21,11 +21,15 @@ ARG UWSGI_PROCESSES=10
 FROM python:3.13-slim-bookworm
 
 
-# R is here because a task that asks for R code cannot install its own runtime, and the minutes
-# that takes come out of the task's own budget.
+# A task cannot install these for itself: since the sandbox stopped running as root it cannot apt
+# at all, and even when it could the minutes came out of its own budget. The image was carrying
+# Python.h and no compiler. The last five are what the runs reached for and did not find -- `file`
+# alone 56 times, which is the first thing anything does with a document it was handed.
 RUN apt update && \
     apt upgrade -y && \
-    apt install -y --no-install-recommends libexpat1 r-base-core r-cran-testthat && \
+    apt install -y --no-install-recommends libexpat1 r-base-core r-cran-testthat \
+                                           gcc g++ libc6-dev make pkg-config \
+                                           file xxd curl git sqlite3 && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 
