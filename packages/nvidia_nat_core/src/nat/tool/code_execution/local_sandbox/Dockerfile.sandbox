@@ -33,7 +33,12 @@ RUN apt update && \
 COPY sandbox.requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY local_sandbox_server.py /app/main.py
-RUN mkdir /workspace
+# Any uid runs this, so the cwd, HOME and site-packages must be writable: a task's `pip install`
+# has to reach the same place it did as root. Directories only -- writing a file needs its parent,
+# and a recursive chmod copies all of site-packages into this layer.
+ENV HOME=/home/sandbox
+RUN mkdir -m 777 /workspace /home/sandbox \
+ && find /usr/local/lib/python3.13/site-packages /usr/local/bin -type d -exec chmod a+w {} +
 
 # Set Flask app environment variables and ports
 ARG UWSGI_CHEAPER

@@ -79,3 +79,6 @@ RUN pip install --no-cache-dir nvidia-cutlass-dsl nvmath-python \
 ENV CUDA_HOME=/usr/local/cuda-12.4
 ENV PATH=/usr/local/cuda-12.4/bin:$PATH
 ENV LD_LIBRARY_PATH=/usr/local/cuda-12.4/lib64:/usr/local/lib/python3.13/site-packages/nvidia/cuda_runtime/lib
+
+# Last layer: this image's own installs land as root. Directories only; see the base image.
+RUN find /usr/local/lib/python3.13/site-packages /usr/local/bin -type d -exec chmod a+w {} +

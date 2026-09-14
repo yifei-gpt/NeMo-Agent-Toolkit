@@ -99,3 +99,6 @@ ADD https://raw.githubusercontent.com/efabless/skywater-pdk-libs-sky130_fd_sc_hd
 ENV SKY130_LIB=/usr/share/pdk/sky130_fd_sc_hd__tt_025C_1v80.lib
 
 ENV COCOTB_REDUCED_LOG_FMT=1
+
+# Last layer: this image's own installs land as root. Directories only; see the base image.
+RUN find /usr/local/lib/python3.13/site-packages /usr/local/bin -type d -exec chmod a+w {} +
