@@ -98,4 +98,6 @@ RUN pip install --no-cache-dir --force-reinstall torch==2.6.0 --index-url https:
  && python -c "import torch; assert torch.__version__ == '2.6.0+cu124', torch.__version__"
 
 # Last layer: this image's own installs land as root. Directories only; see the base image.
-RUN find /usr/local/lib/python3.13/site-packages /usr/local/bin -type d -exec chmod a+w {} +
+# Boltz's venv is in it: numba caches each function it compiles beside the source, and with nowhere
+# to write there boltz does not start at all for the user the sandbox runs as.
+RUN find /usr/local/lib/python3.13/site-packages /usr/local/bin /opt/boltz-env -type d -exec chmod a+w {} +
