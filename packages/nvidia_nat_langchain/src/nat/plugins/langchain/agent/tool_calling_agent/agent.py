@@ -533,6 +533,26 @@ class ToolCallAgentGraph(DualNodeAgent):
             # configurable with __pregel_runtime is needed when invoking ToolNode outside graph context
 
             for response in tool_response.get("messages"):
+                # An unchanging answer gets re-sent until the budget is gone: 101 identical greps in
+                # one run. Counted on arguments (which the notice never rewrites) AND answer, since
+                # think acknowledges every call alike. Said first: at the end it sits past the answer.
+                call = next((c for c in tool_calls if c.get("id") == response.tool_call_id), {})
+                again = sum(c.get("name") == call.get("name") and c.get("args") == call.get("args")
+                            for m in state.messages if isinstance(m, AIMessage)
+                            for c in (getattr(m, "tool_calls", None) or []))
+                if again >= 2 and sum(m.name == response.name and m.content.endswith(response.content)
+                                      for m in state.messages if isinstance(m, ToolMessage)) >= 2:
+                    if again >= 6:
+                        response.content = (f"[this is call {again} of the same {response.name} with the same "
+                                            "arguments, and the answer above has not changed. It is not being "
+                                            "repeated here; work from the one you already have.]")
+                        logger.warning("%s %s asked %d times over; withheld the answer",
+                                       AGENT_LOG_PREFIX, response.name, again)
+                    else:
+                        response.content = ("[you have had this exact answer twice already and it will "
+                                            f"not change; try something else.]\n{response.content}")
+                        logger.warning("%s %s gave the same answer a third time; said so",
+                                       AGENT_LOG_PREFIX, response.name)
                 if self.detailed_logs:
                     self._log_tool_response(str(tools), str(tool_input), response.content)
                 state.messages += [response]
