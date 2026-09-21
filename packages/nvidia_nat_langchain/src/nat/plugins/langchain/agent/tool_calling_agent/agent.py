@@ -51,11 +51,12 @@ if typing.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-# Measured over 47 single-agent runs: the work itself finishes inside ~65 rounds, so a nudge
-# at 0.7 of the cap lands long after the agent is only circling.
-_WARN_AT = 0.4
-_LOW = ("You have used {used} of your {total} turns. Bring what you have to a finished state and "
-        "write the answer or the deliverable now; do not start anything you cannot complete.")
+# Put in place of a tool result given back to the window; the call and its arguments stay.
+_NOTOOL = ("That was not a tool call: the tools are the only way to read or change anything here, "
+          "and a fenced code block is just text. Call one now.")
+_SHED = "[released: this result was dropped to make room in the context window]"
+# No mid-run budget warning: gemma-4 read one as leave to stop, ending 3 of 3 runs at 100 of 249
+# turns. Only this one, at the cap, and it still ends a run with the answer written.
 _CLOSING = ("You have used all of your tool calls. Do not call any more tools. Write your "
             "final answer now, in full, from what you have already gathered -- state what you "
             "found, and say plainly which parts you could not verify.")
