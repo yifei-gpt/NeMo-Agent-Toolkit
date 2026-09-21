@@ -416,7 +416,8 @@ async def read_file(config: WorkspaceReadConfig, builder: Builder) -> AsyncGener
 
     yield FunctionInfo.from_fn(_run, description=(
         "Read a workspace file as text. Args: `path` relative to the root, and `offset` to continue "
-        "a long file from where the last call stopped." + _where()))
+        "a long file from where the last call stopped. `offset` counts characters, not lines: to "
+        "read around a line number grep gave you, use bash `sed -n '990,1050p' path` instead." + _where()))
 
 
 def _add_table(doc, rows: list[str]) -> None:
@@ -591,6 +592,13 @@ class WorkspaceSearchConfig(FunctionBaseConfig, name="grep_files"):
     max_documents: int = Field(default=250, description="Documents whose text may be extracted per search")
 
 
+def _literal(query: str) -> str:
+    """Why a regex found nothing: the search is plain text. Said in the description and ignored --
+    7 of nemotron's 18 searches were regexes, 14 empty -- so it goes in the answer."""
+    return (" -- this search is plain text, so those regex characters had to appear literally; "
+            "for a pattern use bash `grep -rnE`." if re.search(r"[.*+?\[\]\\^$|()]", query) else "")
+
+
 @register_function(config_type=WorkspaceSearchConfig)
 async def grep_files(config: WorkspaceSearchConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
     """Find which workspace files hold a string, without reading each one whole."""
@@ -607,7 +615,7 @@ async def grep_files(config: WorkspaceSearchConfig, builder: Builder) -> AsyncGe
             if ran:
                 rows = [r for r in out.splitlines() if r.strip()]
                 if not rows:
-                    return f"(no line contains {query!r})"
+                    return f"(no line contains {query!r}){_literal(query)}"
                 if len(rows) > config.max_hits:
                     return ("\n".join(rows[:config.max_hits])
                             + f"\n... more than {config.max_hits} matches; narrow the query.")
