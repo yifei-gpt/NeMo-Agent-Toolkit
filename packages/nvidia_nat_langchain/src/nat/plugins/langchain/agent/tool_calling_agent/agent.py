@@ -204,6 +204,35 @@ class ToolCallAgentGraph(DualNodeAgent):
             response = response + c
         return response
 
+    def _repair(self, call: dict) -> None:
+        """Arguments a parser merged into one key (`a=1, b`), or the one the model named its own way."""
+        args = call["args"]
+        if any("=" in k for k in args):
+            out = {}
+            for k, v in args.items():
+                for part in (k.split(",") if "=" in k else [k]):
+                    name, _, val = part.partition("=")
+                    out[name.strip()] = val.strip().strip("\'\"") if val else v
+            args = call["args"] = out
+        fields = getattr(getattr(self.tool_caller.tools_by_name.get(call["name"]), "args_schema", None),
+                         "model_fields", None)
+        for name, field in (fields or {}).items():
+            # A parser blind to the list type hands the array through as source text, and pydantic
+            # refuses the call before the tool's own reader -- written for this -- ever sees it.
+            got = args.get(name)
+            if (isinstance(got, str) and got.lstrip().startswith("[")
+                    and (field.annotation is list or typing.get_origin(field.annotation) is list)):
+                try:
+                    parsed = json.loads(got)
+                except ValueError:
+                    continue
+                if isinstance(parsed, list):
+                    args[name] = parsed
+        missing = [k for k, f in (fields or {}).items() if f.is_required() and k not in args]
+        extra = [k for k in args if k not in (fields or args)]
+        if len(missing) == 1 and len(extra) == 1:
+            args[missing[0]] = args.pop(extra[0])
+
     async def agent_node(self, state: ToolCallAgentGraphState, config: RunnableConfig | None = None):
         try:
             logger.debug("%s Starting the Tool Calling Agent Node", AGENT_LOG_PREFIX)
@@ -214,20 +243,42 @@ class ToolCallAgentGraph(DualNodeAgent):
             # tools bound, the agent writes what it found instead of the graph raising.
             rounds = sum(1 for message in state.messages if getattr(message, "tool_calls", None))
             closing = bool(self.max_tool_rounds) and rounds >= self.max_tool_rounds
+            # Circling is running out of turns by another road: one run sent the same grep 491 times.
+            # The worst honest repeat over 125 runs is 26, so 40 catches only a loop, and it ends the
+            # way the cap does -- answer written, workspace graded.
+            most = collections.Counter((c.get("name"), str(c.get("args")))
+                                       for m in state.messages if isinstance(m, AIMessage)
+                                       for c in (getattr(m, "tool_calls", None) or []))
+            if not closing and max(most.values(), default=0) >= 40:
+                logger.warning("%s made one call %d times over; asked it to finish instead",
+                               AGENT_LOG_PREFIX, max(most.values()))
+                closing = True
             if closing:
                 state.messages = state.messages + [HumanMessage(content=_CLOSING)]
-            elif (self.max_tool_rounds and not self._warned_low
-                  and rounds >= self.max_tool_rounds * _WARN_AT):
-                # Once, while there is still room to act on it: told only at the limit, a run
-                # stops mid-task with everything it gathered unwritten.
-                self._warned_low = True
-                state.messages = state.messages + [HumanMessage(
-                    content=_LOW.format(used=rounds, total=self.max_tool_rounds))]
             response = await self._invoke_llm(state, closing=closing)
             if isinstance(response, AIMessageChunk):
                 response = _chunk_to_message(response)
 
             response = await self._validate_llm_response(response, state)
+
+            for call in getattr(response, "tool_calls", None) or ():
+                self._repair(call)
+
+            # Answering with no tool touched is no answer to a task about changing a repo: one model
+            # ended nine runs in three seconds, fencing its shell command instead of calling bash.
+            # Said once; a second bare answer stands.
+            if (not getattr(response, "tool_calls", None)
+                    and not any(isinstance(m, ToolMessage) for m in state.messages)
+                    and not any(isinstance(m, HumanMessage) and str(m.content).startswith(_NOTOOL)
+                                for m in state.messages)):
+                logger.warning("%s answered without calling a tool; asked once more", AGENT_LOG_PREFIX)
+                state.messages += [response, HumanMessage(content=_NOTOOL)]
+                response = await self._invoke_llm(state, closing=False)
+                if isinstance(response, AIMessageChunk):
+                    response = _chunk_to_message(response)
+                response = await self._validate_llm_response(response, state)
+                for call in getattr(response, "tool_calls", None) or ():
+                    self._repair(call)
 
             if self.detailed_logs:
                 agent_input = "\n".join(str(message.content) for message in state.messages)
