@@ -794,28 +794,33 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
         out = (body.get("stdout") or "") + (body.get("stderr") or "")
         if body.get("process_status") not in (None, "completed", "success"):
             out = f"[{body['process_status']}]\n{out}"
-        # A command that succeeds and prints nothing -- a heredoc, a bare `#` comment the model
-        # meant as a thought -- otherwise returns "", which reads as a tool that did nothing and
-        # gets re-sent. One run re-sent the same comment 95 times. Say the command ran and left
-        # no output, so re-running it is pointless; think() is where a thought belongs.
-        out = out.strip() or ("the command ran and exited 0 with no output -- re-running it will "
-                              "return this again. If you meant to reason, use think; otherwise move on.")
+        # Silence reads as a tool that did nothing and gets re-sent: 95 times for a `#` comment,
+        # 510 for a heredoc that wrote its file every time. Say what it means.
+        out = out.strip() or ("exited 0 and printed nothing -- which is what a write, a move, or a "
+                              "build with nothing to report does when it works. Re-running returns "
+                              "this same line; if you meant to reason, use think.")
         cap = config.max_output_characters
         if len(out) <= cap:
             return out
         FIRED[config.type] += 1
-        return out[:cap] + (f"\n...[cut at {cap} characters. Send the output to a file and read it, "
-                            "or filter it here with head, tail or grep -- running this again returns "
-                            "the same cut.]")
+        # The tail too: a build puts its first errors at the top and its verdict at the bottom.
+        return out[:cap * 3 // 4] + (f"\n...[cut {len(out) - cap} characters; the end of the output "
+                                     "follows. Narrow with grep -- piping to head would drop the "
+                                     "exit status with it.]\n") + out[-(cap // 4):]
 
     # Named, not just described: agents guessed /app, the image's own workdir, and lost 3 steps.
     yield FunctionInfo.from_fn(_run, description=(
         "Run one shell command in the workspace and return its output. Each call is a new shell, "
         "so a `cd` or an exported variable is gone by the next one -- chain them in one command "
         "line instead. The working directory is "
-        f"the workspace root, {_root().as_posix()}, so paths are relative to it. For anything on "
+        # The bridged shell runs in the container: the host path does not exist there, and every
+        # other tool says /app through _where().
+        f"the workspace root, {_CONTAINER_ROOT if _bridge() else _root().as_posix()}, so paths are "
+        "relative to it. For anything on "
         "the web use search_web and fetch_url rather than curl or urllib here: those keep what "
-        "they read where the rest of the run can see it.\n\n"
+        "they read where the rest of the run can see it. Long output is cut from the middle, never "
+        "the end, so `| head` buys nothing and costs the exit status: a pipeline reports only its "
+        "LAST command's, and `go build | head` reads as success however the build went.\n\n"
         "Args:\n    command (str): the command line, e.g. `ls -la` or `python -m pytest -q`."))
 
 
