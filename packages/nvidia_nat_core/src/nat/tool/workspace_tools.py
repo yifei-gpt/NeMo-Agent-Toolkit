@@ -325,11 +325,21 @@ async def list_directory(config: WorkspaceListConfig, builder: Builder) -> Async
 
     async def _run(subdir: str = "", contains: str = "") -> str:
         if _bridge():
-            where = subdir.strip("/ ") or "."
+            here = subdir.strip()
+            parts = [x for x in Path(here).parts if x not in ("/", "", ".")]
+            # `/app` IS the root: `find /app` looked for /app/app and returned only find's error,
+            # 18 listings in one pass. Only a LEADING root is dropped.
+            if here.startswith("/") and parts[:1] == [_CONTAINER_ROOT.strip("/")]:
+                parts = parts[1:]
+            where = "/".join(parts) or "."
             ran, out = _sh(f"find {shlex.quote(where)} -type f -printf '%P\\t%s\\n' 2>/dev/null "
                            f"|| find {shlex.quote(where)} -type f")
             if ran:
-                return _from_find(out, where, contains, config.max_entries)
+                # find's stderr arrives mixed in and reads as a row: a directory of one odd file.
+                rows = "\n".join(l for l in out.splitlines() if not l.startswith("find:"))
+                if not rows.strip():
+                    return f"no such directory: {subdir or _CONTAINER_ROOT}"
+                return _from_find(rows, where, contains, config.max_entries)
         return _listing(subdir, contains, config.max_entries)
 
     yield FunctionInfo.from_fn(
