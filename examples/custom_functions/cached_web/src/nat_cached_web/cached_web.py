@@ -133,11 +133,15 @@ async def _pace(directory: Path, interval: float) -> None:
             fcntl.flock(fh, fcntl.LOCK_EX)
             try:
                 fh.seek(0)
-                last = float(fh.read().strip() or 0)
+                try:
+                    last = float(fh.read().strip() or 0)
+                except ValueError:      # a glued stamp from before the flush below: start over
+                    last = 0.0
                 wait = last + interval - time.time()
                 if wait <= 0:
                     fh.seek(0), fh.truncate()
                     fh.write(str(time.time()))
+                    fh.flush()      # under the lock: else two buffered stamps land glued
                     return
             finally:
                 fcntl.flock(fh, fcntl.LOCK_UN)
