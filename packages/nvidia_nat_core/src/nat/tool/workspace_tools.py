@@ -660,12 +660,22 @@ async def grep_files(config: WorkspaceSearchConfig, builder: Builder) -> AsyncGe
         note = (f"\n[scanned {seen - skipped} of {seen} files in {time.time() - started:.0f}s; "
                 f"{skipped} documents were left unopened -- narrow with subdir= or path_contains=]"
                 if skipped else "")
-        return ("\n".join(hits) + note) if hits else (f"(no line contains {query!r})" + note)
+        return ("\n".join(hits) + note) if hits else (f"(no line contains {query!r})"
+                                                       + _literal(query) + note)
 
     yield FunctionInfo.from_fn(_run, description=(
         "Search workspace file contents and return matching lines with their paths. `query` is plain "
         "text matched case-insensitively, not a regular expression -- for a regex use bash with grep. "
         "Args: `query`, optional `subdir`, and `path_contains` to restrict which files are scanned." + _where()))
+
+
+def _near(body: str, old: str) -> str:
+    """Where the passage nearly is: 12 identical failed edits in one run, each told only that the
+    text was absent."""
+    head = next((l.strip() for l in old.splitlines() if l.strip()), "")
+    at = [n for n, l in enumerate(body.splitlines(), 1) if head and head in l][:3]
+    return (f" Its first line is at line {', '.join(map(str, at))}: read there and copy from the file."
+            if at else "")
 
 
 class WorkspaceEditConfig(FunctionBaseConfig, name="edit_file"):
@@ -677,6 +687,10 @@ async def edit_file(config: WorkspaceEditConfig, builder: Builder) -> AsyncGener
     """Replace one exact passage in a file, rather than rewriting the file around it."""
 
     async def _run(path: str, old: str, new: str) -> str:
+        # "edited" for a no-op reads as success: one model resent the same one 415 times, a third
+        # of its budget, waiting for the file to change.
+        if old == new:
+            return f"`old` and `new` are identical, so {path} is unchanged; put the replacement in `new`."
         if _bridge():
             q = shlex.quote(path)
             ran, body = _sh(f"if [ -f {q} ]; then cat {q}; else echo __MISSING__; fi")
@@ -685,7 +699,7 @@ async def edit_file(config: WorkspaceEditConfig, builder: Builder) -> AsyncGener
                     return f"{path} is not a file in the workspace; list_directory shows what is."
                 seen = body.count(old)
                 if seen == 0:
-                    return f"that exact text is not in {path}; read it again and copy the passage."
+                    return f"that exact text is not in {path}; read it again and copy the passage.{_near(body, old)}"
                 if seen > 1:
                     return f"that text appears {seen} times in {path}; include more of it."
                 done, out = _put(path, body.replace(old, new, 1).encode())
@@ -702,7 +716,7 @@ async def edit_file(config: WorkspaceEditConfig, builder: Builder) -> AsyncGener
         hits = body.count(old)
         if hits == 0:
             return (f"that passage does not appear in {path}; read it first and copy the text "
-                    "exactly, whitespace included.")
+                    f"exactly, whitespace included.{_near(body, old)}")
         if hits > 1:
             # Editing the first of several is how a file quietly gets the wrong one changed.
             return f"that passage appears {hits} times in {path}; extend `old` until it is unique."
