@@ -88,7 +88,7 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
         with open(trail, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry) + "\n")
 
-    async def _execute_code(generated_code: str) -> dict:
+    async def _execute_code(generated_code: str) -> str:
         logger.info("Executing code in the sandbox at %s", config.uri)
         _record(generated_code, None)
         try:
@@ -131,18 +131,27 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
                                 "anything it printed is lost with it. Do less in one call.")
         elif len(text) > cap:
             FIRED[config.type] += 1
-            output["stdout"] = text[:cap] + f"\n... {len(text) - cap} more characters, print less"
-        return output
+            # The tail too: a test run puts its summary last, and head-only truncation hid it.
+            output["stdout"] = (text[:cap * 3 // 4] + f"\n... {len(text) - cap} characters cut; "
+                                "the end of the output follows\n" + text[-(cap // 4):])
+        # What it printed, not the envelope: as a dict it reached the model with every newline
+        # escaped and every message buried in a field. Over 3009 calls run_code was re-sent
+        # unchanged after 31.7% of them, against 6.9% for the same command through bash.
+        said = str(output.get("stdout") or "")
+        if output.get("process_status") not in ("completed", "success"):
+            err = str(output.get("stderr") or "").strip()
+            said = f"[{output.get('process_status')}]\n{said}" + (f"\n{err}" if err and err not in said else "")
+        return said
 
     yield FunctionInfo.from_fn(
         fn=_execute_code,
         input_schema=CodeExecutionInputSchema,
-        description=(config.description or ("Runs `generated_code` in the task's own container and returns its stdout, "
-                     "stderr and status. A shell command line works as well as python -- send "
+        description=(config.description or ("Runs `generated_code` in the task's own container and returns what it printed. "
+                     "A shell command line works as well as python -- send "
                      "whichever suits the step. The session persists, so a directory you enter "
                      "and a file you write are still there on the next call."
                      if os.environ.get("NAT_BRIDGE_READY") else
-                     """Runs `generated_code` as python and returns its stdout, stderr and status.
+                     """Runs `generated_code` as python and returns what it printed.
         Print what you want to see -- nothing is returned otherwise, and no variable survives to the
         next call. The workspace is the working directory, so relative paths read and write the same
         files the workspace tools see.""")))
