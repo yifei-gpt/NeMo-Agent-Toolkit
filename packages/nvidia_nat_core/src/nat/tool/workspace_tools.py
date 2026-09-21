@@ -88,6 +88,21 @@ def _bare(step: str) -> str:
     return re.sub(r"^[-*\d.)\s]*(\[[ xX-]\])?\s*", "", step.strip())
 
 
+_DONE = ("done", "completed", "complete", "finished", "checked", "status", "state")
+
+
+def _step_text(raw: dict) -> str:
+    """The step inside a wrapper: its first text, never its `done` flag."""
+    return str(next((v for k, v in raw.items() if k.lower() not in _DONE and isinstance(v, str) and v.strip()),
+                    next(iter(raw.values()), "")))
+
+
+def _step_done(raw) -> bool:
+    """Whether a wrapped step says it is already finished."""
+    got = next((raw[k] for k in raw if k.lower() in _DONE), None) if isinstance(raw, dict) else None
+    return str(got).strip().lower() in ("true", "1", "yes", "done", "completed", "finished")
+
+
 def _steps_in(text) -> list[str]:
     """The steps an agent sent, whether as a list or a line per step.
 
@@ -102,7 +117,10 @@ def _steps_in(text) -> list[str]:
     `done` and `giving_up` are genuinely strings, and take the line-per-item path.
     """
     if isinstance(text, list):
-        return [str(x).strip() for x in text if str(x).strip()]
+        # Steps arrive wrapped ({"step": ...} / {"name": ..., "done": true}). Not the first VALUE:
+        # one key ahead of the text and the step becomes "True".
+        flat = [_step_text(x) if isinstance(x, dict) else str(x) for x in text]
+        return [x.strip() for x in flat if x.strip()]
     return [line for line in (text or "").splitlines() if line.strip()]
 
 
@@ -828,7 +846,9 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
     reason is what stops the next agent -- or the next turn of this one -- repeating the attempt.
     """
 
-    async def _run(steps: list[str] = [], done: str = "", giving_up: str = "",
+    # `list`, not `list[str]`: wrapped steps had pydantic rejecting whole plans (Nemotron 10,
+    # Qwen 5) before _steps_in saw them.
+    async def _run(steps: list = [], done: str = "", giving_up: str = "",
                    because: str = "") -> str:
         key = str(_root())
         lines = list(_PLANS.get(key, []))
@@ -838,18 +858,32 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
             # A closed step stays closed: each specialist rewrites this list, and a plain replace
             # reopened what the one before it had already finished.
             shut = {l[6:].split("  (")[0].strip().lower(): l for l in lines if not l.startswith("- [ ]")}
+            # Some models close a step only as {"step": ..., "done": true}; dropping the flag left
+            # the plan all-open and rewritten rather than advanced -- 8 calls, 19 plans re-sent.
+            ticked = {_bare(t).strip().lower() for t, raw in zip(asked, steps if isinstance(steps, list) else [])
+                      if _step_done(raw)}
             # Steps often arrive already bulleted, and "- [ ] - step" reads as a broken list.
-            lines = [shut.get(_bare(s).strip().lower(), f"- [ ] {_bare(s)}")
+            lines = [shut.get(_bare(s).strip().lower(),
+                              f"- [{'x' if _bare(s).strip().lower() in ticked else ' '}] {_bare(s)}")
                      for s in asked]
-        missed = []
+        def hits(mark, line):
+            """Either way round: a step returns as a prefix of itself as often as with a note
+            appended, and neither is a different step."""
+            sent, held = mark.strip().lower(), line[6:].split("  (")[0].strip().lower()
+            return sent in held or (len(held) >= 12 and held in sent)
+
+        missed, already = [], []
         for mark, box, why in ([(x, "- [x]", "") for x in _steps_in(done)]
                                + [(x, "- [-]", because) for x in _steps_in(giving_up)]):
             for i, line in enumerate(lines):
-                if line.startswith("- [ ]") and mark.strip().lower() in line.lower():
+                if line.startswith("- [ ]") and hits(mark, line):
                     lines[i] = line.replace("- [ ]", box, 1) + (f"  ({why.strip()})" if why.strip() else "")
                     break
             else:
-                missed.append(mark.strip())
+                # Which of the two: told "closed, or never listed" an agent cannot tell it
+                # succeeded -- 15 in 100 sent the same close again.
+                (already if any(not l.startswith("- [ ]") and hits(mark, l) for l in lines)
+                 else missed).append(mark.strip())
         if lines:
             _PLANS[key] = lines
         if not lines:
@@ -861,9 +895,10 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
         # retried -- one run sent the same plan 19 times and read back the same words every time.
         if lines == before and (asked or done.strip() or giving_up.strip()):
             tail += "\nNothing changed: this is the list as it already stood."
+        if already:
+            tail += "\n" + ", ".join(repr(m) for m in already) + " was closed already; nothing to do."
         if missed:
-            tail += ("\nNo open step matches " + ", ".join(repr(m) for m in missed)
-                     + " -- already closed, or never on the list.")
+            tail += "\nNo step matches " + ", ".join(repr(m) for m in missed) + " -- it is not on this list."
         return "\n".join(lines) + "\n\n" + tail
 
     yield FunctionInfo.from_fn(_run, description=(
