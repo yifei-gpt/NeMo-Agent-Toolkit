@@ -13,7 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
+import json
 import logging
+import re
 import typing
 
 from langchain_core.callbacks.base import AsyncCallbackHandler
@@ -115,8 +118,25 @@ class ToolCallAgentGraph(DualNodeAgent):
         # gathered, and a bound tool schema is an invitation to spend a turn it does not have.
         self.closing_agent = prompt_runnable | llm
         self.max_tool_rounds = max_tool_rounds
-        self._warned_low = False
-        self.tool_caller = ToolNode(tools, handle_tool_errors=handle_tool_errors)
+        # A refused call is otherwise invisible: no step, no line. Keep the tool and the reason,
+        # drop the arguments between them -- a written-out file fills the log and the window alike.
+        def rejected(e):
+            r = repr(e)
+            # Argument names too, which the truncated middle drops: without them "path: Field
+            # required" reads the same whether the model erred or we failed to rename a synonym.
+            sent = ", ".join(dict.fromkeys(re.findall(r"[{,] ?\\?'(\w+)\\?': ", r[:2000]))) or "?"
+            r = r if len(r) < 400 else f"{r[:120]} [...] {r[-280:]}"
+            logger.warning("%s tool call rejected (sent: %s): %s", AGENT_LOG_PREFIX, sent, r)
+            # Named fields alone leave the same broken shape re-sent (gemma-4: 33 times); the whole
+            # signature shows which argument is missing.
+            m = re.search(r"tool '([\w.-]+)'", r)
+            fields = getattr(getattr(self.tool_caller.tools_by_name.get(m.group(1)) if m else None,
+                                     "args_schema", None), "model_fields", None)
+            sig = (" This tool takes: "
+                   + ", ".join(k if f.is_required() else f"{k} (optional)" for k, f in fields.items())
+                   + ".") if fields else ""
+            return f"Error: {r}\n{sig}\n Please fix your mistakes."
+        self.tool_caller = ToolNode(tools, handle_tool_errors=rejected if handle_tool_errors is True else handle_tool_errors)
         self.return_direct = [tool.name for tool in return_direct] if return_direct else []
 
         self._max_truncation_retries: int = max_truncation_retries
