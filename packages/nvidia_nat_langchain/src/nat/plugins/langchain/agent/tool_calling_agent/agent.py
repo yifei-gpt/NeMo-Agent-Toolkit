@@ -164,6 +164,33 @@ class ToolCallAgentGraph(DualNodeAgent):
         Raises:
             RuntimeError: If the LLM returns no response.
         """
+        try:
+            return await self._stream(state, closing)
+        except Exception as ex:
+            # A history past the window used to end the run and all its work; the oldest tool
+            # results are the cheapest tokens to give back.
+            if "context length" not in str(ex) or not self._shed(state):
+                raise
+            logger.warning("%s context window full: released the oldest tool results", AGENT_LOG_PREFIX)
+            return await self._stream(state, closing)
+
+    @staticmethod
+    def _shed(state: ToolCallAgentGraphState) -> bool:
+        """Blank the oldest tool results until half the text they hold is gone; False when none are left."""
+        # By size, not count: a repo's big reads are the recent ones, and freeing by count refilled
+        # the window five minutes later at a full re-prefill each time.
+        held = [m for m in state.messages if isinstance(m, ToolMessage) and m.content != _SHED]
+        goal = sum(len(m.content) for m in held) // 2
+        gave = False
+        for m in held[:-1]:      # never the newest: that is the result the model is working from
+            if goal <= 0:
+                break
+            goal -= len(m.content)
+            m.content = _SHED
+            gave = True
+        return gave
+
+    async def _stream(self, state: ToolCallAgentGraphState, closing: bool):
         # Use astream so LangGraph's stream_mode="messages" can observe individual LLM tokens.
         # Config is inherited from LangGraph's context, preserving streaming callbacks.
         chunks: list[AIMessageChunk] = []
