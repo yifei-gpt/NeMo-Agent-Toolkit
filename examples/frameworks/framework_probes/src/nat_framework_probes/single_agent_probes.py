@@ -27,11 +27,82 @@ from nat.cli.register_workflow import register_function
 from nat.data_models.component_ref import FunctionRef
 from nat.data_models.component_ref import LLMRef
 from nat.data_models.function import FunctionBaseConfig
+from nat.plugins.langchain.agent.tool_calling_agent.agent import CLEAR_CHUNK
+from nat.plugins.langchain.agent.tool_calling_agent.agent import CLEAR_TRIGGER
+from nat.plugins.langchain.agent.tool_calling_agent.agent import chars_per_token
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_PROMPT = ("You are a careful analyst. Use the available tools to look up facts and to compute "
                   "values; never guess. End with a short, direct answer.")
+
+
+# The langchain agent's rule, so all three frameworks trim alike.
+KEEP, CLEARED = 3, "[cleared]"
+
+
+def _to_clear(held, size, over, chars_per_token):
+    """The oldest results that free `over` rounded up to CLEAR_CHUNK, never the newest KEEP."""
+    need, out = -(-over // CLEAR_CHUNK) * CLEAR_CHUNK, set()
+    for x in held[:-KEEP]:
+        if need <= 0:
+            break
+        need -= (size(x) - len(CLEARED)) / chars_per_token
+        out.add(id(x))
+    return out
+
+
+def _adk_callbacks():
+    """That rule as ADK's before/after model callbacks; the request is rebuilt, so the session keeps every result."""
+    seen = {"chars_per_token": 4.0, "chars": 0}
+
+    def before(callback_context, llm_request):
+        chars = sum(len(c.model_dump_json()) for c in llm_request.contents)
+        over = chars / seen["chars_per_token"] - CLEAR_TRIGGER
+        if over > 0:
+            held = [p for c in llm_request.contents for p in (c.parts or []) if p.function_response]
+            old = _to_clear(held, lambda p: len(str(p.function_response.response)), over, seen["chars_per_token"])
+            gone = lambda p: p.model_copy(update={"function_response": p.function_response.model_copy(
+                update={"response": {"result": CLEARED}})})
+            llm_request.contents = [c.model_copy(update={"parts": [gone(p) if id(p) in old else p
+                                                                   for p in c.parts or []]})
+                                    for c in llm_request.contents]
+            chars = sum(len(c.model_dump_json()) for c in llm_request.contents)
+        seen["chars"] = chars
+
+    def after(callback_context, llm_response):
+        if sent := getattr(llm_response.usage_metadata, "prompt_token_count", None):
+            seen["chars_per_token"] = chars_per_token(seen["chars"], sent)
+
+    return before, after
+
+
+def _autogen_context(client):
+    """That rule as an AutoGen model context; get_messages copies, so the history keeps every result."""
+    from autogen_core.model_context import UnboundedChatCompletionContext
+    from autogen_core.models import FunctionExecutionResultMessage
+
+    class Cleared(UnboundedChatCompletionContext):
+        chars_per_token, chars, used = 4.0, 0, 0
+
+        async def get_messages(self):
+            # The client's usage is a running total: what it grew by is the last request's prompt.
+            used = client.actual_usage().prompt_tokens
+            if self.chars and used > self.used:
+                self.chars_per_token = chars_per_token(self.chars, used - self.used)
+            self.used = used
+            messages = await super().get_messages()
+            over = sum(len(m.model_dump_json()) for m in messages) / self.chars_per_token - CLEAR_TRIGGER
+            if over > 0:
+                held = [r for m in messages if isinstance(m, FunctionExecutionResultMessage) for r in m.content]
+                old = _to_clear(held, lambda r: len(r.model_dump_json()), over, self.chars_per_token)
+                gone = lambda r: r.model_copy(update={"content": CLEARED}) if id(r) in old else r
+                messages = [m.model_copy(update={"content": [gone(r) for r in m.content]})
+                            if isinstance(m, FunctionExecutionResultMessage) else m for m in messages]
+            self.chars = sum(len(m.model_dump_json()) for m in messages)
+            return messages
+
+    return Cleared()
 
 
 class AdkProbeConfig(FunctionBaseConfig, name="adk_probe"):
@@ -69,7 +140,9 @@ async def adk_probe(config: AdkProbeConfig, builder: Builder) -> AsyncGenerator[
 
     llm = await builder.get_llm(config.llm_name, wrapper_type=LLMFrameworkEnum.ADK)
     tools = await builder.get_tools(config.tool_names, wrapper_type=LLMFrameworkEnum.ADK)
-    agent = Agent(name="analyst", model=llm, description="Analyst", instruction=config.system_prompt, tools=tools)
+    before, after = _adk_callbacks()
+    agent = Agent(name="analyst", model=llm, description="Analyst", instruction=config.system_prompt, tools=tools,
+                  before_model_callback=before, after_model_callback=after)
 
     session_service = InMemorySessionService()
     runner = Runner(app_name="analyst",
@@ -122,7 +195,8 @@ async def autogen_probe(config: AutogenProbeConfig, builder: Builder) -> AsyncGe
                                tools=tools,
                                system_message=config.system_prompt,
                                max_tool_iterations=config.max_turns,
-                               reflect_on_tool_use=True)
+                               reflect_on_tool_use=True,
+                               model_context=_autogen_context(llm))
         # A holder per question, set before the run so every tool task inherits the same object.
         held: list[str] = []
         FINISHED_ON.set(held)

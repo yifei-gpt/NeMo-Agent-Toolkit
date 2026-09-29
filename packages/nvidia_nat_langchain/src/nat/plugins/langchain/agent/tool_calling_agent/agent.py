@@ -14,11 +14,13 @@
 # limitations under the License.
 
 import collections
+import functools
 import json
 import logging
 import re
 import typing
 
+from langchain.agents.middleware import ClearToolUsesEdit
 from langchain_core.callbacks.base import AsyncCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
@@ -28,6 +30,7 @@ from langchain_core.messages import SystemMessage
 from langchain_core.messages import ToolMessage
 from langchain_core.messages.ai import UsageMetadata
 from langchain_core.messages.base import BaseMessage
+from langchain_core.messages.utils import count_tokens_approximately
 from langchain_core.runnables import RunnableConfig
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool
@@ -55,6 +58,13 @@ logger = logging.getLogger(__name__)
 _NOTOOL = ("That was not a tool call: the tools are the only way to read or change anything here, "
           "and a fenced code block is just text. Call one now.")
 _SHED = "[released: this result was dropped to make room in the context window]"
+# Near the window, not LangChain's 100K; past it the oldest go in 50K steps, so the cache holds between them.
+CLEAR_TRIGGER, CLEAR_CHUNK = 150_000, 50_000
+
+
+def chars_per_token(chars: float, tokens: int) -> float:
+    """What the server's count says a token holds; clamped, as early on the tool schemas outweigh the history."""
+    return min(4.0, max(1.0, chars / tokens))
 # No mid-run budget warning: gemma-4 read one as leave to stop, ending 3 of 3 runs at 100 of 249
 # turns. Only this one, at the cap, and it still ends a run with the answer written.
 _CLOSING = ("You have used all of your tool calls. Do not call any more tools. Write your "
@@ -149,6 +159,8 @@ class ToolCallAgentGraph(DualNodeAgent):
         # 16k means the model is rambling, and more room does not stop that.
         self._truncation_ceiling: int = int((self._current_max_tokens or 8192) * 1.25)
         self._max_empty_response_retries: int = max_empty_response_retries
+        # 4 until the server's count corrects it: digits and CJK run far denser than prose.
+        self._chars_per_token: float = 4.0
 
         logger.debug("%s Initialized Tool Calling Agent Graph", AGENT_LOG_PREFIX)
 
@@ -195,13 +207,22 @@ class ToolCallAgentGraph(DualNodeAgent):
         # Config is inherited from LangGraph's context, preserving streaming callbacks.
         chunks: list[AIMessageChunk] = []
         runnable = self.closing_agent if closing else self.agent
-        async for chunk in runnable.astream({"messages": state.messages}):
+        # On a copy, as ContextEditingMiddleware does: the state keeps every result.
+        messages = list(state.messages)
+        count = functools.partial(count_tokens_approximately, chars_per_token=self._chars_per_token)
+        over = count(messages) - CLEAR_TRIGGER
+        if over > 0:
+            ClearToolUsesEdit(trigger=CLEAR_TRIGGER, clear_at_least=-(-over // CLEAR_CHUNK) * CLEAR_CHUNK).apply(
+                messages, count_tokens=count)
+        async for chunk in runnable.astream({"messages": messages}):
             chunks.append(chunk)
         if not chunks:
             raise RuntimeError('No response received from agent')
         response: AIMessageChunk = chunks[0]
         for c in chunks[1:]:
             response = response + c
+        if sent := (response.usage_metadata or {}).get("input_tokens"):
+            self._chars_per_token = chars_per_token(count_tokens_approximately(messages, chars_per_token=1), sent)
         return response
 
     def _repair(self, call: dict) -> None:
