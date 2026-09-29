@@ -30,6 +30,8 @@ CENSUS_ROWS = 40
 
 # Where a bridged session starts; the harness runs every container task set with this as its cwd.
 _CONTAINER_ROOT = "/app"
+# Where the sandbox mounts the workspace, as upstream's start_local_sandbox.sh does.
+SANDBOX_ROOT = "/workspace"
 
 
 def _root() -> Path:
@@ -836,7 +838,7 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
             # as a crash, and it throws away what the command had already printed.
             wrapper = (
                 "import subprocess, os, tempfile\n"
-                f"cwd = {_root().as_posix()!r}\n"
+                f"cwd = {SANDBOX_ROOT!r}\n"
                 "os.makedirs(cwd, exist_ok=True)\n"
                 "out, err = tempfile.TemporaryFile(), tempfile.TemporaryFile()\n"
                 "try:\n"
@@ -890,7 +892,7 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
         "line instead. The working directory is "
         # The bridged shell runs in the container: the host path does not exist there, and every
         # other tool says /app through _where().
-        f"the workspace root, {_CONTAINER_ROOT if _bridge() else _root().as_posix()}, so paths are "
+        f"the workspace root, {_CONTAINER_ROOT if _bridge() else SANDBOX_ROOT}, so paths are "
         "relative to it, and only files there are kept after the run. For anything on "
         "the web use search_web and fetch_url rather than curl or urllib here: those keep what "
         "they read where the rest of the run can see it. Long output is cut from the middle, never "

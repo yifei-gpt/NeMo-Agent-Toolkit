@@ -30,6 +30,7 @@ from nat.data_models.function import FunctionBaseConfig
 
 logger = logging.getLogger(__name__)
 
+from nat.tool.workspace_tools import SANDBOX_ROOT
 # The same counter the output cap keeps: a tool that cuts itself loses just as much.
 from nat.middleware.output_limit.output_limit_middleware import FIRED
 
@@ -74,7 +75,7 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
             logger.info("sandbox preamble off (root=%s bridge=%s uri=%s)", bool(root), bridge, config.uri)
             return code
         # No try: a workspace the sandbox cannot enter must fail loudly, not run in the container.
-        return (f"import os, runpy, tempfile\nos.chdir({root!r})\n"
+        return (f"import os, runpy, tempfile\nos.chdir({SANDBOX_ROOT!r})\n"
                 "fd, path = tempfile.mkstemp(suffix='.py', prefix='run_code_')\n"
                 f"os.write(fd, {code!r}.encode())\nos.close(fd)\n"
                 "runpy.run_path(path, run_name='__main__')\n")
