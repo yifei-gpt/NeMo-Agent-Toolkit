@@ -199,7 +199,7 @@ def _window(page: str, offset: int, width: int, store: int = 0) -> str:
         return f"Nothing at offset {offset}; this page is {len(page)} characters long.{cut}"
     end = min(offset + width, len(page))
     tail = (f"\n\n[characters {offset}-{end} of {len(page)}; call fetch_url again with "
-            f"offset={end} to read on]" if end < len(page) else "")
+            f"offset={end} to read on, or find_on_page to find one passage]" if end < len(page) else "")
     return page[offset:end] + tail + cut
 
 

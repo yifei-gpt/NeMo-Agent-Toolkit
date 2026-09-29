@@ -64,8 +64,6 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
         # The sandbox starts in its own container directory, so an unqualified write lands somewhere
         # the agent can never read back while the tool still reports success.
         root = os.environ.get("NAT_WORKSPACE_DIR")
-        # umask too: the sandbox runs as root, and a 644 file it leaves behind is one the workspace
-        # tools can then never rewrite.
         # A container sandbox already starts where the task lives and accepts shell as well as
         # python; a host chdir prepended there is both the wrong path and the wrong language.
         # Only a bridge the harness actually opened counts: the placeholder set for config
@@ -75,7 +73,10 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
             logger.info("sandbox preamble off (root=%s bridge=%s uri=%s)", bool(root), bridge, config.uri)
             return code
         # No try: a workspace the sandbox cannot enter must fail loudly, not run in the container.
-        return f"import os\nos.umask(0)\nos.chdir({root!r})\n" + code
+        return (f"import os, runpy, tempfile\nos.chdir({root!r})\n"
+                "fd, path = tempfile.mkstemp(suffix='.py', prefix='run_code_')\n"
+                f"os.write(fd, {code!r}.encode())\nos.close(fd)\n"
+                "runpy.run_path(path, run_name='__main__')\n")
 
     def _record(code: str, output: dict | None) -> None:
         """What the agent actually submitted, when asked for. The decision journal records which

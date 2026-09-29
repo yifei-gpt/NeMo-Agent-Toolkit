@@ -133,18 +133,32 @@ def _nothing_read(path: str, size: int, offset: int) -> str:
             f"end. Read it from 0, or from an offset below {size}.")
 
 
-def _resolve(rel: str) -> Path:
+def _allowed(p: Path, write: bool = False) -> bool:
+    # A staged world may read through its links into the data its sandbox mounts, never write there.
+    owner, _, data = os.environ.get("MARKAGENTX_STAGED_DATA", "").partition(os.pathsep)
+    real = p.resolve()
+    return real.is_relative_to(_root()) or (not write and _staged() and owner == str(_root()) and bool(data)
+                                            and real.is_relative_to(Path(data).resolve()))
+
+
+def _resolve(rel: str, write: bool = False) -> Path:
     # Briefs echo the root path whole, partial or not at all; each form folds under the root.
     root = _root()
-    parts = Path(rel.strip()).parts
-    parts = parts[parts.index(root.name) + 1:] if root.name in parts else tuple(
-        x for x in parts if x not in ("/", "", "."))
+    given = Path(rel.strip())
+    parts = tuple(x for x in given.parts if x not in ("/", "", "."))
+    if given.is_absolute() or rel.strip().startswith("~"):
+        if Path(os.path.realpath(given)).is_relative_to(root):
+            parts = Path(os.path.realpath(given)).relative_to(root).parts
+        elif _bridge() and given.is_relative_to(_CONTAINER_ROOT):
+            parts = given.relative_to(_CONTAINER_ROOT).parts
+        else:
+            raise ValueError(f"{rel} is outside the workspace, and nothing outside it is kept after the run; "
+                             f"name it relative to the workspace root")
+    else:
+        parts = parts[next((k for k in range(len(root.parts) - 1, 0, -1) if parts[:k] == root.parts[-k:]), 0):]
     p = Path(os.path.normpath(root.joinpath(*parts)))
-    # Lexical, so a staged world's links into the benchmark's data still open; elsewhere the
-    # target must land inside too.
-    for q in (p,) if _staged() else (p, p.resolve()):
-        if not q.is_relative_to(root):
-            raise ValueError(f"path escapes workspace: {rel}")
+    if not p.is_relative_to(root) or not _allowed(p) or (write and p != root and not _allowed(p.parent, write=True)):
+        raise ValueError(f"path escapes workspace: {rel}")
     return p
 
 
@@ -225,13 +239,25 @@ def _extract(p: Path) -> str | None:
 
 def _extract_uncached(p: Path) -> str | None:
     import re
+    import shutil
     import zipfile
 
     suffix = p.suffix.lower()
-    if suffix in {".docx", ".xlsx", ".pptx"}:
+    try:
+        with p.open("rb") as fh:
+            head = fh.read(8)
+    except OSError:
+        return None
+    # By content, not name: these worlds hold .docx that are CSV, .doc that are docx, a pdf named .docx.
+    # The zip's own header, not is_zipfile: an old binary that embeds a zip has its directory near the end.
+    office = suffix in {".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt"}
+    if office and head.startswith(b"PK\x03\x04"):
         try:
             with zipfile.ZipFile(p) as z:
-                parts = [n for n in z.namelist() if n.endswith(".xml") and "rels" not in n]
+                skip = ("docProps/", "theme", "styles", "settings", "fontTable", "Content_Types",
+                        "slideLayout", "slideMaster", "notesMaster")
+                parts = [n for n in z.namelist() if n.endswith(".xml") and "rels" not in n
+                         and not any(s in n for s in skip)]
                 chunks = []
                 for name in parts[:40]:
                     raw = z.read(name).decode("utf-8", errors="ignore")
@@ -244,13 +270,25 @@ def _extract_uncached(p: Path) -> str | None:
                 return text
         except Exception:
             return None
-    if suffix == ".pdf":
+    if office and head.startswith(b"\xd0\xcf\x11\xe0"):
+        # The pre-2007 binaries, through catdoc's readers that install.sh puts beside this python.
+        beside = os.pathsep.join([os.path.dirname(sys.executable), os.environ.get("PATH", "")])
+        tool = shutil.which({"doc": "catdoc", "ppt": "catppt", "xls": "xls2csv"}[suffix[1:4]], path=beside)
+        if not tool:
+            return None
+        try:
+            done = subprocess.run([tool, "-d", "utf-8", str(p)], capture_output=True, encoding="utf-8",
+                                  errors="replace", timeout=60, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        return done.stdout.strip() or None
+    if suffix == ".pdf" or head.startswith(b"%PDF"):
         text = _pdf_text(p)
         # An unparseable .pdf that is really plain text is an agent-written deliverable: let it read back.
         if text is not None:
             return text
     # ASCII-leading binaries still read as mojibake, so the extension decides, not a byte probe.
-    if suffix in {".doc", ".xls", ".ppt", ".png", ".jpg", ".jpeg", ".gif", ".zip", ".bin", ".so"}:
+    if suffix in {".png", ".jpg", ".jpeg", ".gif", ".zip", ".bin", ".so"}:
         return None
     try:
         data = p.read_bytes()
@@ -322,8 +360,7 @@ _NOISE = {".git", "node_modules", ".venv", ".mypy_cache", ".pytest_cache"}
 def _shown(p: Path, staged: bool) -> bool:
     """A staged world is walked whole; one the user named drops its metadata, .git alone filling
     a listing, and whatever its links reach outside."""
-    return staged or (not _NOISE & set(p.relative_to(_root()).parts)
-                      and p.resolve().is_relative_to(_root()))
+    return (staged or not _NOISE & set(p.relative_to(_root()).parts)) and _allowed(p)
 
 
 def _listing(subdir: str = "", contains: str = "", max_entries: int = 200) -> str:
@@ -404,7 +441,9 @@ async def read_file(config: WorkspaceReadConfig, builder: Builder) -> AsyncGener
             return f"no such file: {path}"
         text = _extract(p)
         if text is None:
-            return f"{path} is a binary file ({p.stat().st_size} bytes) with no text extractor."
+            image = p.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+            seen = " Look at it with view_image." if image else ""
+            return f"{path} ({p.stat().st_size} bytes) has no text this tool can extract.{seen}"
         chunk = text[offset:offset + config.max_chars]
         if not chunk:
             return _nothing_read(path, len(text), offset)
@@ -418,6 +457,35 @@ async def read_file(config: WorkspaceReadConfig, builder: Builder) -> AsyncGener
         "Read a workspace file as text. Args: `path` relative to the root, and `offset` to continue "
         "a long file from where the last call stopped. `offset` counts characters, not lines: to "
         "read around a line number grep gave you, use bash `sed -n '990,1050p' path` instead." + _where()))
+
+
+class WorkspaceViewImageConfig(FunctionBaseConfig, name="view_image"):
+    pass
+
+
+@register_function(config_type=WorkspaceViewImageConfig)
+async def view_image(config: WorkspaceViewImageConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
+    """Show one workspace image to the model."""
+
+    async def _run(path: str) -> str:
+        if _bridge():
+            return "view_image reads files on this host; this task's files live in its own container."
+        p = _resolve(path)
+        if not p.is_file():
+            return f"no such file: {path}"
+        try:
+            from PIL import Image
+            with Image.open(p) as im:
+                w, h = im.size
+        except Exception:
+            return f"{path} is not an image this tool can open (png, jpg, gif, bmp, webp)."
+        # The marker becomes the image itself on its way to the model (markagentx.adapters.base.show_images).
+        return f"{p.relative_to(_root())} ({w}x{h}): [[markagentx-image:{p}]]"
+
+    yield FunctionInfo.from_fn(_run, description=(
+        "Look at a workspace image: a chart you plotted, a figure, a screenshot. Args: `path` relative "
+        "to the root. For a PDF page, render it to PNG first (pymupdf in run_code). Only the newest few "
+        "images stay visible, so view one again when you need it."))
 
 
 def _add_table(doc, rows: list[str]) -> None:
@@ -542,7 +610,7 @@ async def write_file(config: WorkspaceWriteConfig, builder: Builder) -> AsyncGen
             if ran:
                 return (f"wrote {path} ({detail})" if "__WROTE__" in out
                         else out.strip() or f"could not write {path}")
-        p = _resolve(path)
+        p = _resolve(path, write=True)
         # An empty or directory `path` writes onto the directory itself, and that OS error carries
         # an absolute host path the caller can do nothing with.
         if p == _root() or p.is_dir():
@@ -631,7 +699,7 @@ async def grep_files(config: WorkspaceSearchConfig, builder: Builder) -> AsyncGe
                     or (path_contains and path_contains.lower() not in str(p).lower()):
                 continue
             seen += 1
-            costly = p.suffix.lower() in {".pdf", ".docx", ".xlsx", ".pptx"}
+            costly = p.suffix.lower() in {".pdf", ".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt"}
             if costly and (opened >= config.max_documents
                            or time.time() - started > config.max_seconds):
                 skipped += 1
@@ -706,9 +774,11 @@ async def edit_file(config: WorkspaceEditConfig, builder: Builder) -> AsyncGener
                 if done and "__WROTE__" in out:
                     return f"edited {path} ({len(old)} chars -> {len(new)})"
                 return out.strip() or f"could not write {path}"
-        p = _resolve(path)
+        p = _resolve(path, write=True)
         if not p.is_file():
             return f"{path} is not a file in the workspace; list_directory shows what is."
+        if p.suffix.lower() in {".docx", ".xlsx", ".pptx", ".pdf", ".doc", ".xls", ".ppt"}:
+            return f"edit_file changes text files; to change {path}, send the whole new content with write_file."
         try:
             body = p.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
@@ -760,23 +830,23 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
             # The cut is caught here, not left to surface as a TimeoutExpired traceback: that reads
             # as a crash, and it throws away what the command had already printed.
             wrapper = (
-                "import subprocess, os\n"
+                "import subprocess, os, tempfile\n"
                 f"cwd = {_root().as_posix()!r}\n"
                 "os.makedirs(cwd, exist_ok=True)\n"
+                "out, err = tempfile.TemporaryFile(), tempfile.TemporaryFile()\n"
                 "try:\n"
-                f"    r = subprocess.run({command!r}, shell=True, cwd=cwd, capture_output=True,\n"
-                f"                       text=True, timeout={config.timeout})\n"
-                "except subprocess.TimeoutExpired as cut:\n"
-                # TimeoutExpired carries the output as bytes even under text=True, and stderr as None.
-                "    got = [cut.stdout, cut.stderr]\n"
-                "    print(''.join(p.decode(errors='replace') if isinstance(p, bytes) else (p or '')\n"
-                "                  for p in got), end='')\n"
+                f"    r = subprocess.run({command!r}, shell=True, cwd=cwd, stdout=out, stderr=err,\n"
+                f"                       stdin=subprocess.DEVNULL, timeout={config.timeout})\n"
+                "except subprocess.TimeoutExpired:\n"
+                "    r = None\n"
+                "for f in (out, err):\n"
+                "    f.seek(0)\n"
+                "    print(f.read().decode(errors='replace'), end='')\n"
+                "if r is None:\n"
                 f"    print('\\n[stopped at the {config.timeout:g}s limit -- anything after this "
                 "was not run]', end='')\n"
-                "else:\n"
-                "    print(r.stdout, end='')\n"
-                "    print(r.stderr, end='')\n"
-                "    print(f'\\n[exit {r.returncode}]' if r.returncode else '', end='')\n")
+                "elif r.returncode:\n"
+                "    print(f'\\n[exit {r.returncode}]', end='')\n")
         try:
             async with httpx.AsyncClient(timeout=config.timeout + 15) as client:
                 answer = await client.post(config.uri.rstrip("/") + "/execute",
@@ -816,7 +886,7 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
         # The bridged shell runs in the container: the host path does not exist there, and every
         # other tool says /app through _where().
         f"the workspace root, {_CONTAINER_ROOT if _bridge() else _root().as_posix()}, so paths are "
-        "relative to it. For anything on "
+        "relative to it, and only files there are kept after the run. For anything on "
         "the web use search_web and fetch_url rather than curl or urllib here: those keep what "
         "they read where the rest of the run can see it. Long output is cut from the middle, never "
         "the end, so `| head` buys nothing and costs the exit status: a pipeline reports only its "

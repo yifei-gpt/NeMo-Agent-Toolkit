@@ -85,22 +85,48 @@ async def calculator(_config: CalculatorToolConfig, _builder: Builder) -> AsyncG
 
     async def _evaluate(expression: str) -> str:
         """Work out an arithmetic expression and return it with its result, so a caller can see
-        which sum it got back. Example: "143 * 12.50 + 87 * 3.20"."""
+        which sum it got back. Takes + - * / ** %, the constants pi e tau inf, and sqrt cbrt exp
+        log log2 log10 sin cos tan asin acos atan atan2 sinh cosh tanh degrees radians hypot floor
+        ceil factorial comb perm gcd lcm abs round min max, bare or as math.sqrt.
+        Example: "143 * 12.50 + 87 * 3.20" or "log(2) * sqrt(pi)"."""
         import ast
         import operator
         ops = {ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
                ast.Div: operator.truediv, ast.Pow: operator.pow, ast.Mod: operator.mod,
                ast.USub: operator.neg, ast.UAdd: operator.pos}
+        consts = {"pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf}
+        fns = {n: getattr(math, n) for n in (
+            "sqrt", "cbrt", "exp", "log", "log2", "log10", "sin", "cos", "tan", "asin", "acos", "atan",
+            "atan2", "sinh", "cosh", "tanh", "degrees", "radians", "hypot", "floor", "ceil",
+            "factorial", "comb", "perm", "gcd", "lcm")} | {"abs": abs, "round": round, "min": min, "max": max}
+
+        def name_of(node):
+            # `sqrt` or `math.sqrt`, as a model writes either.
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "math":
+                return node.attr
+            return node.id if isinstance(node, ast.Name) else None
+
+        def call(fn, *args):
+            # In the agent's own process: an integer that keeps growing stalls every agent in the run.
+            if (fn is operator.pow and isinstance(args[1], int) and abs(args[1]) > 10**4 and abs(args[0]) > 1) or (
+                    fn in (math.factorial, math.comb, math.perm) and any(abs(a) > 10**4 for a in args)):
+                raise ValueError("that number is too large to work out here; use run_code")
+            return fn(*args)
 
         def walk(node):
-            # Arithmetic only: a name or a call would make this an eval of whatever was sent.
+            # Listed names only: any other name or call would make this an eval of whatever was sent.
             if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
                 return node.value
             if isinstance(node, ast.BinOp) and type(node.op) in ops:
-                return ops[type(node.op)](walk(node.left), walk(node.right))
+                return call(ops[type(node.op)], walk(node.left), walk(node.right))
             if isinstance(node, ast.UnaryOp) and type(node.op) in ops:
                 return ops[type(node.op)](walk(node.operand))
-            raise ValueError(f"only numbers and + - * / ** % are allowed, not {ast.dump(node)[:40]}")
+            if name_of(node) in consts:
+                return consts[name_of(node)]
+            if isinstance(node, ast.Call) and name_of(node.func) in fns and not node.keywords:
+                return call(fns[name_of(node.func)], *map(walk, node.args))
+            raise ValueError(f"only numbers, + - * / ** %, and the listed constants and functions are allowed, "
+                             f"not {ast.dump(node)[:40]}")
 
         try:
             value = walk(ast.parse(expression.strip(), mode="eval").body)
