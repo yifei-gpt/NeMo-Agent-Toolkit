@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import tempfile
 import subprocess
 import time
@@ -239,7 +240,6 @@ def _extract(p: Path) -> str | None:
 
 def _extract_uncached(p: Path) -> str | None:
     import re
-    import shutil
     import zipfile
 
     suffix = p.suffix.lower()
