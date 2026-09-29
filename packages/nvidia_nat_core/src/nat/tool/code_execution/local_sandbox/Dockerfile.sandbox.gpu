@@ -81,8 +81,13 @@ RUN pip install --no-cache-dir nvidia-cutlass-dsl nvmath-python \
 # The runtime rides in wheels and the compiler in /usr/local/cuda-12.4; neither puts itself
 # where the loader or the shell would find it.
 ENV CUDA_HOME=/usr/local/cuda-12.4
-ENV PATH=/usr/local/cuda-12.4/bin:$PATH
+ENV PATH=/usr/local/cuda-12.4/bin:/opt/nvidia/nsight-compute/2024.1.0:$PATH
+# nvcc's default PTX is newer than this driver JITs; an explicit -arch still wins.
+ENV NVCC_PREPEND_FLAGS=-arch=native
 ENV LD_LIBRARY_PATH=/usr/local/cuda-12.4/lib64:/usr/local/lib/python3.13/site-packages/nvidia/cuda_runtime/lib
+
+# torch's load_inline builds with it, and that is how KernelBench compiles a candidate kernel.
+RUN pip install --no-cache-dir ninja
 
 # Last layer: this image's own installs land as root. Directories only; see the base image.
 RUN find /usr/local/lib/python3.13/site-packages /usr/local/bin -type d -exec chmod a+w {} +

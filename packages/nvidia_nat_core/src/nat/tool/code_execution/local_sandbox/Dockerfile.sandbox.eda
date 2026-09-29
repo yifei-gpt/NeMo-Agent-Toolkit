@@ -14,40 +14,36 @@
 # rather than out of the model, which is the only kind an agent cannot talk itself into.
 FROM nat-sandbox
 
-# iverilog simulates the source directly; verilator compiles it to C++ and needs a host
-# compiler and make to build what it emits. yosys, magic, netgen and klayout are deliberately
-# absent: they arrive from the nix store below, newer, and Debian's would only be shadowed.
-# gtkwave is here for its command-line converters; the viewer itself needs a display.
+# verilator compiles to C++ and needs a host compiler and make; the simulators come from the suite below.
 RUN apt update \
  && apt install -y --no-install-recommends \
-      iverilog verilator make gcc g++ libc6-dev git \
-      ghdl \
-      z3 boolector \
-      nextpnr-ice40 fpga-icestorm \
+      make gcc g++ libc6-dev git \
       gcc-riscv64-unknown-elf \
-      gtkwave \
  && apt clean && rm -rf /var/lib/apt/lists/*
+
+# OSS CAD Suite, YosysHQ's nightly bundle: current yosys (with slang), verilator, iverilog, ghdl,
+# nextpnr, icestorm, sby and its solvers, gtkwave. Last on PATH: it ships a python of its own.
+RUN curl -fsSL https://github.com/YosysHQ/oss-cad-suite-build/releases/download/2026-09-27/oss-cad-suite-linux-x64-20260927.tgz \
+    | tar -xz -C /opt \
+ && /opt/oss-cad-suite/bin/yosys -V && /opt/oss-cad-suite/bin/verilator --version
+ENV PATH=$PATH:/opt/oss-cad-suite/bin
 
 # The rest of the flow: yosys ends at a gate netlist, and a netlist is not a chip. OpenROAD
 # places and routes it, magic and netgen check the result against the rules and the schematic,
 # klayout reads the GDSII that comes out.
 #
-# Taken from OpenLane's own image rather than installed: OpenROAD is not packaged for Debian,
+# Taken from LibreLane's image (OpenLane 2's successor) rather than installed: OpenROAD is not packaged for Debian,
 # the .deb Precision Innovations publishes wants libpython3.9 which bookworm does not carry,
 # and the relocatable tarball needs glibc 2.38 against this base's 2.36. OpenLane's build is
 # Nix, so every dependency it has is inside /nix/store and the whole store copies across and
 # runs -- 4.3 GB for a toolchain that would otherwise need a different base image.
-COPY --from=ghcr.io/efabless/openlane2:2.0.3 /nix/store /nix/store
+COPY --from=ghcr.io/librelane/librelane:3.0.14 /nix/store /nix/store
 
-# Nix addresses a tool by a hash no one can type, so each one gets a name on PATH. The store's
-# yosys is 0.38 against Debian's 0.23 and its sta is current where Debian's is from 2019, so
-# the links go in /usr/local/bin, which precedes /usr/bin: the newer pair wins for everything,
-# and nothing that already ran against the older ones has to change.
+# Nix addresses a tool by a hash no one can type, so each one gets a name on PATH; yosys comes from the suite.
 RUN set -eu; for t in openroad klayout magic netgen; do \
       f=$(ls -d /nix/store/*/bin/$t 2>/dev/null | head -1); \
       [ -n "$f" ] && ln -sf "$f" /usr/local/bin/$t; \
     done; \
-    ln -sf "$(ls -d /nix/store/*yosys-with-plugins/bin/yosys | head -1)" /usr/local/bin/yosys; \
     ln -sf "$(ls -d /nix/store/*opensta/bin/sta | head -1)" /usr/local/bin/sta; \
     openroad -version && yosys -V && sta -version
 
@@ -81,13 +77,6 @@ ENV PDK_ROOT=${HOME}/.volare/volare/sky130/versions PDK=sky130A
 # testbench and its assertions are ordinary code rather than another language to get right.
 RUN pip install --no-cache-dir cocotb cocotb-bus pyuvm pytest pyvcd amaranth
 
-# SymbiYosys drives yosys-smtbmc and the solvers above. It installs with a Makefile rather
-# than a wheel -- pip reads the repository and finds no Python project in it.
-RUN git clone --depth 1 https://github.com/YosysHQ/sby.git /tmp/sby \
- && make -C /tmp/sby install \
- && rm -rf /tmp/sby \
- && sby --help >/dev/null 2>&1 && echo "sby installed"
-
 # The two benchmarks this field reports against: VerilogEval (NVIDIA, specification to RTL)
 # and RTLLM. Published frontier numbers are 89.74% and 96.08%, so a run here is comparable
 # rather than anecdotal, and both ship their own testbenches.
@@ -105,6 +94,20 @@ ADD https://raw.githubusercontent.com/efabless/skywater-pdk-libs-sky130_fd_sc_hd
 ENV SKY130_LIB=/usr/share/pdk/sky130_fd_sc_hd__tt_025C_1v80.lib
 
 ENV COCOTB_REDUCED_LOG_FMT=1
+
+# ADD leaves a downloaded file readable by root alone, and the sandbox does not run as root.
+RUN chmod a+r /usr/share/pdk/*.lib
+
+# LibreLane's own CLI came with the store: named on PATH like the tools above.
+RUN ln -sf "$(ls -d /nix/store/*-user-environment/bin/librelane | head -1)" /usr/local/bin/librelane \
+ && librelane --version >/dev/null
+
+# VerilogEval's testbenches compile under iverilog 12 only; the suite's newer one stays under /opt/oss-cad-suite/bin.
+RUN apt update && apt install -y --no-install-recommends autoconf bison flex gperf \
+ && git clone --depth 1 -b v12_0 https://github.com/steveicarus/iverilog /tmp/iverilog \
+ && cd /tmp/iverilog && sh autoconf.sh && ./configure --prefix=/usr/local && make -j"$(nproc)" && make install \
+ && cd / && rm -rf /tmp/iverilog && apt purge -y autoconf bison flex gperf && apt autoremove -y \
+ && apt clean && rm -rf /var/lib/apt/lists/* && iverilog -V 2>&1 | head -1
 
 # Last layer: this image's own installs land as root. Directories only; see the base image.
 RUN find /usr/local/lib/python3.13/site-packages /usr/local/bin -type d -exec chmod a+w {} +

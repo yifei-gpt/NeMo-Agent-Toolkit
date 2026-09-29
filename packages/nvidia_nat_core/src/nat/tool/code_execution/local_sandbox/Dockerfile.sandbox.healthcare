@@ -45,6 +45,10 @@ RUN pip install --no-cache-dir admet-ai chemprop \
 # an optimisation needs a target to optimise against. Weights are fetched on first use rather
 # than baked in, which keeps this image from doubling.
 RUN pip install --no-cache-dir openmm || echo "openmm unavailable"
+# pdbfixer repairs a PDB before openmm will load it; mdtraj reads the trajectory it writes.
+RUN pip install --no-cache-dir pdbfixer mdtraj || echo "pdbfixer/mdtraj unavailable"
+# ESM3 and ESM C, protein language models: embeddings and generation for the protein side.
+RUN pip install --no-cache-dir esm || echo "esm unavailable; the rest of the image is unaffected"
 
 # boltz declares requires_python <3.13 and pins numpy<2 with scipy==1.13.1, none of which this
 # image's Python or its rdkit and torch can give it. It is a command-line program, so it gets
@@ -58,8 +62,8 @@ RUN apt update \
  && apt clean && rm -rf /var/lib/apt/lists/* \
  && python3.11 -m venv /opt/boltz-env \
  && /opt/boltz-env/bin/pip install --no-cache-dir -q \
-      "torch==2.6.0+cu124" --extra-index-url https://download.pytorch.org/whl/cu124 \
- && printf "torch==2.6.0+cu124\nrdkit>=2024.3.2\n" > /opt/boltz-env/constraints.txt \
+      "torch==2.13.0+cu129" --extra-index-url https://download.pytorch.org/whl/cu129 \
+ && printf "torch==2.13.0+cu129\nrdkit>=2024.3.2\n" > /opt/boltz-env/constraints.txt \
  && /opt/boltz-env/bin/pip install --no-cache-dir -q -c /opt/boltz-env/constraints.txt "boltz[cuda]" \
  && /opt/boltz-env/bin/boltz --help >/dev/null 2>&1 && echo "boltz installed under 3.11" \
  || echo "boltz unavailable; the rest of the image is unaffected"
@@ -96,12 +100,12 @@ RUN git clone --depth 1 https://github.com/MolecularAI/REINVENT4.git /opt/reinve
 ENV REINVENT_DIR=/opt/reinvent4
 
 # The chem stack resolves a torch of its own and leaves a cu130 wheel behind, which a CUDA 12
-# driver cannot load -- and the CUDA base is this image's whole reason. Put the base's torch back,
+# driver cannot load -- and the CUDA base is this image's whole reason. Pin the newest CUDA 12 torch,
 # and fail the build rather than ship an image whose GPU is dead.
-RUN pip install --no-cache-dir --force-reinstall torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124 \
- && python -c "import torch; assert torch.__version__ == '2.6.0+cu124', torch.__version__"
+RUN pip install --no-cache-dir --force-reinstall torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu129 \
+ && python -c "import torch, torchvision, chemprop, admet_ai; assert torch.__version__ == '2.13.0+cu129', torch.__version__"
 
 # Last layer: this image's own installs land as root. Directories only; see the base image.
 # Boltz's venv is in it: numba caches each function it compiles beside the source, and with nowhere
 # to write there boltz does not start at all for the user the sandbox runs as.
-RUN find /usr/local/lib/python3.13/site-packages /usr/local/bin /opt/boltz-env -type d -exec chmod a+w {} +
+RUN find /usr/local/lib/python3.13/site-packages /usr/local/bin /opt/boltz-env "$HOME" -type d -exec chmod a+w {} +
