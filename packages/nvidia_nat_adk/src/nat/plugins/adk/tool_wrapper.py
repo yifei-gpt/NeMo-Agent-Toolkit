@@ -228,11 +228,15 @@ def google_adk_tool_wrapper(
                     # every optional parameter became mandatory, and a model that correctly left
                     # one out was told to try again -- 25 of 142 task_list calls on ADK.
                     if not field.is_required():
+                        default = field.get_default(call_default_factory=True)
+                        # ADK refuses `X = None` unless X admits None: an MCP tool's optional enum is one.
+                        if default is None and type(None) not in get_args(usable):
+                            usable = Union[usable, None]
                         optional.append(
                             inspect.Parameter(param_name,
                                               inspect.Parameter.POSITIONAL_OR_KEYWORD,
                                               annotation=usable,
-                                              default=field.get_default(call_default_factory=True)))
+                                              default=default))
                     else:
                         needed.append(
                             inspect.Parameter(param_name,
