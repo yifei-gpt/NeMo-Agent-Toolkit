@@ -296,6 +296,10 @@ def _extract_uncached(p: Path) -> str | None:
         return None
     if b"\x00" in data[:4096]:
         return None
+    # GB18030 next, strictly: a Chinese office file is often GBK, and detection misreads short ones as Korean.
+    for encoding in ("utf-8", "gb18030"):
+        with contextlib.suppress(UnicodeDecodeError):
+            return data.decode(encoding)
     return data.decode("utf-8", errors="replace")
 
 
@@ -412,6 +416,7 @@ async def read_file(config: WorkspaceReadConfig, builder: Builder) -> AsyncGener
     """Read one workspace file as text."""
 
     async def _run(path: str, offset: int = 0) -> str:
+        offset = max(0, int(offset))       # a negative one means the start, not a place past the end
         if _bridge():
             q = shlex.quote(path)
             ran, out = _sh(f"if [ -d {q} ]; then echo __DIR__; elif [ -f {q} ]; then "
