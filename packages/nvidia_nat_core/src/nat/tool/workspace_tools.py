@@ -952,6 +952,8 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
     # Qwen 5) before _steps_in saw them.
     async def _run(steps: list = [], done: str = "", giving_up: str = "",
                    because: str = "") -> str:
+        if giving_up and not because.strip():
+            return "Say why in `because`: the reason is what keeps the next attempt from repeating it."
         key = str(_root())
         lines = list(_PLANS.get(key, []))
         before = list(lines)

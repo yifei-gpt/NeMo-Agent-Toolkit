@@ -16,6 +16,7 @@
 import json
 import logging
 import os
+import re
 from typing import Literal
 
 from pydantic import BaseModel
@@ -113,7 +114,10 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
         text = output.get("stdout") or ""
         # The traceback is what tells the agent which line to fix; without it the failure is mute.
         if output.get("process_status") == "error":
-            tail = str(output.get("stderr") or "").strip()[-600:]
+            # From the agent's own file down: the frames above it are the sandbox's wrapper.
+            output["stderr"] = re.sub(r"(?s)(Traceback \(most recent call last\):\n).*?(?=  File \"[^\"]*run_code_)",
+                                      r"\1", str(output.get("stderr") or ""))
+            tail = output["stderr"].strip()[-600:]
             text = (text + "\n\n[the run raised after this output]\n" + tail).strip()
             output["stdout"] = text
         # Code that only assigns returns an empty string, which reads exactly like a broken tool:
