@@ -152,8 +152,8 @@ def _resolve(rel: str, write: bool = False) -> Path:
     if given.is_absolute() or rel.strip().startswith("~"):
         if Path(os.path.realpath(given)).is_relative_to(root):
             parts = Path(os.path.realpath(given)).relative_to(root).parts
-        elif _bridge() and given.is_relative_to(_CONTAINER_ROOT):
-            parts = given.relative_to(_CONTAINER_ROOT).parts
+        elif given.is_relative_to(seen := _CONTAINER_ROOT if _bridge() else SANDBOX_ROOT):
+            parts = given.relative_to(seen).parts
         else:
             raise ValueError(f"{rel} is outside the workspace, and nothing outside it is kept after the run; "
                              f"name it relative to the workspace root")
@@ -377,7 +377,8 @@ def _listing(subdir: str = "", contains: str = "", max_entries: int = 200) -> st
     staged = _staged()
     pairs = [(str(p.relative_to(_root())), p.stat().st_size)
              for p in sorted(base.rglob("*")) if p.is_file() and _shown(p, staged)]
-    return _formatted(_root(), pairs, contains, max_entries)
+    # The path code in the sandbox opens, not the host's.
+    return _formatted(SANDBOX_ROOT, pairs, contains, max_entries)
 
 
 @register_function(config_type=WorkspaceListConfig)
