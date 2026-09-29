@@ -105,6 +105,9 @@ ENV REINVENT_DIR=/opt/reinvent4
 RUN pip install --no-cache-dir --force-reinstall torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cu129 \
  && python -c "import torch, torchvision, chemprop, admet_ai; assert torch.__version__ == '2.13.0+cu129', torch.__version__"
 
+# OpenMM's CUDA platform; NVRTC held at 12.2, the newest whose PTX this host's 535 driver runs.
+RUN pip install --no-cache-dir "openmm[cuda12]==8.6.1" "nvidia-cuda-nvrtc-cu12==12.2.140"
+
 # Last layer: this image's own installs land as root. Directories only; see the base image.
 # Boltz's venv is in it: numba caches each function it compiles beside the source, and with nowhere
 # to write there boltz does not start at all for the user the sandbox runs as.
