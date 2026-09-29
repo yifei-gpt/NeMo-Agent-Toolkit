@@ -18,7 +18,6 @@ import contextlib
 import logging
 import multiprocessing
 import os
-import resource
 import time
 from enum import StrEnum
 from io import StringIO
@@ -109,7 +108,8 @@ def execute_python(generated_code: str, timeout: float) -> CodeExecutionResult:
                 except Empty:
                     pass
                 break
-    if result is None and process.exitcode is None:
+    timed_out = result is None and process.exitcode is None
+    if timed_out:
         process.kill()          # nothing came back, so ending it now loses nothing and saves the wait
     process.join(timeout=5)
     if process.exitcode is None:
@@ -118,11 +118,12 @@ def execute_python(generated_code: str, timeout: float) -> CodeExecutionResult:
         # A child that died without answering is not a child that ran too long: the OOM killer,
         # a segfault and an interpreter abort all land here, and calling them a timeout sends back
         # "do less in one call" for something doing less will not fix.
-        if process.exitcode is not None and process.exitcode < 0:
+        if not timed_out and process.exitcode is not None:
+            why = (f"was killed by signal {-process.exitcode}. Memory is the usual cause" if process.exitcode < 0 else
+                   f"exited with code {process.exitcode} outside python: a native crash or a thread limit")
             return CodeExecutionResult(
                 process_status=CodeExecutionStatus.ERROR, stdout="",
-                stderr=f"The process was killed by signal {-process.exitcode} before it could "
-                       f"answer -- it did not run out of time. Memory is the usual cause.\n")
+                stderr=f"The process {why} -- it did not run out of time.\n")
         return CodeExecutionResult(process_status=CodeExecutionStatus.TIMEOUT, stdout="", stderr="Timed out\n")
     return result
 
@@ -137,8 +138,7 @@ def _bounded(capture):
         text[:WIRE_LIMIT] + f"\n...[{len(text) - WIRE_LIMIT} more characters produced, not returned]")
 
 
-# need to memory-limit to avoid common errors of allocating too much
-# but this has to be done in a subprocess to not crush server itself
+# In a subprocess, so code that exhausts memory is killed without taking the server with it.
 def execute_code_subprocess(generated_code: str, queue):
     """
     Execute code in a subprocess.
@@ -149,13 +149,7 @@ def execute_code_subprocess(generated_code: str, queue):
     """
 
     logger.debug("execute_code_subprocess started, PID: %s", os.getpid())
-
-    try:
-        limit = 1024 * 1024 * 1024 * 10  # 10gb - somehow with a smaller limit the server dies when numpy is used
-        resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
-        resource.setrlimit(resource.RLIMIT_DATA, (limit, limit))
-    except Exception as e:
-        logger.exception("Failed to set resource limits, PID: %s, error: %s", os.getpid(), e)
+    # No address-space cap: torch and OpenBLAS reserve far more than they use, and the container bounds real memory.
 
     stdout_capture = StringIO()
     stderr_capture = StringIO()
