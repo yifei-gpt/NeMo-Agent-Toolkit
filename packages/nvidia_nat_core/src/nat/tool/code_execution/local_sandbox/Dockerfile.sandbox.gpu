@@ -51,8 +51,10 @@ RUN apt update \
 RUN pip install --no-cache-dir cupy-cuda12x
 
 # Torch last and on its own layer: it is the largest of these and the one most likely to be
-# dropped, and a separate layer keeps the rest cached when it is. Triton rides along with it.
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu124
+# dropped, and a separate layer keeps the rest cached when it is. Triton rides along with it. The
+# base's CPU build goes first: a plain install would find torch satisfied and keep it.
+RUN pip uninstall -y torch torchvision \
+ && pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 # pynvml reads the clocks, power cap and temperature a benchmark has to be read against: a
 # kernel is not slow if the card is thermally capped. nvtx marks regions for a profiler.

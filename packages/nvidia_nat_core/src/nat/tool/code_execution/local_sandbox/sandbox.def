@@ -29,6 +29,7 @@ From: python:3.13-slim-bookworm
     mv -f /usr/bin/chown.real /usr/bin/chown
 
     apt clean && rm -rf /var/lib/apt/lists/*
+    pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
     pip install --no-cache-dir -r /app/requirements.txt
     mkdir -p /workspace
 

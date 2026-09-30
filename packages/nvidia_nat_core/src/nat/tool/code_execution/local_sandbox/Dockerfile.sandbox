@@ -25,12 +25,19 @@ FROM python:3.13-slim-bookworm
 # at all, and even when it could the minutes came out of its own budget. The image was carrying
 # Python.h and no compiler. The next five are what the runs reached for and did not find -- `file`
 # alone 56 times, which is the first thing anything does with a document it was handed. catdoc
-# reads the pre-2007 .doc, .xls and .ppt for read_file, which runs here.
+# reads the pre-2007 .doc, .xls and .ppt for read_file, which runs here. The rest is what a task on
+# files needs next: soffice converts office files and recalculates their formulas, poppler and
+# tesseract read PDFs and scans, and without CJK fonts a chart or PDF prints Chinese as boxes.
 RUN apt update && \
     apt upgrade -y && \
     apt install -y --no-install-recommends libexpat1 r-base-core r-cran-testthat \
-                                           gcc g++ libc6-dev make pkg-config \
-                                           file xxd curl git sqlite3 catdoc && \
+                                           r-cran-ggplot2 r-cran-dplyr r-cran-tidyr r-cran-readr \
+                                           r-cran-jsonlite r-cran-data.table \
+                                           gcc g++ libc6-dev make cmake pkg-config \
+                                           file xxd curl wget git sqlite3 catdoc jq ripgrep tree bc procps \
+                                           libreoffice-writer-nogui libreoffice-calc-nogui libreoffice-impress-nogui \
+                                           pandoc poppler-utils tesseract-ocr imagemagick ffmpeg graphviz \
+                                           fonts-liberation2 fonts-dejavu-core fonts-noto-cjk && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 # Node.js LTS, which most sandboxes carry: from the official image, since bookworm's own is past end of life.
@@ -38,6 +45,10 @@ COPY --from=node:24-bookworm-slim /usr/local/bin/node /usr/local/bin/
 COPY --from=node:24-bookworm-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && node --version && npm --version
+
+# CPU wheels, in their own layer: PyPI's torch brings several GB of CUDA libraries this image never
+# loads. The -gpu image swaps them for CUDA builds.
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 # Set up application code and install Python dependencies
 COPY sandbox.requirements.txt /app/requirements.txt
@@ -47,6 +58,8 @@ COPY local_sandbox_server.py /app/main.py
 # has to reach the same place it did as root, man pages in share/ included. Directories only --
 # writing a file needs its parent, and a recursive chmod copies every file into this layer.
 ENV HOME=/home/sandbox
+# soffice finds its profile through the uid's passwd entry, which that uid has none of, and exits 77.
+ENV UserInstallation=file://$HOME/.config/libreoffice/4
 RUN mkdir -m 777 /workspace /home/sandbox \
  && find /usr/local -type d -exec chmod a+w {} +
 
@@ -63,6 +76,8 @@ ENV UWSGI_HTTP_TIMEOUT=1200
 
 ENV LISTEN_PORT=6000
 EXPOSE 6000
+
+LABEL markagentx.tools="Python 3.13 with numpy, pandas, scipy, scikit-learn, PyTorch (CPU), transformers, XGBoost, LightGBM, OpenCV and readers and writers for office files and PDFs; R with ggplot2 and dplyr; Node 24; gcc, cmake; LibreOffice (soffice --headless), pandoc, poppler (pdftotext), tesseract, ImageMagick, ffmpeg, Graphviz, jq, ripgrep."
 
 WORKDIR /app
 CMD uwsgi --http 0.0.0.0:${LISTEN_PORT} --http-timeout ${UWSGI_HTTP_TIMEOUT} --socket-timeout ${UWSGI_HTTP_TIMEOUT} --harakiri ${UWSGI_HTTP_TIMEOUT} --master -p ${UWSGI_PROCESSES} --force-cwd /workspace -w main:app

@@ -46,3 +46,25 @@ pytest
 hypothesis
 setuptools
 wheel
+# What a task reaches for without naming it: the scientific and ML stack (torch is the Dockerfile's,
+# CPU-only), images and tables, and the Python ends of the image's own CLIs.
+sympy
+networkx
+transformers
+xgboost-cpu
+lightgbm
+opencv-python-headless
+scikit-image
+imageio
+duckdb
+sqlalchemy
+h5py
+xlsxwriter
+odfpy
+nltk
+httpx
+rich
+jsonschema
+pytesseract
+pdf2image
+graphviz
