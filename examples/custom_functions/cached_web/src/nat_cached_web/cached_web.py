@@ -20,13 +20,17 @@ the same web when they ask the same thing, which is what makes a utility compari
 import asyncio
 import fcntl
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
+import socket
 import time
 from pathlib import Path
 
+import anyio
+import httpcore
 import httpx
 from pydantic import Field
 
@@ -355,6 +359,27 @@ async def web_find_cached(tool_config: WebFindConfig, builder: Builder):
     )
 
 
+class _NotPublic(httpcore.ConnectError):
+    """A local or private address, which fetch_url does not read."""
+
+
+class _PublicOnly(httpcore.AsyncNetworkBackend):
+    """Dials public addresses only, checked on the address actually dialled: neither a redirect nor a
+    DNS answer that changes between lookups can reach this host's own services."""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        ips = [info[4][0] for info in await anyio.getaddrinfo(host, port, type=socket.SOCK_STREAM)]
+        if not ips or not all(ipaddress.ip_address(ip).is_global for ip in ips):
+            raise _NotPublic(f"{host} is not a public address")
+        return await self._inner.connect_tcp(ips[0], port, timeout, local_address, socket_options)
+
+    async def sleep(self, seconds):
+        await self._inner.sleep(seconds)
+
+
 class WebFetchConfig(FunctionBaseConfig, name="web_fetch_cached"):
     """One page, as readable text, memoized on disk and read a window at a time."""
 
@@ -362,6 +387,8 @@ class WebFetchConfig(FunctionBaseConfig, name="web_fetch_cached"):
     max_chars: int = Field(default=12000, description="Characters returned per call")
     store_chars: int = Field(default=240000, description="How much of the page is kept on disk")
     min_request_interval_s: float = Field(default=0.3, description="Throttle between live calls")
+    private_ok: bool = Field(default=False, description="Reach local and private addresses too, for "
+                             "a task set that serves its own sites")
 
 
 @register_function(config_type=WebFetchConfig, framework_wrappers=[LLMFrameworkEnum.LANGCHAIN])
@@ -371,9 +398,13 @@ async def web_fetch_cached(tool_config: WebFetchConfig, builder: Builder):
     lock = asyncio.Lock()
 
     async def _fetch(url: str) -> tuple[bool, str]:
+        transport = httpx.AsyncHTTPTransport()
+        if not tool_config.private_ok:
+            # httpx has no public knob for the dialler; the httpcore pool under it holds one.
+            transport._pool._network_backend = _PublicOnly(transport._pool._network_backend)
         try:
             async with httpx.AsyncClient(headers={"User-Agent": _USER_AGENT}, timeout=45.0,
-                                         follow_redirects=True) as client:
+                                         follow_redirects=True, transport=transport) as client:
                 answer = await client.get(url)
                 answer.raise_for_status()
                 kind = answer.headers.get("content-type", "")
@@ -386,6 +417,8 @@ async def web_fetch_cached(tool_config: WebFetchConfig, builder: Builder):
         except Exception as exc:  # noqa: BLE001
             code = getattr(getattr(exc, "response", None), "status_code", None)
             logger.warning("web fetch failed for %s: %s", url[:80], exc or type(exc).__name__)
+            if isinstance(exc.__cause__, _NotPublic):
+                return False, f"Could not read {url}: it is a local or private address, which fetch_url does not read."
             # Which advice is right turns on the code: re-searching a 403 returns the same blocked
             # address, and the agent re-searched it until its step budget ran out.
             if code in (401, 403):
