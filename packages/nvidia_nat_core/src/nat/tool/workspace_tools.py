@@ -862,6 +862,11 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
                                                  "timeout": config.timeout, "language": "python"})
                 answer.raise_for_status()
                 body = answer.json()
+        except (httpx.RemoteProtocolError, httpx.ReadError):
+            # Taken, then dropped mid-command: the command took the server down, and uwsgi respawns it.
+            return ("the sandbox's server died while this command ran: a command that kills every process "
+                    "(kill -1, pkill) or runs it out of memory takes it down too. It is back for the next "
+                    "command; check what this one did before running it again.")
         except Exception as exc:  # noqa: BLE001 -- any failure to run means the same thing
             # Not "right now": that reads as a wait, and an agent told to wait re-sends the same
             # command until its budget is gone -- thirty-six times in one run measured here. What
@@ -886,6 +891,8 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
                                      "follows. Narrow with grep -- piping to head would drop the "
                                      "exit status with it.]\n") + out[-(cap // 4):]
 
+    # The image's own toolchain, named by its label: an agent never guesses $SKY130_LIB.
+    tools = "" if _bridge() else os.environ.get("MARKAGENTX_SANDBOX_TOOLS", "")
     # Named, not just described: agents guessed /app, the image's own workdir, and lost 3 steps.
     yield FunctionInfo.from_fn(_run, description=(
         "Run one shell command in the workspace and return its output. Each call is a new shell, "
@@ -898,7 +905,8 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
         "the web use search_web and fetch_url rather than curl or urllib here: those keep what "
         "they read where the rest of the run can see it. Long output is cut from the middle, never "
         "the end, so `| head` buys nothing and costs the exit status: a pipeline reports only its "
-        "LAST command's, and `go build | head` reads as success however the build went.\n\n"
+        "LAST command's, and `go build | head` reads as success however the build went."
+        + (f" Installed here: {tools}" if tools else "") + "\n\n"
         "Args:\n    command (str): the command line, e.g. `ls -la` or `python -m pytest -q`."))
 
 
