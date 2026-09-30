@@ -24,12 +24,9 @@ from nat.cli.register_workflow import register_function
 from nat.data_models.function import FunctionBaseConfig
 from nat.tool import workspace_ops as ops
 
-MAX_READ_CHARS = 20000
-
 
 # Where a bridged session starts; the harness runs every container task set with this as its cwd.
 _CONTAINER_ROOT = "/app"
-SANDBOX_ROOT = ops.SANDBOX_ROOT
 
 
 def _root() -> Path:
@@ -40,8 +37,8 @@ def _root() -> Path:
 
 
 def _staged() -> bool:
-    """A world a run built, not one the user named. Both sides resolve: /home/yifei/data links to
-    /mnt/data, and the two spellings would read a staged world as the user's."""
+    """A world a run built, not one the user named. Both sides resolve: a directory reached through a link
+    has two spellings, and comparing one with the other would read a staged world as the user's."""
     sweep = os.environ.get("MARKAGENTX_WORKSPACES")
     return bool(sweep and _root().is_relative_to(Path(sweep).resolve()))
 
@@ -89,7 +86,7 @@ def _data() -> str:
 
 # Sent whole with every operation: never stale in a container started earlier, never in the agent's reach.
 # Its cwd is the workspace, whose files must not shadow the standard library it imports.
-_OPS_SOURCE = (f"import sys\nsys.path[:] = [p for p in sys.path if p not in ('', {SANDBOX_ROOT!r})]\n"
+_OPS_SOURCE = (f"import sys\nsys.path[:] = [p for p in sys.path if p not in ('', {ops.SANDBOX_ROOT!r})]\n"
                + Path(ops.__file__).read_text(encoding="utf-8"))
 
 
@@ -101,7 +98,7 @@ def _op_here(name: str, **args):
     with no sandbox at all does the operation run in this process, and then no shell exists to plant one.
     """
     url = os.environ.get("NAT_SANDBOX_URL")
-    call = json.dumps({"op": name, "root": SANDBOX_ROOT if url else str(_root()), "data": _data(), **args})
+    call = json.dumps({"op": name, "root": ops.SANDBOX_ROOT if url else str(_root()), "data": _data(), **args})
     if not url:
         got = json.loads(ops.main(call))
     else:
@@ -115,7 +112,7 @@ def _op_here(name: str, **args):
                 out = json.loads(answer.read())
         except Exception as exc:  # noqa: BLE001 -- unreachable and refusing mean the same thing here
             raise ValueError(f"the workspace is unreachable right now ({type(exc).__name__}); the sandbox is "
-                             "restarted within a minute, so try again then") from None
+                             "restarted within ten seconds, and a call after that works") from None
         line = next((l for l in (out.get("stdout") or "").splitlines() if l.startswith(nonce)), None)
         if line is None:
             raise ValueError("the file operation died in the sandbox: " + (out.get("stderr") or "")[-300:].strip())
@@ -235,7 +232,7 @@ async def list_directory(config: WorkspaceListConfig, builder: Builder) -> Async
 
 
 class WorkspaceReadConfig(FunctionBaseConfig, name="read_file"):
-    max_chars: int = Field(default=MAX_READ_CHARS, description="Cap on returned characters")
+    max_chars: int = Field(default=20000, description="Cap on returned characters")
 
 
 @register_function(config_type=WorkspaceReadConfig)
@@ -286,10 +283,10 @@ async def view_image(config: WorkspaceViewImageConfig, builder: Builder) -> Asyn
         if _bridge():
             return "view_image reads files on this host; this task's files live in its own container."
         got = await _op("image", path=path)
-        if "png" not in got:
+        if "data" not in got:
             return got["text"]
-        key = hashlib.sha1(got["png"].encode()).hexdigest()[:16]
-        _IMAGES[key] = "data:image/png;base64," + got["png"]
+        key = hashlib.sha1(got["data"].encode()).hexdigest()[:16]
+        _IMAGES[key] = f"data:{got['mime']};base64,{got['data']}"
         _IMAGES.move_to_end(key)
         while len(_IMAGES) > 64:
             _IMAGES.popitem(last=False)
@@ -438,7 +435,7 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
             # as a crash, and it throws away what the command had already printed.
             wrapper = (
                 "import subprocess, os, tempfile\n"
-                f"cwd = {SANDBOX_ROOT!r}\n"
+                f"cwd = {ops.SANDBOX_ROOT!r}\n"
                 "os.makedirs(cwd, exist_ok=True)\n"
                 "out, err = tempfile.TemporaryFile(), tempfile.TemporaryFile()\n"
                 "try:\n"
@@ -499,7 +496,7 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
         "line instead. The working directory is "
         # The bridged shell runs in the container: the host path does not exist there, and every
         # other tool says /app through _where().
-        f"the workspace root, {_CONTAINER_ROOT if _bridge() else SANDBOX_ROOT}, so paths are "
+        f"the workspace root, {_CONTAINER_ROOT if _bridge() else ops.SANDBOX_ROOT}, so paths are "
         "relative to it, and only files there are kept after the run. For anything on "
         "the web use search_web and fetch_url rather than curl or urllib here: those keep what "
         "they read where the rest of the run can see it. Long output is cut from the middle, never "

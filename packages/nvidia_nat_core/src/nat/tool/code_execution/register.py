@@ -30,7 +30,7 @@ from nat.data_models.function import FunctionBaseConfig
 
 logger = logging.getLogger(__name__)
 
-from nat.tool.workspace_tools import SANDBOX_ROOT
+from nat.tool.workspace_ops import SANDBOX_ROOT
 # The same counter the output cap keeps: a tool that cuts itself loses just as much.
 from nat.middleware.output_limit.output_limit_middleware import FIRED
 

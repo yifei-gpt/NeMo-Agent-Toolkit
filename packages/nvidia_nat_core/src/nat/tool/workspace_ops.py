@@ -8,6 +8,7 @@ only at the top, since this source is sent to the container and run as it is; wi
 the tools import it here instead. Each operation returns what its tool says to the model.
 """
 import base64
+import codecs
 import contextlib
 import csv
 import hashlib
@@ -29,6 +30,8 @@ _NOISE = {".git", "node_modules", ".venv", ".mypy_cache", ".pytest_cache"}
 _PART_OF = ("\n\n[only the first {kept} {unit} were read, of {whole}; the rest is not shown and searching this "
             "file will not find it]")
 _OFFICE = {".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt"}
+# A text file's head, read whole into memory, and a workbook's rows: past them a file is far beyond any context.
+_TEXT_BYTES, _ROWS = 64 << 20, 100_000
 _DOCUMENTS = _OFFICE | {".pdf"}
 # On disk, not in memory: every operation is a fresh process, and a second search over the same tree
 # re-parsed 1950 PDFs from scratch when nothing was kept.
@@ -110,7 +113,8 @@ def extract(p: Path) -> str | None:
         st = p.stat()
     except OSError:
         return None
-    kept = _CACHE / hashlib.sha1(f"{p.resolve()}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()
+    # The version leads the key: text extracted the old way must not answer for the new.
+    kept = _CACHE / hashlib.sha1(f"4|{p.resolve()}|{st.st_size}|{st.st_mtime_ns}".encode()).hexdigest()
     with contextlib.suppress(OSError, ValueError):
         return json.loads(kept.read_text(encoding="utf-8"))
     text = _extract_uncached(p)
@@ -118,6 +122,25 @@ def extract(p: Path) -> str | None:
         _CACHE.mkdir(parents=True, exist_ok=True)
         kept.write_text(json.dumps(text), encoding="utf-8")
     return text
+
+
+def _xlsx_text(p: Path) -> str | None:
+    """A workbook as its sheets' rows, a tab between cells: its strings live apart from its cells, so
+    its XML read in order gives string indices where the words were."""
+    from openpyxl import load_workbook
+    wb = load_workbook(p, read_only=True, data_only=True)
+    try:
+        lines = []
+        for ws in wb.worksheets:
+            lines.append(f"## {ws.title}")
+            for row in ws.iter_rows(values_only=True):
+                if len(lines) > _ROWS:
+                    return "\n".join(lines) + _PART_OF.format(kept=_ROWS, whole=f"more than {_ROWS}", unit="rows")
+                if line := "\t".join("" if v is None else str(v) for v in row).rstrip("\t"):
+                    lines.append(line)
+        return "\n".join(lines) if len(lines) > len(wb.worksheets) else None
+    finally:
+        wb.close()
 
 
 def _extract_uncached(p: Path) -> str | None:
@@ -133,6 +156,9 @@ def _extract_uncached(p: Path) -> str | None:
     # The zip's own header, not is_zipfile: an old binary that embeds a zip has its directory near the end.
     office = suffix in _OFFICE
     if office and head.startswith(b"PK\x03\x04"):
+        if suffix in (".xlsx", ".xls"):
+            with contextlib.suppress(Exception):
+                return _xlsx_text(p)
         try:
             with zipfile.ZipFile(p) as z:
                 skip = ("docProps/", "theme", "styles", "settings", "fontTable", "Content_Types",
@@ -142,8 +168,10 @@ def _extract_uncached(p: Path) -> str | None:
                 chunks = []
                 for name in parts[:40]:
                     raw = z.read(name).decode("utf-8", errors="ignore")
-                    chunks.append(re.sub(r"<[^>]+>", " ", raw))
-                text = re.sub(r"\s+", " ", " ".join(chunks)).strip() or None
+                    # A paragraph ends its line: flattened whole, a document is one line grep cannot point into.
+                    chunks.append(re.sub(r"<[^>]+>", " ", re.sub(r"</(w:p|a:p)>", "\n", raw)))
+                text = re.sub(r"[ \t\r\f\v]+", " ", "\n".join(chunks))
+                text = re.sub(r" *\n[ \n]*", "\n", text).strip() or None
                 # A document read down to its first 40 parts is not the document, and silence here
                 # reads downstream as "this is all of it".
                 if text and len(parts) > 40:
@@ -172,15 +200,45 @@ def _extract_uncached(p: Path) -> str | None:
     if suffix in {".png", ".jpg", ".jpeg", ".gif", ".zip", ".bin", ".so"}:
         return None
     try:
-        data = p.read_bytes()
+        # Bounded: a sparse 50 GB file read whole took the sandbox's memory, and every search with it.
+        with p.open("rb") as fh:
+            data = fh.read(_TEXT_BYTES + 1)
     except Exception:
         return None
-    if b"\x00" in data[:4096]:
+    if b"\x00" in data[:4096] and not data.startswith(tuple(_BOMS)):
         return None
-    # GB18030 next, strictly: a Chinese office file is often GBK, and detection misreads short ones as Korean.
-    for encoding in ("utf-8", "gb18030"):
-        with contextlib.suppress(UnicodeDecodeError):
-            return data.decode(encoding)
+    text = _decoded(data[:_TEXT_BYTES])
+    if len(data) > _TEXT_BYTES:
+        text += _PART_OF.format(kept=_TEXT_BYTES >> 20, whole=f"{p.stat().st_size >> 20} MB", unit="MB of this file")
+    return text
+
+
+# UTF-32 ahead of UTF-16: its little-endian mark begins with UTF-16's.
+_BOMS = {codecs.BOM_UTF32_LE: "utf-32", codecs.BOM_UTF32_BE: "utf-32", codecs.BOM_UTF8: "utf-8-sig",
+         codecs.BOM_UTF16_LE: "utf-16", codecs.BOM_UTF16_BE: "utf-16"}
+
+
+def _decoded(data: bytes) -> str:
+    """Text in the encoding it most likely has, said whenever that is not UTF-8. Detection guessed short
+    GBK as Big5 and Latin-1 as cp1250, so this reads the bytes instead: a CJK encoding pairs its high
+    bytes, a Western one leaves each alone between letters, and Japanese is the one that brings kana."""
+    for bom, encoding in _BOMS.items():
+        if data.startswith(bom):
+            return data.decode(encoding, errors="replace")
+    with contextlib.suppress(UnicodeDecodeError):
+        return data.decode("utf-8")
+    head = data[:1 << 20]       # the pattern shows in the first megabyte; counting all of a big file does not pay
+    high = [i for i, b in enumerate(head) if b >= 0x80]
+    paired = sum((i + 1 < len(head) and head[i + 1] >= 0x80) or (i > 0 and head[i - 1] >= 0x80) for i in high)
+    said = "\n\n[not UTF-8: read as {}; if that is wrong, bash `iconv -f` another]"
+    if paired <= 0.8 * len(high):
+        return data.decode("cp1252", errors="replace") + said.format("cp1252")
+    with contextlib.suppress(UnicodeDecodeError):
+        text = data.decode("shift_jis")
+        if 20 * sum("\u3040" <= c <= "\u30ff" for c in text) > len(high):
+            return text + said.format("shift_jis")
+    with contextlib.suppress(UnicodeDecodeError):
+        return data.decode("gb18030") + said.format("gb18030")
     return data.decode("utf-8", errors="replace")
 
 
@@ -213,7 +271,7 @@ def _shown(root: Path, p: Path, staged: bool, data: str) -> bool:
     return (staged or not _NOISE & set(p.relative_to(root).parts)) and _allowed(root, p, data)
 
 
-def listing(root: str, subdir: str = "", contains: str = "", max_entries: int = 200, staged: bool = False,
+def listing(root: str, subdir: str = "", contains: str = "", *, max_entries: int, staged: bool = False,
             data: str = "") -> str:
     top = Path(root).resolve()
     base = resolve(root, subdir, data) if subdir else top
@@ -225,12 +283,14 @@ def listing(root: str, subdir: str = "", contains: str = "", max_entries: int = 
     return formatted(SANDBOX_ROOT, pairs, contains, max_entries)
 
 
-def read(root: str, path: str, offset: int = 0, max_chars: int = 20000, data: str = "") -> str:
+def read(root: str, path: str, offset: int = 0, *, max_chars: int, data: str = "") -> str:
     p = resolve(root, path, data)
     if p.is_dir():
         return f"{path} is a directory -- list it with list_directory, or name a file in it."
     if not p.is_file():
         return f"no such file: {path}"
+    if not os.access(p, os.R_OK):
+        return f"{path} cannot be read: permission denied."
     text = extract(p)
     if text is None:
         image = p.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
@@ -246,8 +306,12 @@ def read(root: str, path: str, offset: int = 0, max_chars: int = 20000, data: st
     return f"{chunk}\n... {rest} more characters, call again with offset={offset + len(chunk)}"
 
 
+# Raw bytes per image: as base64 (4/3) and JSON, under the 1 MB WIRE_LIMIT a sandbox reply may carry.
+_IMAGE_BYTES = 650_000
+
+
 def image(root: str, path: str, data: str = "") -> dict:
-    """The image as the model is sent it, a PNG at a size it reads well, with the line that says so."""
+    """The image as the model is sent it, at a size it reads well, with the line that says so."""
     p = resolve(root, path, data)
     if not p.is_file():
         return {"text": f"no such file: {path}"}
@@ -260,12 +324,21 @@ def image(root: str, path: str, data: str = "") -> dict:
             k = min(max(1280, max(w, h)), 1600) / max(w, h)
             if k != 1:
                 im = im.resize((max(1, round(w * k)), max(1, round(h * k))))
-            buf = io.BytesIO()
-            im.save(buf, "PNG")
+            # PNG keeps a chart's text sharp; a photo too big as PNG goes as JPEG, then smaller.
+            kind = "png"
+            while True:
+                buf = io.BytesIO()
+                im.save(buf, kind, **({"quality": 85} if kind == "jpeg" else {}))
+                if buf.tell() <= _IMAGE_BYTES or min(im.size) < 64:
+                    break
+                if kind == "png":
+                    kind = "jpeg"
+                else:
+                    im = im.resize((im.width * 3 // 4, im.height * 3 // 4))
     except Exception:
         return {"text": f"{path} is not an image this tool can open (png, jpg, gif, bmp, webp)."}
-    return {"text": f"{p.relative_to(Path(root).resolve())} ({w}x{h})",
-            "png": base64.b64encode(buf.getvalue()).decode()}
+    return {"text": f"{p.relative_to(Path(root).resolve())} ({w}x{h})", "mime": f"image/{kind}",
+            "data": base64.b64encode(buf.getvalue()).decode()}
 
 
 def _add_table(doc, rows: list[str]) -> None:
@@ -412,8 +485,8 @@ def literal(query: str) -> str:
             "for a pattern use bash `grep -rnE`." if re.search(r"[.*+?\[\]\\^$|()]", query) else "")
 
 
-def grep(root: str, query: str, subdir: str = "", path_contains: str = "", max_hits: int = 60,
-         max_seconds: float = 90.0, max_documents: int = 250, staged: bool = False, data: str = "") -> dict:
+def grep(root: str, query: str, subdir: str = "", path_contains: str = "", *, max_hits: int, max_seconds: float,
+         max_documents: int, staged: bool = False, data: str = "") -> dict:
     """-> {"text": what the tool says, "cut": whether max_hits cut the answer}."""
     needle = query.strip().lower()
     top = Path(root).resolve()
@@ -439,11 +512,13 @@ def grep(root: str, query: str, subdir: str = "", path_contains: str = "", max_h
         for i, line in enumerate(text.splitlines(), 1):
             if needle in line.lower():
                 said = line.strip()
-                # A CSV row or a minified file is one long line, and its first 200 characters
-                # read exactly like all of it. The bridged grep does not cut at all, so
-                # unmarked this tool answers differently depending on whether a container is up.
-                hits.append(f"{rel}:{i}: {said[:200]}"
-                            + (f"  ...[+{len(said) - 200} more on this line]" if len(said) > 200 else ""))
+                # Around the match, not from the line's start: a CSV row or a minified file is one long
+                # line, the match can sit a million characters in, and its head reads as a miss. Marked,
+                # since the bridged grep does not cut at all.
+                at = max(0, said.lower().find(needle) - 80)
+                hits.append(f"{rel}:{i}: " + ("…" if at else "") + said[at:at + 200]
+                            + ("…" if len(said) > at + 200 else "")
+                            + (f" [a {len(said)}-character line]" if len(said) > 200 else ""))
                 if len(hits) > max_hits:
                     # Past the cap the agent needs a narrower query, not an arbitrary prefix.
                     return {"text": "\n".join(hits[:max_hits]) + f"\n... more than {max_hits} matches; "

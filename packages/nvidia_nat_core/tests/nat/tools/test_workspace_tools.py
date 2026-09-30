@@ -18,7 +18,9 @@ def workspace(tmp_path, monkeypatch):
 def test_root_is_never_the_process_cwd(monkeypatch, tmp_path):
     monkeypatch.delenv("NAT_WORKSPACE_DIR", raising=False)
     monkeypatch.chdir(tmp_path)
-    assert wt._root() != tmp_path.resolve()
+    scratch = wt._root()
+    scratch.rmdir()
+    assert scratch != tmp_path.resolve()
 
 
 def test_paths_fold_under_the_root(tmp_path):
@@ -50,14 +52,24 @@ def test_a_link_out_of_the_workspace_is_refused(tmp_path):
     (tmp_path / "ws").mkdir()
     (tmp_path / "secret").write_text("kept")
     (tmp_path / "ws" / "leak").symlink_to(tmp_path / "secret")
-    for call in (lambda: ops.read(str(tmp_path / "ws"), "leak"), lambda: ops.write(str(tmp_path / "ws"), "leak", "x")):
+    ws = str(tmp_path / "ws")
+    for call in (lambda: ops.read(ws, "leak", max_chars=100), lambda: ops.write(ws, "leak", "x")):
         with pytest.raises(ValueError):
             call()
     assert (tmp_path / "secret").read_text() == "kept"
 
 
+@pytest.mark.parametrize("text, encoding", [
+    ("name,city\nRésumé,Zürich\n", "latin-1"), ("“quoted” – €100\n", "cp1252"), ("名前,42\nCafé,7\n", "utf-16"),
+    ("\ufeffid,Zoë\n", "utf-8"), ("中文测试：季度报告\n", "gb18030"), ("你好", "gb18030"), ("日本語のテキストです。\n", "shift_jis")])
+def test_a_file_reads_back_in_its_own_encoding(tmp_path, monkeypatch, text, encoding):
+    monkeypatch.setattr(ops, "_CACHE", tmp_path / "cache")
+    (tmp_path / "f.txt").write_bytes(text.encode(encoding))
+    assert ops.read(str(tmp_path), "f.txt", max_chars=100).split("\n\n[not UTF-8")[0] == text.lstrip("\ufeff")
+
+
 def test_without_a_sandbox_the_tools_run_here(workspace):
     assert wt._op_here("write", path="d/a.txt", content="hi").startswith("wrote d/a.txt")
-    assert wt._op_here("read", path="d/a.txt") == "hi"
+    assert wt._op_here("read", path="d/a.txt", max_chars=100) == "hi"
     with pytest.raises(ValueError):
-        wt._op_here("read", path="../../etc/passwd")
+        wt._op_here("read", path="../../etc/passwd", max_chars=100)
