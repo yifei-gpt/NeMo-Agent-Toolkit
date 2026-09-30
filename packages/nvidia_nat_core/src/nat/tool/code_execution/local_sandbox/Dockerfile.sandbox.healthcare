@@ -111,4 +111,6 @@ RUN pip install --no-cache-dir "openmm[cuda12]==8.6.1" "nvidia-cuda-nvrtc-cu12==
 # Last layer: this image's own installs land as root. Directories only; see the base image.
 # Boltz's venv is in it: numba caches each function it compiles beside the source, and with nowhere
 # to write there boltz does not start at all for the user the sandbox runs as.
-RUN find /usr/local/lib/python3.13/site-packages /usr/local/bin /opt/boltz-env "$HOME" -type d -exec chmod a+w {} +
+RUN find /usr/local /opt/boltz-env "$HOME" -type d -exec chmod a+w {} +
+# What the agent is told this image carries; replaces the CUDA image's, which it includes.
+LABEL markagentx.tools="CUDA 12.4 with PyTorch, Triton and CuPy; RDKit, OpenMM (CUDA platform), pdbfixer, AutoDock Vina with meeko, ProLIF, Open Babel, PyMOL, Biopython, ADMET-AI, ESM, REINVENT4, and Boltz-2 as $BOLTZ (its own interpreter). nvidia-smi lists the cards this run was given."

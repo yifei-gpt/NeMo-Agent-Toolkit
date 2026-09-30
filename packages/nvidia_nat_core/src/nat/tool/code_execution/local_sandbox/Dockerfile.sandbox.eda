@@ -110,4 +110,6 @@ RUN apt update && apt install -y --no-install-recommends autoconf bison flex gpe
  && apt clean && rm -rf /var/lib/apt/lists/* && iverilog -V 2>&1 | head -1
 
 # Last layer: this image's own installs land as root. Directories only; see the base image.
-RUN find /usr/local/lib/python3.13/site-packages /usr/local/bin -type d -exec chmod a+w {} +
+RUN find /usr/local -type d -exec chmod a+w {} +
+# What the agent is told this image carries; the harness reads it into the shell's description.
+LABEL markagentx.tools="yosys, iverilog 12, OpenROAD, LibreLane, cocotb 2 (SIM=icarus, and the Makefile includes $(shell cocotb-config --makefiles)/Makefile.sim). The sky130 PDK ($PDK) is in $PDK_ROOT and its standard-cell liberty at $SKY130_LIB; VerilogEval in $VERILOG_EVAL_DIR, RTLLM in $RTLLM_DIR."

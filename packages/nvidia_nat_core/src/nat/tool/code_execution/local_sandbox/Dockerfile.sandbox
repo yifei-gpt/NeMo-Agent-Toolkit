@@ -32,17 +32,22 @@ RUN apt update && \
                                            file xxd curl git sqlite3 && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
+# Node.js LTS, which most sandboxes carry: from the official image, since bookworm's own is past end of life.
+COPY --from=node:24-bookworm-slim /usr/local/bin/node /usr/local/bin/
+COPY --from=node:24-bookworm-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && node --version && npm --version
 
 # Set up application code and install Python dependencies
 COPY sandbox.requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY local_sandbox_server.py /app/main.py
-# Any uid runs this, so the cwd, HOME and site-packages must be writable: a task's `pip install`
-# has to reach the same place it did as root. Directories only -- writing a file needs its parent,
-# and a recursive chmod copies all of site-packages into this layer.
+# Any uid runs this, so the cwd, HOME and /usr/local must be writable: a task's `pip install`
+# has to reach the same place it did as root, man pages in share/ included. Directories only --
+# writing a file needs its parent, and a recursive chmod copies every file into this layer.
 ENV HOME=/home/sandbox
 RUN mkdir -m 777 /workspace /home/sandbox \
- && find /usr/local/lib/python3.13/site-packages /usr/local/bin -type d -exec chmod a+w {} +
+ && find /usr/local -type d -exec chmod a+w {} +
 
 # Set Flask app environment variables and ports
 ARG UWSGI_CHEAPER
