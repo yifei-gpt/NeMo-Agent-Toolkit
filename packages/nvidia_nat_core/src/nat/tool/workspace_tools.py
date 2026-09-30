@@ -3,16 +3,15 @@
 
 """Workspace file tools for benchmarks that hand an agent a directory and a brief."""
 
-import contextlib
-import logging
+import asyncio
+import hashlib
+import json
 import os
 import re
+import secrets
 import shlex
-import shutil
 import tempfile
-import subprocess
-import time
-import sys
+import urllib.request
 from collections.abc import AsyncGenerator
 from collections import OrderedDict
 from pathlib import Path
@@ -23,15 +22,14 @@ from nat.builder.builder import Builder
 from nat.builder.function_info import FunctionInfo
 from nat.cli.register_workflow import register_function
 from nat.data_models.function import FunctionBaseConfig
+from nat.tool import workspace_ops as ops
 
 MAX_READ_CHARS = 20000
-CENSUS_ROWS = 40
 
 
 # Where a bridged session starts; the harness runs every container task set with this as its cwd.
 _CONTAINER_ROOT = "/app"
-# Where the sandbox mounts the workspace, as upstream's start_local_sandbox.sh does.
-SANDBOX_ROOT = "/workspace"
+SANDBOX_ROOT = ops.SANDBOX_ROOT
 
 
 def _root() -> Path:
@@ -59,20 +57,17 @@ def _sh(command: str, timeout: float = 60.0) -> tuple[bool, str]:
     Shell and not python: six of terminalbench's fourteen local images carry no python at all, and
     the bridged session routes a command line to bash either way. `cd` first so it routes there.
     """
-    import json as _json
-    import urllib.request
-
     uri = _bridge()
     if not uri:
         return False, ""
-    body = _json.dumps({"generated_code": f"cd {_CONTAINER_ROOT} && " + command,
+    body = json.dumps({"generated_code": f"cd {_CONTAINER_ROOT} && " + command,
                         "language": "python", "timeout": timeout}).encode()
     try:
         with urllib.request.urlopen(
                 urllib.request.Request(uri.rstrip("/") + "/execute", body,
                                        {"Content-Type": "application/json"}),
                 timeout=timeout + 15) as answer:
-            got = _json.loads(answer.read())
+            got = json.loads(answer.read())
     except Exception as exc:  # noqa: BLE001 -- unreachable and refusing mean the same thing here
         return True, f"the workspace is unreachable right now ({type(exc).__name__})."
     return True, (got.get("stdout") or "") + (got.get("stderr") or "")
@@ -84,6 +79,63 @@ def _where() -> str:
     and writes through bash heredocs instead."""
     return (f" This task's workspace root is {_CONTAINER_ROOT}, so `x` and {_CONTAINER_ROOT}/x name "
             f"the same file; either form works here." if _bridge() else "")
+
+
+def _data() -> str:
+    """The dataset a staged world's links reach into: reads may follow them, writes never."""
+    owner, _, data = os.environ.get("MARKAGENTX_STAGED_DATA", "").partition(os.pathsep)
+    return data if data and _staged() and owner == str(_root()) else ""
+
+
+# Sent whole with every operation: never stale in a container started earlier, never in the agent's reach.
+# Its cwd is the workspace, whose files must not shadow the standard library it imports.
+_OPS_SOURCE = (f"import sys\nsys.path[:] = [p for p in sys.path if p not in ('', {SANDBOX_ROOT!r})]\n"
+               + Path(ops.__file__).read_text(encoding="utf-8"))
+
+
+def _op_here(name: str, **args):
+    """One file operation where the files are, as its tool's result; a ValueError is its refusal.
+
+    In the sandbox whenever one can exist, so this host never opens a path the agent chose: a link its
+    shell plants between a check and an open would lead here to anything this user can read. Only
+    with no sandbox at all does the operation run in this process, and then no shell exists to plant one.
+    """
+    url = os.environ.get("NAT_SANDBOX_URL")
+    call = json.dumps({"op": name, "root": SANDBOX_ROOT if url else str(_root()), "data": _data(), **args})
+    if not url:
+        got = json.loads(ops.main(call))
+    else:
+        # Only the line carrying this nonce is the answer: the container is the agent's to write in.
+        nonce = secrets.token_hex(8)
+        code = _OPS_SOURCE + f"\nprint({nonce!r} + main({call!r}))\n"
+        body = json.dumps({"generated_code": code, "language": "python", "timeout": 300}).encode()
+        request = urllib.request.Request(url.rstrip("/") + "/execute", body, {"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=315) as answer:
+                out = json.loads(answer.read())
+        except Exception as exc:  # noqa: BLE001 -- unreachable and refusing mean the same thing here
+            raise ValueError(f"the workspace is unreachable right now ({type(exc).__name__}); the sandbox is "
+                             "restarted within a minute, so try again then") from None
+        line = next((l for l in (out.get("stdout") or "").splitlines() if l.startswith(nonce)), None)
+        if line is None:
+            raise ValueError("the file operation died in the sandbox: " + (out.get("stderr") or "")[-300:].strip())
+        got = json.loads(line[len(nonce):])
+    if "error" in got:
+        raise ValueError(got["error"])
+    return got["result"]
+
+
+async def _op(name: str, **args):
+    # Off the event loop: a search may scan for a minute and a half, and other agents share this loop.
+    return await asyncio.to_thread(_op_here, name, **args)
+
+
+# What view_image showed, by key: the request that carries an image reads it here, never the path again.
+_IMAGES: "OrderedDict[str, str]" = OrderedDict()
+
+
+def image_url(key: str) -> str | None:
+    return _IMAGES.get(key)
 
 
 def _bare(step: str) -> str:
@@ -127,195 +179,11 @@ def _steps_in(text) -> list[str]:
     return [line for line in (text or "").splitlines() if line.strip()]
 
 
-def _nothing_read(path: str, size: int, offset: int) -> str:
-    """An empty read means an empty file or an offset past the end, and the bare "" it returned
-    means those and a broken tool alike -- one run asked for the same empty file twice over."""
-    if size <= 0:
-        return f"{path} exists and is empty; there is nothing in it to read."
-    return (f"nothing at offset {offset}: {path} is {size} characters long, so that is past its "
-            f"end. Read it from 0, or from an offset below {size}.")
-
-
-def _allowed(p: Path, write: bool = False) -> bool:
-    # A staged world may read through its links into the data its sandbox mounts, never write there.
-    owner, _, data = os.environ.get("MARKAGENTX_STAGED_DATA", "").partition(os.pathsep)
-    real = p.resolve()
-    return real.is_relative_to(_root()) or (not write and _staged() and owner == str(_root()) and bool(data)
-                                            and real.is_relative_to(Path(data).resolve()))
-
-
-def _resolve(rel: str, write: bool = False) -> Path:
-    # Briefs echo the root path whole, partial or not at all; each form folds under the root.
-    root = _root()
-    given = Path(rel.strip())
-    parts = tuple(x for x in given.parts if x not in ("/", "", "."))
-    if given.is_absolute() or rel.strip().startswith("~"):
-        if Path(os.path.realpath(given)).is_relative_to(root):
-            parts = Path(os.path.realpath(given)).relative_to(root).parts
-        elif given.is_relative_to(seen := _CONTAINER_ROOT if _bridge() else SANDBOX_ROOT):
-            parts = given.relative_to(seen).parts
-        else:
-            raise ValueError(f"{rel} is outside the workspace, and nothing outside it is kept after the run; "
-                             f"name it relative to the workspace root")
-    else:
-        parts = parts[next((k for k in range(len(root.parts) - 1, 0, -1) if parts[:k] == root.parts[-k:]), 0):]
-    p = Path(os.path.normpath(root.joinpath(*parts)))
-    if not p.is_relative_to(root) or not _allowed(p) or (write and p != root and not _allowed(p.parent, write=True)):
-        raise ValueError(f"path escapes workspace: {rel}")
-    return p
-
-
-logger = logging.getLogger(__name__)
-
-_PART_OF = ("\n\n[only the first {kept} {unit} were read, of {whole}; the rest is not shown and searching this file will not find it]")
-
 # Counted where the cap middleware counts its own: a dropped match is a dropped match.
 from nat.middleware.output_limit.output_limit_middleware import FIRED
 
-# Out of process: one malformed PDF can hang pdfminer or crash the interpreter, uncatchably.
-_PDF_CHILD = ("import sys, pdfplumber\n"
-              "with pdfplumber.open(sys.argv[1]) as pdf:\n"
-              "    sys.stdout.write('\\n'.join((p.extract_text() or '') for p in pdf.pages[:40]))\n"
-              # Said, not guessed: without the count the parent cannot tell 40 pages from 400,
-              # and read_file then reports the head of a long document as the whole of it.
-              "    sys.stderr.write(str(len(pdf.pages)))\n")
-
-
-# A PDF that could not be parsed cannot be parsed the next time either, and each attempt costs
-# the full timeout. Two workspace runs spent their wall clock re-parsing the same broken file.
-_PDF_REFUSED: dict[tuple[str, int, float], None] = {}
-# Successful extractions too: a second search over the same tree re-parsed 1950 PDFs from scratch.
-_EXTRACTED: "OrderedDict[tuple[str, int, float], str | None]" = OrderedDict()
-_EXTRACT_CACHE_MAX = 4000
-
-
-def _pdf_text(p: Path) -> str | None:
-    try:
-        stamp = (str(p), p.stat().st_size, p.stat().st_mtime)
-    except OSError:
-        stamp = (str(p), -1, -1.0)
-    if stamp in _PDF_REFUSED:
-        return None
-    # A workspace tree carries empty placeholder files; an empty one is not a broken PDF, and
-    # warning per file per search buried the reads that did fail.
-    if stamp[1] == 0:
-        return None
-    try:
-        done = subprocess.run([sys.executable, "-c", _PDF_CHILD, str(p)],
-                              capture_output=True, timeout=60, check=False)
-    except subprocess.TimeoutExpired:
-        logger.warning("PDF %s took over 60s to parse and was skipped", p.name)
-        _PDF_REFUSED[stamp] = None
-        return None
-    if done.returncode != 0:
-        logger.warning("PDF %s could not be parsed (exit %s)", p.name, done.returncode)
-        _PDF_REFUSED[stamp] = None
-        return None
-    text = done.stdout.decode("utf-8", "ignore").strip() or None
-    # The child wrote the page census to stderr: 40 pages of a 266-page filing is not the filing,
-    # and read_file reports a head it was never told was a head as the whole document.
-    if text:
-        with contextlib.suppress(ValueError):
-            whole = int(done.stderr.decode("utf-8", "ignore").strip() or 0)
-            if whole > 40:
-                text += _PART_OF.format(kept=40, whole=whole, unit="pages of this PDF")
-    return text
-
-
-def _extract(p: Path) -> str | None:
-    """Text from a workspace file, or None: Office formats are zipped XML read via the stdlib;
-    reading them as UTF-8 yields mojibake that floods the context window."""
-    try:
-        stamp = (str(p), p.stat().st_size, p.stat().st_mtime)
-    except OSError:
-        stamp = None
-    if stamp is not None and stamp in _EXTRACTED:
-        _EXTRACTED.move_to_end(stamp)
-        return _EXTRACTED[stamp]
-    text = _extract_uncached(p)
-    if stamp is not None:
-        _EXTRACTED[stamp] = text
-        while len(_EXTRACTED) > _EXTRACT_CACHE_MAX:
-            _EXTRACTED.popitem(last=False)
-    return text
-
-
-def _extract_uncached(p: Path) -> str | None:
-    import re
-    import zipfile
-
-    suffix = p.suffix.lower()
-    try:
-        with p.open("rb") as fh:
-            head = fh.read(8)
-    except OSError:
-        return None
-    # By content, not name: these worlds hold .docx that are CSV, .doc that are docx, a pdf named .docx.
-    # The zip's own header, not is_zipfile: an old binary that embeds a zip has its directory near the end.
-    office = suffix in {".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt"}
-    if office and head.startswith(b"PK\x03\x04"):
-        try:
-            with zipfile.ZipFile(p) as z:
-                skip = ("docProps/", "theme", "styles", "settings", "fontTable", "Content_Types",
-                        "slideLayout", "slideMaster", "notesMaster")
-                parts = [n for n in z.namelist() if n.endswith(".xml") and "rels" not in n
-                         and not any(s in n for s in skip)]
-                chunks = []
-                for name in parts[:40]:
-                    raw = z.read(name).decode("utf-8", errors="ignore")
-                    chunks.append(re.sub(r"<[^>]+>", " ", raw))
-                text = re.sub(r"\s+", " ", " ".join(chunks)).strip() or None
-                # A document read down to its first 40 parts is not the document, and silence here
-                # reads downstream as "this is all of it".
-                if text and len(parts) > 40:
-                    text += _PART_OF.format(kept=40, whole=len(parts), unit="parts of this file")
-                return text
-        except Exception:
-            return None
-    if office and head.startswith(b"\xd0\xcf\x11\xe0"):
-        # The pre-2007 binaries, through catdoc's readers that install.sh puts beside this python.
-        beside = os.pathsep.join([os.path.dirname(sys.executable), os.environ.get("PATH", "")])
-        tool = shutil.which({"doc": "catdoc", "ppt": "catppt", "xls": "xls2csv"}[suffix[1:4]], path=beside)
-        if not tool:
-            return None
-        try:
-            done = subprocess.run([tool, "-d", "utf-8", str(p)], capture_output=True, encoding="utf-8",
-                                  errors="replace", timeout=60, check=False)
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        return done.stdout.strip() or None
-    if suffix == ".pdf" or head.startswith(b"%PDF"):
-        text = _pdf_text(p)
-        # An unparseable .pdf that is really plain text is an agent-written deliverable: let it read back.
-        if text is not None:
-            return text
-    # ASCII-leading binaries still read as mojibake, so the extension decides, not a byte probe.
-    if suffix in {".png", ".jpg", ".jpeg", ".gif", ".zip", ".bin", ".so"}:
-        return None
-    try:
-        data = p.read_bytes()
-    except Exception:
-        return None
-    if b"\x00" in data[:4096]:
-        return None
-    # GB18030 next, strictly: a Chinese office file is often GBK, and detection misreads short ones as Korean.
-    for encoding in ("utf-8", "gb18030"):
-        with contextlib.suppress(UnicodeDecodeError):
-            return data.decode(encoding)
-    return data.decode("utf-8", errors="replace")
-
-
 class WorkspaceListConfig(FunctionBaseConfig, name="list_directory"):
     max_entries: int = Field(default=200, description="Cap on returned paths")
-
-
-def _built(target: Path, content: str) -> str:
-    """Build `content` into `target` in the shape its extension asks for. -> what was built."""
-    build = {".docx": _write_docx, ".xlsx": _write_xlsx, ".pptx": _write_pptx}.get(target.suffix.lower())
-    if build is None:
-        target.write_text(content, encoding="utf-8")
-        return f"{content.count(chr(10)) + 1} lines"
-    return build(target, content)
 
 
 def _put(path: str, blob: bytes) -> tuple[bool, str]:
@@ -328,57 +196,13 @@ def _put(path: str, blob: bytes) -> tuple[bool, str]:
                f"&& echo __WROTE__")
 
 
-def _formatted(root, pairs, contains: str, max_entries: int) -> str:
-    """One listing format for both trees, the local one and the container's: the files, or past the
-    cap a folder census, which is the only thing an arbitrary slice of them could not tell."""
-    needle = (contains or "").strip().lower()
-    hits: list[str] = []
-    census: dict[str, int] = {}
-    for rel, size in pairs:
-        if not rel or (needle and needle not in rel.lower()):
-            continue
-        census[str(Path(rel).parent)] = census.get(str(Path(rel).parent), 0) + 1
-        hits.append(f"{rel}  ({size} bytes)" if size else rel)
-    # The absolute root, so code run in a sandbox can open these files by path.
-    head = f"workspace root: {root}"
-    if not hits:
-        return head + ("\n(no file matches %r)" % contains if needle else "\n(empty)")
-    if len(hits) <= max_entries:
-        return "\n".join([head, *hits])
-    rows = sorted(census.items(), key=lambda kv: -kv[1])[:CENSUS_ROWS]
-    return (f"{head}\n{len(hits)} files match -- too many to list. Folders, largest first; "
-            f"open one with `subdir`, or filter with `contains`:\n" +
-            "\n".join(f"{d}/  ({n} files)" for d, n in rows))
-
-
 def _from_find(out: str, where: str, contains: str, max_entries: int) -> str:
     """`find -printf '%P\\t%s'` output, formatted the way a local tree is."""
     pairs = []
     for line in out.splitlines():
         name, _, size = line.partition("\t")
         pairs.append((f"{where}/{name}".lstrip("./") if where not in (".", "") else name, size))
-    return _formatted(_CONTAINER_ROOT, pairs, contains, max_entries)
-
-
-_NOISE = {".git", "node_modules", ".venv", ".mypy_cache", ".pytest_cache"}
-
-
-def _shown(p: Path, staged: bool) -> bool:
-    """A staged world is walked whole; one the user named drops its metadata, .git alone filling
-    a listing, and whatever its links reach outside."""
-    return (staged or not _NOISE & set(p.relative_to(_root()).parts)) and _allowed(p)
-
-
-def _listing(subdir: str = "", contains: str = "", max_entries: int = 200) -> str:
-    """Module level so a test can reach it: the census branch shipped broken with nothing covering it."""
-    base = _resolve(subdir) if subdir else _root()
-    if not base.is_dir():
-        return f"not a directory: {subdir}"
-    staged = _staged()
-    pairs = [(str(p.relative_to(_root())), p.stat().st_size)
-             for p in sorted(base.rglob("*")) if p.is_file() and _shown(p, staged)]
-    # The path code in the sandbox opens, not the host's.
-    return _formatted(SANDBOX_ROOT, pairs, contains, max_entries)
+    return ops.formatted(_CONTAINER_ROOT, pairs, contains, max_entries)
 
 
 @register_function(config_type=WorkspaceListConfig)
@@ -402,7 +226,7 @@ async def list_directory(config: WorkspaceListConfig, builder: Builder) -> Async
                 if not rows.strip():
                     return f"no such directory: {subdir or _CONTAINER_ROOT}"
                 return _from_find(rows, where, contains, config.max_entries)
-        return _listing(subdir, contains, config.max_entries)
+        return await _op("list", subdir=subdir, contains=contains, max_entries=config.max_entries, staged=_staged())
 
     yield FunctionInfo.from_fn(
         _run,
@@ -436,30 +260,13 @@ async def read_file(config: WorkspaceReadConfig, builder: Builder) -> AsyncGener
                 except ValueError:
                     return out
                 if not chunk:
-                    return _nothing_read(path, size, offset)
+                    return ops.nothing_read(path, size, offset)
                 rest = size - offset - len(chunk)
                 if rest <= 0:
                     return chunk
                 return (f"{chunk}\n... {rest} more characters, call again with "
                         f"offset={offset + len(chunk)}")
-        p = _resolve(path)
-        if p.is_dir():
-            return f"{path} is a directory -- list it with list_directory, or name a file in it."
-        if not p.is_file():
-            return f"no such file: {path}"
-        text = _extract(p)
-        if text is None:
-            image = p.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
-            seen = " Look at it with view_image." if image else ""
-            return f"{path} ({p.stat().st_size} bytes) has no text this tool can extract.{seen}"
-        chunk = text[offset:offset + config.max_chars]
-        if not chunk:
-            return _nothing_read(path, len(text), offset)
-        rest = len(text) - offset - len(chunk)
-        if rest <= 0:
-            return chunk
-        # Say where to continue, or the model re-reads the same head and looks like a repeat loop.
-        return f"{chunk}\n... {rest} more characters, call again with offset={offset + len(chunk)}"
+        return await _op("read", path=path, offset=offset, max_chars=config.max_chars)
 
     yield FunctionInfo.from_fn(_run, description=(
         "Read a workspace file as text. Args: `path` relative to the root, and `offset` to continue "
@@ -478,123 +285,21 @@ async def view_image(config: WorkspaceViewImageConfig, builder: Builder) -> Asyn
     async def _run(path: str) -> str:
         if _bridge():
             return "view_image reads files on this host; this task's files live in its own container."
-        p = _resolve(path)
-        if not p.is_file():
-            return f"no such file: {path}"
-        try:
-            from PIL import Image
-            with Image.open(p) as im:
-                w, h = im.size
-        except Exception:
-            return f"{path} is not an image this tool can open (png, jpg, gif, bmp, webp)."
+        got = await _op("image", path=path)
+        if "png" not in got:
+            return got["text"]
+        key = hashlib.sha1(got["png"].encode()).hexdigest()[:16]
+        _IMAGES[key] = "data:image/png;base64," + got["png"]
+        _IMAGES.move_to_end(key)
+        while len(_IMAGES) > 64:
+            _IMAGES.popitem(last=False)
         # The marker becomes the image itself on its way to the model (markagentx.adapters.base.show_images).
-        return f"{p.relative_to(_root())} ({w}x{h}): [[markagentx-image:{p}]]"
+        return f"{got['text']}: [[markagentx-image:{key}]]"
 
     yield FunctionInfo.from_fn(_run, description=(
         "Look at a workspace image: a chart you plotted, a figure, a screenshot. Args: `path` relative "
         "to the root. For a PDF page, render it to PNG first (pymupdf in run_code). Only the newest few "
         "images stay visible, so view one again when you need it."))
-
-
-def _add_table(doc, rows: list[str]) -> None:
-    cells = [[c.strip() for c in r.strip("|").split("|")] for r in rows]
-    # The `|---|:--:|` rule under a markdown header carries no data, so it must not become a row.
-    cells = [r for r in cells if not all(set(c) <= set("-: ") for c in r)]
-    if not cells:
-        return
-    table = doc.add_table(rows=len(cells), cols=max(len(r) for r in cells))
-    table.style = "Table Grid"
-    for i, row in enumerate(cells):
-        for j, value in enumerate(row):
-            table.cell(i, j).text = value
-
-
-def _write_docx(p: Path, text: str) -> str:
-    """Build a real Word document out of markdown-ish text."""
-    import re
-
-    from docx import Document
-
-    doc = Document()
-    para: list[str] = []
-    rows: list[str] = []
-
-    def flush_para() -> None:
-        if para:
-            doc.add_paragraph(" ".join(para))
-            para.clear()
-
-    def flush_rows() -> None:
-        if rows:
-            _add_table(doc, rows)
-            rows.clear()
-
-    for raw in text.splitlines():
-        line = raw.strip()
-        if line.startswith("|") and line.endswith("|"):
-            flush_para()
-            rows.append(line)
-            continue
-        flush_rows()
-        head = re.match(r"(#{1,3})\s+(.+)", line)
-        bullet = re.match(r"([-*+\u2022]|\d+[.)])\s+", line)
-        if head or bullet or not line:
-            flush_para()
-        if head:
-            doc.add_heading(head[2].strip(" #"), level=len(head[1]))
-        elif bullet:
-            doc.add_paragraph(line)
-        elif line:
-            para.append(line)
-    flush_rows()
-    flush_para()
-    doc.save(p)
-    return f"{len(doc.paragraphs)} paragraphs, {len(doc.tables)} tables"
-
-
-def _write_xlsx(p: Path, text: str) -> str:
-    """Build a real Excel workbook out of CSV text."""
-    import csv
-    import io
-    import re
-
-    from openpyxl import Workbook
-
-    def _typed(cell: str):
-        """A number written as text is one Excel flags and every formula skips, and a column holding
-        both sorts worse than one holding either. Plain decimals convert; a leading zero, a plus or
-        an exponent means an identifier -- 007, +1, 1e5 -- and stays the string it was sent as."""
-        body = cell.strip()
-        if not re.fullmatch(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?", body):
-            return cell
-        return float(body) if "." in body else int(body)
-
-    wb = Workbook()
-    ws = wb.active
-    # StringIO rather than splitlines(): only a real stream keeps a newline inside a quoted field.
-    for row in csv.reader(io.StringIO(text)):
-        ws.append([_typed(c) for c in row])
-    wb.save(p)
-    return f"{ws.max_row} rows x {ws.max_column} columns"
-
-
-def _write_pptx(p: Path, text: str) -> str:
-    """Build a real PowerPoint deck, one slide per blank-line-separated block."""
-    import re
-
-    from pptx import Presentation
-
-    prs = Presentation()
-    layout = prs.slide_layouts[1]
-    for block in re.split(r"\n[ \t]*\n", text.strip()):
-        lines = [ln.strip().lstrip("#-*\u2022 ").strip() for ln in block.splitlines() if ln.strip()]
-        if not lines:
-            continue
-        slide = prs.slides.add_slide(layout)
-        slide.shapes.title.text = lines[0]
-        slide.placeholders[1].text = "\n".join(lines[1:])
-    prs.save(p)
-    return f"{len(prs.slides)} slides"
 
 
 class WorkspaceWriteConfig(FunctionBaseConfig, name="write_file"):
@@ -607,46 +312,17 @@ async def write_file(config: WorkspaceWriteConfig, builder: Builder) -> AsyncGen
 
     async def _run(path: str, content: str) -> str:
         if _bridge():
-            import tempfile as _tmp
-            with _tmp.TemporaryDirectory(prefix="ws-out-") as staging:
+            with tempfile.TemporaryDirectory(prefix="ws-out-") as staging:
                 local = Path(staging) / Path(path).name
                 try:
-                    detail = _built(local, content)
+                    detail = ops.built(local, content)
                 except Exception as exc:  # noqa: BLE001 -- the builder's own words beat a traceback
                     return f"could not build {path}: {exc}"
                 ran, out = _put(path, local.read_bytes())
             if ran:
                 return (f"wrote {path} ({detail})" if "__WROTE__" in out
                         else out.strip() or f"could not write {path}")
-        p = _resolve(path, write=True)
-        # An empty or directory `path` writes onto the directory itself, and that OS error carries
-        # an absolute host path the caller can do nothing with.
-        if p == _root() or p.is_dir():
-            return f"`path` must name a file inside the workspace; {path!r} names a directory."
-        p.parent.mkdir(parents=True, exist_ok=True)
-        # Writing to a symlink never means editing its target; linked worlds would reject or corrupt.
-        if p.is_symlink():
-            p.unlink()
-        build = {".docx": _write_docx, ".xlsx": _write_xlsx, ".pptx": _write_pptx}.get(p.suffix.lower())
-        if build is None:
-            # Said at the moment the lines go: a description telling the agent to prefer
-            # edit_file moved 1 framework in 4, and the loss is silent otherwise.
-            before = p.read_text(encoding="utf-8", errors="ignore").count("\n") + 1 if p.is_file() else 0
-            try:
-                p.write_text(content, encoding="utf-8")
-            except OSError as exc:
-                return f"could not write {path}: {exc.strerror or exc}."
-            after = content.count("\n") + 1
-            note = (f" It held {before} lines and now holds {after}; the other {before - after} are "
-                    "gone. If that was not intended, edit_file changes one passage and leaves "
-                    "the rest." if before > after + max(5, before // 10) else "")
-            return f"wrote {p.relative_to(_root())} ({len(content)} chars){note}"
-        try:
-            detail = build(p, content)
-        except Exception as exc:
-            # Text saved under an Office name looks delivered and grades zero; the failure must be heard.
-            return f"failed to build {p.name}: {exc}. Resend `content` in the shape that extension expects."
-        return f"wrote {p.relative_to(_root())} ({detail})"
+        return await _op("write", path=path, content=content)
 
     yield FunctionInfo.from_fn(_run, description=(
         "Write a deliverable into the workspace, replacing whatever was there. To change part of a "
@@ -668,13 +344,6 @@ class WorkspaceSearchConfig(FunctionBaseConfig, name="grep_files"):
     max_documents: int = Field(default=250, description="Documents whose text may be extracted per search")
 
 
-def _literal(query: str) -> str:
-    """Why a regex found nothing: the search is plain text. Said in the description and ignored --
-    7 of nemotron's 18 searches were regexes, 14 empty -- so it goes in the answer."""
-    return (" -- this search is plain text, so those regex characters had to appear literally; "
-            "for a pattern use bash `grep -rnE`." if re.search(r"[.*+?\[\]\\^$|()]", query) else "")
-
-
 @register_function(config_type=WorkspaceSearchConfig)
 async def grep_files(config: WorkspaceSearchConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
     """Find which workspace files hold a string, without reading each one whole."""
@@ -691,67 +360,20 @@ async def grep_files(config: WorkspaceSearchConfig, builder: Builder) -> AsyncGe
             if ran:
                 rows = [r for r in out.splitlines() if r.strip()]
                 if not rows:
-                    return f"(no line contains {query!r}){_literal(query)}"
+                    return f"(no line contains {query!r}){ops.literal(query)}"
                 if len(rows) > config.max_hits:
                     return ("\n".join(rows[:config.max_hits])
                             + f"\n... more than {config.max_hits} matches; narrow the query.")
                 return "\n".join(rows)
-        base = _resolve(subdir) if subdir else _root()
-        if not base.is_dir():
-            return f"not a directory: {subdir}"
-        hits: list[str] = []
-        started, opened, seen, skipped = time.time(), 0, 0, 0
-        staged = _staged()
-        for p in sorted(base.rglob("*")):
-            if not p.is_file() or not _shown(p, staged) \
-                    or (path_contains and path_contains.lower() not in str(p).lower()):
-                continue
-            seen += 1
-            costly = p.suffix.lower() in {".pdf", ".docx", ".xlsx", ".pptx", ".doc", ".xls", ".ppt"}
-            if costly and (opened >= config.max_documents
-                           or time.time() - started > config.max_seconds):
-                skipped += 1
-                continue
-            opened += costly
-            text = _extract(p)
-            if text is None:
-                continue
-            rel = str(p.relative_to(_root()))
-            for i, line in enumerate(text.splitlines(), 1):
-                if needle in line.lower():
-                    said = line.strip()
-                    # A CSV row or a minified file is one long line, and its first 200 characters
-                    # read exactly like all of it. The bridged grep does not cut at all, so
-                    # unmarked this tool answers differently depending on whether a container is up.
-                    hits.append(f"{rel}:{i}: {said[:200]}"
-                                + (f"  ...[+{len(said) - 200} more on this line]"
-                                   if len(said) > 200 else ""))
-                    if len(hits) > config.max_hits:
-                        # Past the cap the agent needs a narrower query, not an arbitrary prefix.
-                        FIRED[config.type] += 1
-                        return ("\n".join(hits[:config.max_hits]) +
-                                f"\n... more than {config.max_hits} matches; narrow the query.")
-        # Said, not hidden: a truncated scan that reads as "no matches" sends the agent away
-        # from the file it was looking for.
-        note = (f"\n[scanned {seen - skipped} of {seen} files in {time.time() - started:.0f}s; "
-                f"{skipped} documents were left unopened -- narrow with subdir= or path_contains=]"
-                if skipped else "")
-        return ("\n".join(hits) + note) if hits else (f"(no line contains {query!r})"
-                                                       + _literal(query) + note)
+        got = await _op("grep", query=query, subdir=subdir, path_contains=path_contains, max_hits=config.max_hits,
+                        max_seconds=config.max_seconds, max_documents=config.max_documents, staged=_staged())
+        FIRED[config.type] += bool(got.get("cut"))
+        return got["text"]
 
     yield FunctionInfo.from_fn(_run, description=(
         "Search workspace file contents and return matching lines with their paths. `query` is plain "
         "text matched case-insensitively, not a regular expression -- for a regex use bash with grep. "
         "Args: `query`, optional `subdir`, and `path_contains` to restrict which files are scanned." + _where()))
-
-
-def _near(body: str, old: str) -> str:
-    """Where the passage nearly is: 12 identical failed edits in one run, each told only that the
-    text was absent."""
-    head = next((l.strip() for l in old.splitlines() if l.strip()), "")
-    at = [n for n, l in enumerate(body.splitlines(), 1) if head and head in l][:3]
-    return (f" Its first line is at line {', '.join(map(str, at))}: read there and copy from the file."
-            if at else "")
 
 
 class WorkspaceEditConfig(FunctionBaseConfig, name="edit_file"):
@@ -775,35 +397,14 @@ async def edit_file(config: WorkspaceEditConfig, builder: Builder) -> AsyncGener
                     return f"{path} is not a file in the workspace; list_directory shows what is."
                 seen = body.count(old)
                 if seen == 0:
-                    return f"that exact text is not in {path}; read it again and copy the passage.{_near(body, old)}"
+                    return f"that exact text is not in {path}; read it again and copy the passage.{ops.near(body, old)}"
                 if seen > 1:
                     return f"that text appears {seen} times in {path}; include more of it."
                 done, out = _put(path, body.replace(old, new, 1).encode())
                 if done and "__WROTE__" in out:
                     return f"edited {path} ({len(old)} chars -> {len(new)})"
                 return out.strip() or f"could not write {path}"
-        p = _resolve(path, write=True)
-        if not p.is_file():
-            return f"{path} is not a file in the workspace; list_directory shows what is."
-        if p.suffix.lower() in {".docx", ".xlsx", ".pptx", ".pdf", ".doc", ".xls", ".ppt"}:
-            return f"edit_file changes text files; to change {path}, send the whole new content with write_file."
-        try:
-            body = p.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
-            return f"could not read {path}: {getattr(exc, 'strerror', None) or exc}."
-        hits = body.count(old)
-        if hits == 0:
-            return (f"that passage does not appear in {path}; read it first and copy the text "
-                    f"exactly, whitespace included.{_near(body, old)}")
-        if hits > 1:
-            # Editing the first of several is how a file quietly gets the wrong one changed.
-            return f"that passage appears {hits} times in {path}; extend `old` until it is unique."
-        # As write_file does: a staged world is symlinks into the shared dataset, and writing
-        # through one edits the dataset for every run after this.
-        if p.is_symlink():
-            p.unlink()
-        p.write_text(body.replace(old, new), encoding="utf-8")
-        return f"edited {p.relative_to(_root())} ({len(old)} chars -> {len(new)})"
+        return await _op("edit", path=path, old=old, new=new)
 
     yield FunctionInfo.from_fn(_run, description=(
         "Replace one exact passage inside a file, leaving the rest untouched. Use this to change an "
@@ -822,8 +423,6 @@ class WorkspaceShellConfig(FunctionBaseConfig, name="workspace_shell"):
 @register_function(config_type=WorkspaceShellConfig)
 async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
     """A shell in the sandbox, rooted at the workspace."""
-    import json as _json
-
     import httpx
 
     async def _run(command: str) -> str:

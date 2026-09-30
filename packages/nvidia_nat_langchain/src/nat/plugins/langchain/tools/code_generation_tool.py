@@ -66,13 +66,12 @@ You are a helpful code assistant that can teach a junior developer how to code. 
             return code
         # A file has no output limit: a complete implementation returned as text was cut at the
         # cap and asked for again, twelve times, each one a minute.
-        from nat.tool.workspace_tools import _resolve
+        from nat.tool.workspace_tools import _op
         body = code.strip()
         if body.startswith("```"):
             body = body.split("\n", 1)[-1].rsplit("```", 1)[0]
-        target = _resolve(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(body.strip() + "\n", encoding="utf-8")
+        # Through the sandbox, as write_file does: this host never opens a path the agent named.
+        await _op("write", path=path, content=body.strip() + "\n")
         # Re-reading its own code invented flaws and it rewrote the file 3 times; running it
         # reports the real ones, which workspace_edit can then fix in place.
         return (f"wrote {path} ({len(body)} chars). Run it to see what it actually does, and "
