@@ -111,8 +111,8 @@ def _op_here(name: str, **args):
             with urllib.request.urlopen(request, timeout=315) as answer:
                 out = json.loads(answer.read())
         except Exception as exc:  # noqa: BLE001 -- unreachable and refusing mean the same thing here
-            raise ValueError(f"the workspace is unreachable right now ({type(exc).__name__}); the sandbox is "
-                             "restarted within ten seconds, and a call after that works") from None
+            raise ValueError(f"the workspace is unreachable right now ({type(exc).__name__}); the next call "
+                             "restarts the sandbox first") from None
         line = next((l for l in (out.get("stdout") or "").splitlines() if l.startswith(nonce)), None)
         if line is None:
             raise ValueError("the file operation died in the sandbox: " + (out.get("stderr") or "")[-300:].strip())
