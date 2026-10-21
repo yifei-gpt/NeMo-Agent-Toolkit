@@ -28,8 +28,8 @@ from nat.data_models.component_ref import FunctionRef
 from nat.data_models.component_ref import LLMRef
 from nat.data_models.function import FunctionBaseConfig
 from nat.plugins.langchain.agent.tool_calling_agent.agent import CLEAR_CHUNK
-from nat.plugins.langchain.agent.tool_calling_agent.agent import CLEAR_TRIGGER
 from nat.plugins.langchain.agent.tool_calling_agent.agent import chars_per_token
+from nat.plugins.langchain.agent.tool_calling_agent.agent import clear_trigger
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,8 @@ def _to_clear(held, size, over, chars_per_token):
             break
         need -= (size(x) - len(CLEARED)) / chars_per_token
         out.add(id(x))
+    if out:
+        logger.warning("history near the context window: cleared the %d oldest of %d tool results", len(out), len(held))
     return out
 
 
@@ -58,7 +60,7 @@ def _adk_callbacks():
 
     def before(callback_context, llm_request):
         chars = sum(len(c.model_dump_json()) for c in llm_request.contents)
-        over = chars / seen["chars_per_token"] - CLEAR_TRIGGER
+        over = chars / seen["chars_per_token"] - clear_trigger()
         if over > 0:
             held = [p for c in llm_request.contents for p in (c.parts or []) if p.function_response]
             old = _to_clear(held, lambda p: len(str(p.function_response.response)), over, seen["chars_per_token"])
@@ -92,7 +94,7 @@ def _autogen_context(client):
                 self.chars_per_token = chars_per_token(self.chars, used - self.used)
             self.used = used
             messages = await super().get_messages()
-            over = sum(len(m.model_dump_json()) for m in messages) / self.chars_per_token - CLEAR_TRIGGER
+            over = sum(len(m.model_dump_json()) for m in messages) / self.chars_per_token - clear_trigger()
             if over > 0:
                 held = [r for m in messages if isinstance(m, FunctionExecutionResultMessage) for r in m.content]
                 old = _to_clear(held, lambda r: len(r.model_dump_json()), over, self.chars_per_token)

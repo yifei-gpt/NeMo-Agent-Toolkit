@@ -523,6 +523,31 @@ async def think(config: ThinkConfig, builder: Builder) -> AsyncGenerator[Functio
         "the next few steps.\n\nArgs:\n    thought (str): the reasoning to work through."))
 
 
+class AskUserConfig(FunctionBaseConfig, name="ask_user"):
+    pass
+
+
+@register_function(config_type=AskUserConfig)
+async def ask_user(config: AskUserConfig, builder: Builder) -> AsyncGenerator[FunctionInfo, None]:
+    """One question through the front end's human prompt."""
+    from nat.builder.context import Context
+    from nat.data_models.interactive import HumanPromptText
+
+    async def _run(question: str) -> str:
+        try:
+            got = await Context.get().user_interaction_manager.prompt_user_input(
+                HumanPromptText(text=question, required=True))
+        except NotImplementedError:             # no one to ask
+            return "No user is attached to this run: decide for yourself, and say what you assumed."
+        return getattr(got.content, "text", "") or "(no answer)"
+
+    yield FunctionInfo.from_fn(_run, description=(
+        "Ask the user one question and wait for the answer. Only for what the task cannot go on without and "
+        "only the user knows: a missing requirement, or a choice that is theirs to make. Never for what you can "
+        "look up, find in the workspace or decide yourself.\n\nArgs:\n    question (str): the question, "
+        "complete on its own."))
+
+
 # Keyed by workspace and shared by every agent on one task. A process running tasks in turn reuses
 # one workspace, so the key alone does not keep them apart -- reset_task_plan drops the plan at each
 # task boundary rather than carrying one task's steps into the next.

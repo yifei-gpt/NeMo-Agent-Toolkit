@@ -17,6 +17,7 @@ import collections
 import functools
 import json
 import logging
+import os
 import re
 import typing
 
@@ -58,8 +59,14 @@ logger = logging.getLogger(__name__)
 _NOTOOL = ("That was not a tool call: the tools are the only way to read or change anything here, "
           "and a fenced code block is just text. Call one now.")
 _SHED = "[released: this result was dropped to make room in the context window]"
-# Near the window, not LangChain's 100K; past it the oldest go in 50K steps, so the cache holds between them.
-CLEAR_TRIGGER, CLEAR_CHUNK = 150_000, 50_000
+# 50K steps: the cache holds between clears.
+CLEAR_CHUNK = 50_000
+
+
+def clear_trigger() -> int:
+    """150K history tokens, or 3/4 of a smaller window (NAT_CONTEXT_WINDOW)."""
+    window = int(os.environ.get("NAT_CONTEXT_WINDOW") or 0)
+    return min(150_000, 3 * window // 4) if window else 150_000
 
 
 def chars_per_token(chars: float, tokens: int) -> float:
@@ -210,10 +217,12 @@ class ToolCallAgentGraph(DualNodeAgent):
         # On a copy, as ContextEditingMiddleware does: the state keeps every result.
         messages = list(state.messages)
         count = functools.partial(count_tokens_approximately, chars_per_token=self._chars_per_token)
-        over = count(messages) - CLEAR_TRIGGER
-        if over > 0:
-            ClearToolUsesEdit(trigger=CLEAR_TRIGGER, clear_at_least=-(-over // CLEAR_CHUNK) * CLEAR_CHUNK).apply(
+        trigger = clear_trigger()
+        if (over := (held := count(messages)) - trigger) > 0:
+            ClearToolUsesEdit(trigger=trigger, clear_at_least=-(-over // CLEAR_CHUNK) * CLEAR_CHUNK).apply(
                 messages, count_tokens=count)
+            logger.warning("%s history near the context window: cleared the oldest tool results, ~%d -> ~%d tokens",
+                           AGENT_LOG_PREFIX, held, count(messages))
         async for chunk in runnable.astream({"messages": messages}):
             chunks.append(chunk)
         if not chunks:
