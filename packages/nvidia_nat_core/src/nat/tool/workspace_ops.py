@@ -25,6 +25,8 @@ from pathlib import Path
 
 # Where the sandbox mounts the workspace, as upstream's start_local_sandbox.sh does.
 SANDBOX_ROOT = "/workspace"
+# Run's shared secret for sandbox/bridge /execute
+TOKEN_ENV, TOKEN_HEADER = "NAT_SANDBOX_TOKEN", "X-Sandbox-Token"
 CENSUS_ROWS = 40
 _NOISE = {".git", "node_modules", ".venv", ".mypy_cache", ".pytest_cache"}
 _PART_OF = ("\n\n[only the first {kept} {unit} were read, of {whole}; the rest is not shown and searching this "
@@ -44,6 +46,21 @@ _PDF_CHILD = ("import sys, pdfplumber\n"
               # Said, not guessed: without the count the parent cannot tell 40 pages from 400,
               # and read_file then reports the head of a long document as the whole of it.
               "    sys.stderr.write(str(len(pdf.pages)))\n")
+
+
+def auth_headers() -> dict[str, str]:
+    token = os.environ.get(TOKEN_ENV)
+    return {TOKEN_HEADER: token} if token else {}
+
+
+def execute(uri: str, code: str, timeout: float, wait: float | None = None) -> dict:
+    """POST Python to sandbox/bridge /execute -> its JSON; `wait` defaults to `timeout` + 15s."""
+    import urllib.request  # here: the container runs this module's source and never posts
+    body = json.dumps({"generated_code": code, "language": "python", "timeout": timeout}).encode()
+    ask = urllib.request.Request(uri.rstrip("/") + "/execute", body,
+                                 {"Content-Type": "application/json", **auth_headers()})
+    with urllib.request.urlopen(ask, timeout=timeout + 15 if wait is None else wait) as answer:
+        return json.loads(answer.read())
 
 
 def _allowed(root: Path, p: Path, data: str, write: bool = False) -> bool:
@@ -66,7 +83,10 @@ def resolve(root: str, rel: str, data: str = "", write: bool = False) -> Path:
             raise ValueError(f"{rel} is outside the workspace, and nothing outside it is kept after the run; "
                              f"name it relative to the workspace root")
     else:
-        parts = parts[next((k for k in range(len(root.parts) - 1, 0, -1) if parts[:k] == root.parts[-k:]), 0):]
+        echo = next((k for k in range(len(root.parts) - 1, 0, -1) if parts[:k] == root.parts[-k:]), 0)
+        # A real `workspace/` dir is not an echo
+        if echo and not root.joinpath(parts[0]).exists():
+            parts = parts[echo:]
     p = Path(os.path.normpath(root.joinpath(*parts)))
     if not p.is_relative_to(root) or not _allowed(root, p, data) or (
             write and p != root and not _allowed(root, p.parent, data, write=True)):
@@ -256,7 +276,7 @@ def formatted(root: str, pairs, contains: str, max_entries: int) -> str:
     # The absolute root, so code run in a sandbox can open these files by path.
     head = f"workspace root: {root}"
     if not hits:
-        return head + ("\n(no file matches %r)" % contains if needle else "\n(empty)")
+        return head + (f"\n(no file matches {contains!r})" if needle else "\n(empty)")
     if len(hits) <= max_entries:
         return "\n".join([head, *hits])
     rows = sorted(census.items(), key=lambda kv: -kv[1])[:CENSUS_ROWS]
@@ -321,7 +341,7 @@ def image(root: str, path: str, data: str = "") -> dict:
             im = im.convert("RGB")
             w, h = im.size
             # Below ~1280px on the long side small text is misread; past 1600 only the token count grows.
-            k = min(max(1280, max(w, h)), 1600) / max(w, h)
+            k = min(max(1280, w, h), 1600) / max(w, h)
             if k != 1:
                 im = im.resize((max(1, round(w * k)), max(1, round(h * k))))
             # PNG keeps a chart's text sharp; a photo too big as PNG goes as JPEG, then smaller.
@@ -534,10 +554,20 @@ def grep(root: str, query: str, subdir: str = "", path_contains: str = "", *, ma
 def near(body: str, old: str) -> str:
     """Where the passage nearly is: 12 identical failed edits in one run, each told only that the
     text was absent."""
-    head = next((l.strip() for l in old.splitlines() if l.strip()), "")
-    at = [n for n, l in enumerate(body.splitlines(), 1) if head and head in l][:3]
+    head = next((ln.strip() for ln in old.splitlines() if ln.strip()), "")
+    at = [n for n, ln in enumerate(body.splitlines(), 1) if head and head in ln][:3]
     return (f" Its first line is at line {', '.join(map(str, at))}: read there and copy from the file."
             if at else "")
+
+
+def replaced(body: str, old: str, new: str) -> tuple[int, str]:
+    """-> (count of `old`, `body` with it replaced once); an all-CRLF file stays CRLF."""
+    crlf = "\r\n" in body and body.count("\n") == body.count("\r\n")
+    if crlf:
+        body, old, new = (x.replace("\r\n", "\n") for x in (body, old, new))
+    hits = body.count(old)
+    out = body.replace(old, new, 1) if hits == 1 else body
+    return hits, out.replace("\n", "\r\n") if crlf else out
 
 
 def edit(root: str, path: str, old: str, new: str, data: str = "") -> str:
@@ -547,10 +577,11 @@ def edit(root: str, path: str, old: str, new: str, data: str = "") -> str:
     if p.suffix.lower() in _DOCUMENTS:
         return f"edit_file changes text files; to change {path}, send the whole new content with write_file."
     try:
-        body = p.read_text(encoding="utf-8")
+        with p.open(encoding="utf-8", newline="") as fh:     # no newline translation
+            body = fh.read()
     except (OSError, UnicodeDecodeError) as exc:
         return f"could not read {path}: {getattr(exc, 'strerror', None) or exc}."
-    hits = body.count(old)
+    hits, after = replaced(body, old, new)
     if hits == 0:
         return (f"that passage does not appear in {path}; read it first and copy the text "
                 f"exactly, whitespace included.{near(body, old)}")
@@ -561,7 +592,8 @@ def edit(root: str, path: str, old: str, new: str, data: str = "") -> str:
     # through one edits the dataset for every run after this.
     if p.is_symlink():
         p.unlink()
-    p.write_text(body.replace(old, new), encoding="utf-8")
+    with p.open("w", encoding="utf-8", newline="") as fh:
+        fh.write(after)
     return f"edited {p.relative_to(Path(root).resolve())} ({len(old)} chars -> {len(new)})"
 
 

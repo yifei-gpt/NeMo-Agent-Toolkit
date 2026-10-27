@@ -15,9 +15,14 @@
 from __future__ import annotations
 
 import contextlib
+import hmac
 import logging
 import multiprocessing
 import os
+import re
+import signal
+import subprocess
+import sys
 import time
 from enum import StrEnum
 from io import StringIO
@@ -33,6 +38,9 @@ from pydantic import Field
 app = Flask(__name__)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.WARNING)
+
+# Popped so executed code does not inherit it
+_TOKEN = os.environ.pop("NAT_SANDBOX_TOKEN", "")
 
 
 class CodeExecutionStatus(StrEnum):
@@ -66,6 +74,14 @@ class CodeExecutionResponse(Response):
     def with_error(cls, status_code: int, error_message: str) -> CodeExecutionResponse:
         return cls(status_code,
                    CodeExecutionResult(process_status=CodeExecutionStatus.ERROR, stdout="", stderr=error_message))
+
+
+@app.before_request
+def require_token():
+    if _TOKEN and request.path != "/" and not hmac.compare_digest(
+            request.headers.get("X-Sandbox-Token", "").encode(), _TOKEN.encode()):
+        return CodeExecutionResponse.with_error(403, "missing or wrong sandbox token")
+    return None
 
 
 @app.after_request
@@ -110,6 +126,9 @@ def execute_python(generated_code: str, timeout: float) -> CodeExecutionResult:
                 break
     timed_out = result is None and process.exitcode is None
     if timed_out:
+        # Kill its group: what it started must not run on unseen
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
         process.kill()          # nothing came back, so ending it now loses nothing and saves the wait
     process.join(timeout=5)
     if process.exitcode is None:
@@ -149,6 +168,8 @@ def execute_code_subprocess(generated_code: str, queue):
     """
 
     logger.debug("execute_code_subprocess started, PID: %s", os.getpid())
+    with contextlib.suppress(OSError):
+        os.setsid()             # its own process group, so a timeout can end everything it started
     # No address-space cap: torch and OpenBLAS reserve far more than they use, and the container bounds real memory.
 
     stdout_capture = StringIO()
@@ -161,7 +182,15 @@ def execute_code_subprocess(generated_code: str, queue):
             exec(generated_code, {"__name__": "__main__"})
         logger.debug("execute_code_subprocess finished, PID: %s", os.getpid())
         queue.put(CodeExecutionResult(stdout=_bounded(stdout_capture), stderr=_bounded(stderr_capture)))
-    except Exception as e:
+    except SystemExit as stop:
+        # sys.exit, unittest.main, argparse: an exit, not a crash
+        failed = stop.code not in (None, 0)
+        if failed:
+            stderr_capture.write(f"[exit {stop.code}]\n" if isinstance(stop.code, int) else f"{stop.code}\n")
+        queue.put(CodeExecutionResult(
+            process_status=CodeExecutionStatus.ERROR if failed else CodeExecutionStatus.COMPLETED,
+            stdout=_bounded(stdout_capture), stderr=_bounded(stderr_capture)))
+    except BaseException as e:
         import traceback
         with contextlib.redirect_stderr(stderr_capture):
             traceback.print_exc()
@@ -230,5 +259,50 @@ def status() -> tuple[dict[str, str], int]:
     return ({"status": "ok"}, 200)
 
 
-if __name__ == '__main__':
-    app.run(port=6000)
+# Unreachable from a `public` sandbox
+_PRIVATE = {
+    "iptables": ("0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+                 "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4"),
+    "ip6tables": ("::/128", "::1/128", "::ffff:0:0/96", "64:ff9b::/96", "fc00::/7", "fe80::/10", "ff00::/8"),
+}
+
+
+def _fence(net: str) -> None:
+    with open("/etc/resolv.conf") as f:
+        servers = re.findall(r"^nameserver\s+(\S+)", f.read(), re.M)
+    for tool, private in _PRIVATE.items():
+        if tool == "ip6tables" and not os.path.exists("/proc/net/if_inet6"):
+            continue
+        rules = [["-P", "OUTPUT", "ACCEPT"], ["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
+                 ["-A", "OUTPUT", "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]]
+        if net == "public":
+            rules += [["-A", "OUTPUT", "-d", ns, "-p", proto, "--dport", "53", "-j", "ACCEPT"]
+                      for ns in servers if (":" in ns) == (tool == "ip6tables") for proto in ("udp", "tcp")]
+            rules += [["-A", "OUTPUT", "-d", n, "-j", "REJECT"] for n in private]
+        else:
+            rules.append(["-A", "OUTPUT", "-j", "REJECT"])
+        for rule in rules:
+            subprocess.run([tool, *rule], check=True)
+
+
+def _serve() -> None:
+    # As root with SANDBOX_NET: fence egress, then drop to SANDBOX_UID:GID with no capabilities
+    env = os.environ
+    if _TOKEN:  # popped at import; uwsgi's workers import this module again
+        env["NAT_SANDBOX_TOKEN"] = _TOKEN
+    timeout = env["UWSGI_HTTP_TIMEOUT"]
+    cmd = ["uwsgi", "--http", f"{env.get('LISTEN_HOST') or '0.0.0.0'}:{env['LISTEN_PORT']}", "--http-timeout", timeout,
+           "--socket-timeout", timeout, "--harakiri", timeout, "--master", "-p", env["UWSGI_PROCESSES"],
+           "--force-cwd", "/workspace", "-w", "main:app"]
+    if os.getuid() == 0 and (net := env.get("SANDBOX_NET")):
+        if net not in ("public", "none"):
+            sys.exit(f"sandbox: SANDBOX_NET must be public or none, not {net!r}")
+        _fence(net)
+        keep = "-all" + (f",+{caps}" if (caps := env.get("SANDBOX_KEEP_CAPS")) else "")
+        cmd = ["setpriv", f"--reuid={env['SANDBOX_UID']}", f"--regid={env['SANDBOX_GID']}", "--clear-groups",
+               "--inh-caps=-all", f"--bounding-set={keep}", "--", *cmd]
+    os.execvp(cmd[0], cmd)
+
+
+if __name__ == "__main__":
+    _serve()

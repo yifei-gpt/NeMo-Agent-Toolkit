@@ -26,6 +26,7 @@ import logging
 import os
 import re
 import socket
+import sys
 import time
 from pathlib import Path
 
@@ -42,14 +43,14 @@ from nat.data_models.function import FunctionBaseConfig
 
 logger = logging.getLogger(__name__)
 
-_USER_AGENT = "nat-agent (local benchmark run)"
+_USER_AGENT = "MarkAgentX/1.0 (+https://github.com/yifei-gpt/MarkAgentX)"    # Wikimedia refuses a UA with no contact
 # A miss is usually throttling, so it expires instead of poisoning the query for every later run.
 _FAILURE_TTL_S = 86400.0
 _NO_RESULTS = "No web results for: "
+_MAX_BYTES = 32 << 20
+_BLOCK = re.compile(r"<!--|<(script|style|noscript|svg)\b", re.I)    # openings only; ends are a plain find
 _STRIP = [
-    (re.compile(r"<(script|style|noscript|svg)[^>]*>.*?</\1>", re.DOTALL | re.I), " "),
-    (re.compile(r"<!--.*?-->", re.DOTALL), " "),
-    (re.compile(r"<[^>]+>"), " "),
+    (re.compile(r"<[^<>]*>"), " "),    # not `[^>]+`: every stray `<` rescanned the page
     (re.compile(r"&nbsp;?"), " "),
     (re.compile(r"[ \t\r\f\v]+"), " "),
     (re.compile(r"\n\s*\n\s*\n+"), "\n\n"),
@@ -179,7 +180,22 @@ def _write(path: Path, question: str, ok: bool, result: str) -> None:
     os.replace(tmp, path)
 
 
+def _drop_blocks(body: str) -> str:
+    kept, at = [], 0
+    # Not body.lower(): lowering can change length ("İ") and shift indices
+    while found := _BLOCK.search(body, at):
+        kept.append(body[at:found.start()])
+        close = re.compile("-->" if found.group(1) is None else f"</{found.group(1)}", re.I)
+        if (end := close.search(body, found.end())) is None:
+            return "".join(kept)
+        at = body.find(">", end.start()) + 1 or len(body)
+        kept.append(" ")
+    kept.append(body[at:])
+    return "".join(kept)
+
+
 def _as_text(body: str, limit: int) -> str:
+    body = _drop_blocks(body)
     for pattern, repl in _STRIP:
         body = pattern.sub(repl, body)
     body = "\n".join(line.strip() for line in body.splitlines())
@@ -187,8 +203,8 @@ def _as_text(body: str, limit: int) -> str:
     return body[:limit] + ("\n...[truncated]" if len(body) > limit else "")
 
 
-def _page_key(url: str, store: int) -> str:
-    return f"fetch|v2|{url}|{store}"
+def _page_key(url: str, store: int, private_ok: bool = False) -> str:
+    return f"fetch|v2|{url}|{store}" + ("|private" if private_ok else "")
 
 
 def _window(page: str, offset: int, width: int, store: int = 0) -> str:
@@ -207,17 +223,28 @@ def _window(page: str, offset: int, width: int, store: int = 0) -> str:
     return page[offset:end] + tail + cut
 
 
-def _from_pdf(raw: bytes, limit: int) -> str:
-    """A PDF's text, when the reader is installed; its absence is said rather than hidden."""
+# Child process: a hostile PDF can hang or crash the parser
+_PDF_CHILD = ("import sys\n"
+              "try:\n    import pymupdf\nexcept ImportError:\n    sys.exit(3)\n"
+              "with pymupdf.open(stream=sys.stdin.buffer.read(), filetype='pdf') as doc:\n"
+              "    sys.stdout.write('\\n\\n'.join(page.get_text() for page in doc))\n")
+
+
+async def _from_pdf(raw: bytes, limit: int) -> str:
+    child = await asyncio.create_subprocess_exec(sys.executable, "-I", "-c", _PDF_CHILD, stdin=asyncio.subprocess.PIPE,
+                                                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     try:
-        import pymupdf
-    except ImportError:
+        out, err = await asyncio.wait_for(child.communicate(raw), timeout=60)
+    except TimeoutError:
+        child.kill()
+        await child.wait()
+        return "This source is a PDF that took too long to read."
+    if child.returncode == 3:
         return "This source is a PDF and no PDF reader is installed here."
-    try:
-        with pymupdf.open(stream=raw, filetype="pdf") as doc:
-            text = "\n\n".join(page.get_text() for page in doc)
-    except Exception as exc:  # noqa: BLE001
-        return f"This source is a PDF that could not be read ({type(exc).__name__})."
+    if child.returncode:
+        why = (err.decode(errors="replace").strip().splitlines() or [f"exit {child.returncode}"])[-1]
+        return f"This source is a PDF that could not be read ({why[:120]})."
+    text = out.decode("utf-8", "replace")
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text[:limit] + ("\n...[truncated]" if len(text) > limit else "")
 
@@ -316,6 +343,7 @@ class WebFindConfig(FunctionBaseConfig, name="web_find_cached"):
 
     cache_dir: str = Field(description="Directory holding cached pages")
     store_chars: int = Field(default=240000, description="The length fetch_url was told to keep")
+    private_ok: bool = Field(default=False, description="As fetch_url was told, so both read the same pages")
     context_chars: int = Field(default=600, description="Text to return around each hit")
     max_hits: int = Field(default=5, description="Hits to return per search")
 
@@ -329,7 +357,7 @@ async def web_find_cached(tool_config: WebFindConfig, builder: Builder):
     directory = Path(tool_config.cache_dir)
 
     async def _find(url: str, phrase: str) -> str:
-        got = _entry(_cache(directory, _page_key(url.strip(), tool_config.store_chars)))
+        got = _entry(_cache(directory, _page_key(url.strip(), tool_config.store_chars, tool_config.private_ok)))
         # A cached failure is not a page: searched as one, every phrase "does not appear" in it.
         if got is None or not got[0]:
             return f"{url} has not been read yet -- call fetch_url on it first."
@@ -371,10 +399,16 @@ class _PublicOnly(httpcore.AsyncNetworkBackend):
         self._inner = inner
 
     async def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
-        ips = [info[4][0] for info in await anyio.getaddrinfo(host, port, type=socket.SOCK_STREAM)]
+        ips = list(dict.fromkeys(info[4][0] for info in await anyio.getaddrinfo(host, port, type=socket.SOCK_STREAM)))
         if not ips or not all(ipaddress.ip_address(ip).is_global for ip in ips):
             raise _NotPublic(f"{host} is not a public address")
-        return await self._inner.connect_tcp(ips[0], port, timeout, local_address, socket_options)
+        # Try each: the first is often IPv6, which this host may not route
+        for ip in ips[:-1]:
+            try:
+                return await self._inner.connect_tcp(ip, port, timeout, local_address, socket_options)
+            except (httpcore.ConnectError, httpcore.ConnectTimeout):
+                continue
+        return await self._inner.connect_tcp(ips[-1], port, timeout, local_address, socket_options)
 
     async def sleep(self, seconds):
         await self._inner.sleep(seconds)
@@ -401,19 +435,30 @@ async def web_fetch_cached(tool_config: WebFetchConfig, builder: Builder):
         transport = httpx.AsyncHTTPTransport()
         if not tool_config.private_ok:
             # httpx has no public knob for the dialler; the httpcore pool under it holds one.
+            # Renamed, the assignment below would silently guard nothing
+            if not isinstance(getattr(transport._pool, "_network_backend", None), httpcore.AsyncNetworkBackend):
+                raise RuntimeError("httpcore no longer exposes its network backend; fetch_url cannot vet addresses")
             transport._pool._network_backend = _PublicOnly(transport._pool._network_backend)
         try:
             async with httpx.AsyncClient(headers={"User-Agent": _USER_AGENT}, timeout=45.0,
                                          follow_redirects=True, transport=transport) as client:
-                answer = await client.get(url)
-                answer.raise_for_status()
-                kind = answer.headers.get("content-type", "")
-                if "pdf" in kind or url.lower().endswith(".pdf"):
+                async with client.stream("GET", url) as answer:
+                    answer.raise_for_status()
+                    kind = answer.headers.get("content-type", "")
+                    pdf = "pdf" in kind or url.lower().endswith(".pdf")
+                    if not pdf and "html" not in kind and "text" not in kind and "json" not in kind:
+                        return False, f"{url} is {kind or 'not text'}; nothing to read."
+                    raw = bytearray()
+                    async for piece in answer.aiter_bytes():
+                        raw += piece
+                        if len(raw) >= _MAX_BYTES:
+                            del raw[_MAX_BYTES:]
+                            break
+                    encoding = answer.encoding    # httpx falls back to utf-8 for an unknown charset
+                if pdf:
                     # Research sources are PDFs as often as pages; refusing them loses the source.
-                    return True, _from_pdf(answer.content, tool_config.store_chars)
-                if "html" not in kind and "text" not in kind and "json" not in kind:
-                    return False, f"{url} is {kind or 'not text'}; nothing to read."
-                return True, _as_text(answer.text, tool_config.store_chars)
+                    return True, await _from_pdf(bytes(raw), tool_config.store_chars)
+                return True, _as_text(raw.decode(encoding, errors="replace"), tool_config.store_chars)
         except Exception as exc:  # noqa: BLE001
             code = getattr(getattr(exc, "response", None), "status_code", None)
             logger.warning("web fetch failed for %s: %s", url[:80], exc or type(exc).__name__)
@@ -437,7 +482,7 @@ async def web_fetch_cached(tool_config: WebFetchConfig, builder: Builder):
         url = url.strip()
         if not url.lower().startswith(("http://", "https://")):
             return "Give a full http(s) URL, as search_web returns."
-        path = _cache(directory, _page_key(url, tool_config.store_chars))
+        path = _cache(directory, _page_key(url, tool_config.store_chars, tool_config.private_ok))
         page = _read(path)
         if page is None:
             async with lock:

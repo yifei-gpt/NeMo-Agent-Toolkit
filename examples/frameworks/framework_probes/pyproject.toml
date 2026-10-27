@@ -28,12 +28,12 @@ where = ["src"]
 name = "nat_framework_probes"
 dynamic = ["version", "dependencies"]
 requires-python = ">=3.11,<3.14"
-description = "Minimal single agents and teams for the CrewAI, ADK and AutoGen integrations"
+description = "Single agents for the ADK and AutoGen integrations"
 classifiers = ["Programming Language :: Python"]
 
 [tool.setuptools_dynamic_dependencies]
 dependencies = [
-  "nvidia-nat[adk,autogen,crewai] == {version}",
+  "nvidia-nat[adk,autogen] == {version}",
 ]
 
 [tool.uv.sources]

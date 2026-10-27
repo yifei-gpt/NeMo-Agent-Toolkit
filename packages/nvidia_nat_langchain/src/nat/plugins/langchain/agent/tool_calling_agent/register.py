@@ -93,6 +93,8 @@ class ToolCallAgentWorkflowConfig(AgentBaseConfig, name="tool_calling_agent"):
         default=0,
         description="Number of retries when LLM returns an empty response (no content, no tool calls). "
         "0 disables recovery (raises RuntimeError).")
+    require_tool_use: bool = Field(
+        default=False, description="Ask once more when the conversation's first answer calls no tool.")
     system_prompt: str | None = Field(default=None, description="Provides the system prompt to use with the agent.")
     additional_instructions: str | None = Field(default=None,
                                                 description="Additional instructions appended to the system prompt.")
@@ -141,6 +143,7 @@ async def tool_calling_agent_workflow(config: ToolCallAgentWorkflowConfig, build
         max_empty_response_retries=config.max_empty_response_retries,
         # One turn short of the limit, so the closing answer has somewhere to happen.
         max_tool_rounds=max(1, config.max_iterations - 1),
+        require_tool_use=config.require_tool_use,
     ).build_graph()
 
     async def _response_fn(chat_request_or_message: ChatRequestOrMessage) -> str:

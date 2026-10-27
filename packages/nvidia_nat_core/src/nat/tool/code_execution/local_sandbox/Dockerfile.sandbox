@@ -34,7 +34,7 @@ RUN apt update && \
                                            r-cran-ggplot2 r-cran-dplyr r-cran-tidyr r-cran-readr \
                                            r-cran-jsonlite r-cran-data.table \
                                            gcc g++ libc6-dev make cmake pkg-config \
-                                           file xxd curl wget git sqlite3 catdoc jq ripgrep tree bc procps \
+                                           file xxd curl wget git sqlite3 catdoc jq ripgrep tree bc procps iptables \
                                            libreoffice-writer-nogui libreoffice-calc-nogui libreoffice-impress-nogui \
                                            pandoc poppler-utils tesseract-ocr imagemagick ffmpeg graphviz \
                                            fonts-liberation2 fonts-dejavu-core fonts-noto-cjk && \
@@ -79,5 +79,8 @@ EXPOSE 6000
 
 LABEL markagentx.tools="Python 3.13 with numpy, pandas, scipy, scikit-learn, PyTorch (CPU), transformers, XGBoost, LightGBM, OpenCV and readers and writers for office files and PDFs; R with ggplot2 and dplyr; Node 24; gcc, cmake; LibreOffice (soffice --headless), pandoc, poppler (pdftotext), tesseract, ImageMagick, ffmpeg, Graphviz, jq, ripgrep."
 
+# Tells the runtime main.py can fence egress (as root with SANDBOX_NET)
+LABEL markagentx.netguard="1"
+
 WORKDIR /app
-CMD uwsgi --http 0.0.0.0:${LISTEN_PORT} --http-timeout ${UWSGI_HTTP_TIMEOUT} --socket-timeout ${UWSGI_HTTP_TIMEOUT} --harakiri ${UWSGI_HTTP_TIMEOUT} --master -p ${UWSGI_PROCESSES} --force-cwd /workspace -w main:app
+CMD ["python3", "/app/main.py"]

@@ -847,3 +847,15 @@ class TestFunctionGroupMiddlewares:
         # Value is first multiplied by 2 (10), then added 10 (20)
         assert result == 20
         assert results == ["first_pre", "second_pre", "second_post", "first_post"]
+
+
+def test_an_agent_never_answers_with_nothing():
+    from nat.middleware.agent_finish.agent_finish_middleware import _usable
+    for empty in ("", "   ", "``````"):
+        said = _usable(empty, "coder")
+        assert said.startswith("[coder ran out of turns") and "workspace" in said
+
+
+def test_an_answer_passes_through():
+    from nat.middleware.agent_finish.agent_finish_middleware import _usable
+    assert _usable("done: 42", "coder") == "done: 42"

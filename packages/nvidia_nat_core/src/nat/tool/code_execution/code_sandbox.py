@@ -23,6 +23,7 @@ import requests
 import requests.adapters
 from pydantic import HttpUrl
 
+from nat.tool.workspace_ops import auth_headers
 from nat.utils.type_utils import override
 
 logger = logging.getLogger(__file__)
@@ -62,7 +63,7 @@ class Sandbox(abc.ABC):
             # Headroom over the sandbox's own limit: given exactly it, the client gives up in the
             # same moment the sandbox is returning, and its answer is lost to a client-side timeout.
             timeout=timeout_seconds + 15,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", **auth_headers()},
         )
         # retrying 502 errors
         if output.status_code == 502:

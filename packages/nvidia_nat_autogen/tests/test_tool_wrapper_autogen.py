@@ -346,3 +346,20 @@ class TestNestedRequestArguments:
             await tool.run_json({"action": "cik"}, CancellationToken())
 
         assert "2 validation errors for autogen_ambiguousargs" in str(exc_info.value)
+
+
+async def test_a_repeated_answer_is_said_as_langchain_says_it():
+    """Third identical answer flagged, sixth withheld."""
+    from nat.middleware.agent_finish.agent_finish_middleware import Repeats
+    from nat.plugins.autogen.tool_wrapper import REPEATS_ON
+
+    fn = Mock(spec=Function)
+    fn.description = "Think"
+    fn.input_schema = MockInputSchema
+    fn.has_streaming_output = False
+    fn.has_single_output = True
+    fn.acall_invoke = AsyncMock(return_value="ANSWER")
+    func = autogen_tool_wrapper("think", fn, Mock(spec=Builder))._func
+    REPEATS_ON.set(Repeats())
+    said = [await func(param1="check") for _ in range(6)]
+    assert said[1] == "ANSWER" and "twice already" in said[2] and "ANSWER" not in said[5]

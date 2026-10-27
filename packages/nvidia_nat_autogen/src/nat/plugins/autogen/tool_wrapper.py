@@ -35,6 +35,7 @@ from nat.builder.framework_enum import LLMFrameworkEnum
 from nat.builder.function import Function
 from nat.builder.function_base import wrap_flat_input
 from nat.cli.register_workflow import register_tool_wrapper
+from nat.middleware.agent_finish.agent_finish_middleware import Repeats
 from nat.utils.type_utils import DecomposedType
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,8 @@ logger = logging.getLogger(__name__)
 # not. The caller sets it per question, so concurrent questions never share one.
 FINISHED_ON: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
     "nat_autogen_finished", default=None)
+# Per question, as FINISHED_ON
+REPEATS_ON: contextvars.ContextVar[Repeats | None] = contextvars.ContextVar("nat_autogen_repeats", default=None)
 
 
 def resolve_type(t: Any) -> Any:
@@ -120,7 +123,9 @@ def autogen_tool_wrapper(
         """
         from nat.middleware.agent_finish import AgentFinished
         try:
-            return await fn.acall_invoke(*args, **kwargs)
+            result = await fn.acall_invoke(*args, **kwargs)
+            memory = REPEATS_ON.get()
+            return memory.note(name, kwargs, result) if memory is not None else result
         except AgentFinished as done:
             # Raising here hangs AutoGen: its stream sentinel is posted after the gather over tool
             # calls, so an exception out of one never reaches the sentinel (8 runs in 8). Telling

@@ -28,11 +28,11 @@ from nat.builder.function_info import FunctionInfo
 from nat.cli.register_workflow import register_function
 from nat.data_models.function import FunctionBaseConfig
 
-logger = logging.getLogger(__name__)
-
-from nat.tool.workspace_ops import SANDBOX_ROOT
-# The same counter the output cap keeps: a tool that cuts itself loses just as much.
+# Same counter as the output cap: a tool that cuts itself loses as much
 from nat.middleware.output_limit.output_limit_middleware import FIRED
+from nat.tool.workspace_ops import SANDBOX_ROOT
+
+logger = logging.getLogger(__name__)
 
 
 class CodeExecutionToolConfig(FunctionBaseConfig, name="code_execution"):
@@ -78,7 +78,7 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
         return (f"import os, runpy, tempfile\nos.chdir({SANDBOX_ROOT!r})\n"
                 "fd, path = tempfile.mkstemp(suffix='.py', prefix='run_code_')\n"
                 f"os.write(fd, {code!r}.encode())\nos.close(fd)\n"
-                "runpy.run_path(path, run_name='__main__')\n")
+                "try:\n    runpy.run_path(path, run_name='__main__')\nfinally:\n    os.unlink(path)\n")
 
     def _record(code: str, output: dict | None) -> None:
         """What the agent actually submitted, when asked for. The decision journal records which
@@ -152,8 +152,8 @@ async def code_execution_tool(config: CodeExecutionToolConfig, builder: Builder)
     yield FunctionInfo.from_fn(
         fn=_execute_code,
         input_schema=CodeExecutionInputSchema,
-        description=(config.description or ("Runs `generated_code` in the task's own container and returns what it printed. "
-                     "A shell command line works as well as python -- send "
+        description=(config.description or ("Runs `generated_code` in the task's own container and returns what it "
+                     "printed. A shell command line works as well as python -- send "
                      "whichever suits the step. The session persists, so a directory you enter "
                      "and a file you write are still there on the next call."
                      if os.environ.get("NAT_BRIDGE_READY") else

@@ -1,7 +1,17 @@
 # Apptainer translation of Dockerfile.sandbox, for hosts with no container daemon.
 # Kept beside it so the two are edited together; every RUN/ENV/CMD below mirrors one there.
+# Read-only, runs as the caller: the Dockerfile's HOME and /usr/local steps have no counterpart
+Bootstrap: docker
+From: node:24-bookworm-slim
+Stage: node
+
 Bootstrap: docker
 From: python:3.13-slim-bookworm
+Stage: final
+
+%files from node
+    /usr/local/bin/node /usr/local/bin/node
+    /usr/local/lib/node_modules /usr/local/lib/node_modules
 
 %files
     sandbox.requirements.txt /app/requirements.txt
@@ -23,12 +33,21 @@ From: python:3.13-slim-bookworm
 
     mv /usr/bin/chown /usr/bin/chown.real
     printf '#!/bin/sh\nexit 0\n' > /usr/bin/chown && chmod +x /usr/bin/chown
-    # R is here because a task that asks for R code cannot install its own runtime, and the minutes
-    # that takes come out of the task's own budget.
-    apt install -y --no-install-recommends libexpat1 r-base-core r-cran-testthat
+    apt install -y --no-install-recommends libexpat1 r-base-core r-cran-testthat \
+        r-cran-ggplot2 r-cran-dplyr r-cran-tidyr r-cran-readr \
+        r-cran-jsonlite r-cran-data.table \
+        gcc g++ libc6-dev make cmake pkg-config \
+        file xxd curl wget git sqlite3 catdoc jq ripgrep tree bc procps iptables \
+        libreoffice-writer-nogui libreoffice-calc-nogui libreoffice-impress-nogui \
+        pandoc poppler-utils tesseract-ocr imagemagick ffmpeg graphviz \
+        fonts-liberation2 fonts-dejavu-core fonts-noto-cjk
     mv -f /usr/bin/chown.real /usr/bin/chown
-
     apt clean && rm -rf /var/lib/apt/lists/*
+
+    ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm
+    ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+    node --version && npm --version
+
     pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
     pip install --no-cache-dir -r /app/requirements.txt
     mkdir -p /workspace
@@ -39,14 +58,15 @@ From: python:3.13-slim-bookworm
     # uwsgi's own default is 60s, which cut every call at a minute whatever the tool asked for.
     export UWSGI_HTTP_TIMEOUT=1200
     export LISTEN_PORT="${LISTEN_PORT:-6000}"
+    # Host network: 0.0.0.0 would serve code execution to anyone who can reach this machine
+    export LISTEN_HOST=127.0.0.1
+
+%labels
+    markagentx.tools Python 3.13 with numpy, pandas, scipy, scikit-learn, PyTorch (CPU), transformers, XGBoost, LightGBM, OpenCV and readers and writers for office files and PDFs; R with ggplot2 and dplyr; Node 24; gcc, cmake; LibreOffice (soffice --headless), pandoc, poppler (pdftotext), tesseract, ImageMagick, ffmpeg, Graphviz, jq, ripgrep.
 
 # What `apptainer instance start` runs -- the CMD line, verbatim.
 %startscript
-    cd /app && exec uwsgi --http 0.0.0.0:${LISTEN_PORT} --http-timeout ${UWSGI_HTTP_TIMEOUT} \
-        --socket-timeout ${UWSGI_HTTP_TIMEOUT} --harakiri ${UWSGI_HTTP_TIMEOUT} --master \
-        -p ${UWSGI_PROCESSES} --force-cwd /workspace -w main:app
+    cd /app && exec python3 /app/main.py
 
 %runscript
-    cd /app && exec uwsgi --http 0.0.0.0:${LISTEN_PORT} --http-timeout ${UWSGI_HTTP_TIMEOUT} \
-        --socket-timeout ${UWSGI_HTTP_TIMEOUT} --harakiri ${UWSGI_HTTP_TIMEOUT} --master \
-        -p ${UWSGI_PROCESSES} --force-cwd /workspace -w main:app
+    cd /app && exec python3 /app/main.py

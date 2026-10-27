@@ -32,6 +32,8 @@ from nat.data_models.api_server import ChatResponseChunkChoice
 from nat.data_models.api_server import ChoiceDelta
 from nat.data_models.api_server import ChoiceDeltaToolCall
 from nat.data_models.api_server import ChoiceDeltaToolCallFunction
+from nat.middleware.agent_finish.agent_finish_middleware import CIRCLING
+from nat.middleware.agent_finish.agent_finish_middleware import Repeats
 from nat.plugins.langchain.agent.base import AgentDecision
 from nat.plugins.langchain.agent.tool_calling_agent.agent import ToolCallAgentGraph
 from nat.plugins.langchain.agent.tool_calling_agent.agent import ToolCallAgentGraphState
@@ -620,7 +622,7 @@ async def test_retry_on_truncation_succeeds(error_mock_llm, mock_tool):
 
 
 async def test_retry_on_truncation_exhausted(error_mock_llm, mock_tool):
-    """All truncation retries exhausted raises RuntimeError."""
+    """All truncation retries exhausted keeps what the last attempt wrote."""
     agent = _make_agent(error_mock_llm, mock_tool, max_truncation_retries=2, truncation_scaling_fn=lambda c: c + 512)
     first_response = AIMessage(
         content="partial",
@@ -639,8 +641,21 @@ async def test_retry_on_truncation_exhausted(error_mock_llm, mock_tool):
     state = ToolCallAgentGraphState(messages=[HumanMessage(content="test")])
 
     with patch.object(agent, "_invoke_llm", new_callable=AsyncMock, return_value=still_truncated):
-        with pytest.raises(RuntimeError, match="LLM output still truncated after 2 retries"):
-            await agent._retry_on_truncation(first_response, state)
+        result = await agent._retry_on_truncation(first_response, state)
+
+    assert result is still_truncated
+    assert agent._truncation_retries_remaining == 0
+
+
+async def test_retry_on_truncation_exhausted_with_nothing_written(error_mock_llm, mock_tool):
+    """All truncation retries exhausted with no content at all still raises RuntimeError."""
+    agent = _make_agent(error_mock_llm, mock_tool, max_truncation_retries=2, truncation_scaling_fn=lambda c: c + 512)
+    empty = AIMessage(content="", response_metadata={"finish_reason": "length"})
+    state = ToolCallAgentGraphState(messages=[HumanMessage(content="test")])
+
+    with patch.object(agent, "_invoke_llm", new_callable=AsyncMock, return_value=empty):
+        with pytest.raises(RuntimeError, match="still truncated after 2 retries .* nothing was written"):
+            await agent._retry_on_truncation(empty, state)
 
 
 async def test_retry_on_truncation_increments_from_usage(error_mock_llm, mock_tool):
@@ -670,14 +685,14 @@ async def test_retry_on_truncation_increments_from_usage(error_mock_llm, mock_to
         return still_truncated
 
     with patch.object(agent, "_invoke_llm", side_effect=_capture_and_invoke):
-        with pytest.raises(RuntimeError, match="LLM output still truncated after 3 retries"):
-            await agent._retry_on_truncation(first_response, state)
+        result = await agent._retry_on_truncation(first_response, state)
 
+    assert result is still_truncated
     assert observed_max_tokens == [356, 612, 868]
 
 
 async def test_retry_on_truncation_increments_from_configured_max_tokens(error_mock_llm, mock_tool):
-    """When max_tokens is already configured on the LLM, it is used as the base instead of usage data."""
+    """When max_tokens is already configured on the LLM, it is the base, and 1.25x of it the ceiling."""
     increment: int = 512
     error_mock_llm.max_tokens = 50
     agent = _make_agent(
@@ -703,10 +718,10 @@ async def test_retry_on_truncation_increments_from_configured_max_tokens(error_m
         return still_truncated
 
     with patch.object(agent, "_invoke_llm", side_effect=_capture_and_invoke):
-        with pytest.raises(RuntimeError, match="LLM output still truncated after 2 retries"):
-            await agent._retry_on_truncation(first_response, state)
+        result = await agent._retry_on_truncation(first_response, state)
 
-    assert observed_max_tokens == [562, 1074]
+    assert result is still_truncated
+    assert observed_max_tokens == [62, 62]
 
 
 async def test_retry_on_truncation_persists_across_calls(error_mock_llm, mock_tool):
@@ -747,9 +762,9 @@ async def test_retry_on_truncation_persists_across_calls(error_mock_llm, mock_to
         },
     )
     with patch.object(agent, "_invoke_llm", new_callable=AsyncMock, return_value=still_truncated):
-        with pytest.raises(RuntimeError, match="LLM output still truncated after 4 retries"):
-            await agent._retry_on_truncation(truncated, state)
+        result = await agent._retry_on_truncation(truncated, state)
 
+    assert result is still_truncated
     assert agent._truncation_retries_remaining == 0
 
 
@@ -767,12 +782,73 @@ async def test_retry_on_empty_succeeds(error_mock_llm, mock_tool):
 
 
 async def test_retry_on_empty_exhausted(error_mock_llm, mock_tool):
-    """All empty-response retries exhausted raises RuntimeError."""
+    """All retries empty: the turn ends with a message saying so; each retry named the emptiness."""
     agent = _make_agent(error_mock_llm, mock_tool, max_empty_response_retries=2)
     first_meta: dict = {"finish_reason": "stop"}
     still_empty = AIMessage(content="", response_metadata={"finish_reason": "stop"})
     state = ToolCallAgentGraphState(messages=[HumanMessage(content="test")])
 
-    with patch.object(agent, "_invoke_llm", new_callable=AsyncMock, return_value=still_empty):
-        with pytest.raises(RuntimeError, match="empty responses after 2 retries"):
-            await agent._retry_on_empty_response(state, first_meta)
+    with patch.object(agent, "_invoke_llm", new_callable=AsyncMock, return_value=still_empty) as invoke:
+        result = await agent._retry_on_empty_response(state, first_meta)
+
+    assert "returned nothing 3 times" in result.content
+    sent = invoke.await_args.args[0].messages
+    assert len(sent) == 2 and "last reply was empty" in sent[-1].content
+    assert len(state.messages) == 1
+
+
+async def test_truncation_budget_resets_each_turn(error_mock_llm, mock_tool):
+    """A raised max_tokens and spent retries belong to the turn that spent them."""
+    agent = _make_agent(error_mock_llm, mock_tool, max_truncation_retries=2, truncation_scaling_fn=lambda c: c + 100)
+    truncated = AIMessage(content="partial", response_metadata={"finish_reason": "length"},
+                          usage_metadata={"output_tokens": 200, "input_tokens": 50, "total_tokens": 250})
+    state = ToolCallAgentGraphState(messages=[HumanMessage(content="test")])
+    with patch.object(agent, "_invoke_llm", new_callable=AsyncMock, return_value=truncated):
+        await agent._retry_on_truncation(truncated, state)
+    assert agent._truncation_retries_remaining == 0 and agent._current_max_tokens == 400
+
+    done = AIMessage(content="answer", response_metadata={"finish_reason": "stop"})
+    with patch.object(agent, "_invoke_llm", new_callable=AsyncMock, return_value=done):
+        await agent.agent_node(state)
+    assert agent._truncation_retries_remaining == 2 and agent._current_max_tokens is None
+    assert agent.agent is agent._base_agent
+
+
+@pytest.mark.parametrize("required, history, grew", [(False, False, 1), (True, False, 3), (True, True, 1)])
+async def test_a_bare_first_answer_is_questioned_only_where_asked(mock_llm, mock_tool, required, history, grew):
+    """No-tool nudge fires only on the first answer, and only with require_tool_use."""
+    agent = ToolCallAgentGraph(llm=mock_llm, tools=[mock_tool("T")], require_tool_use=required)
+    messages = ([HumanMessage(content="hi"), AIMessage(content="hello")] if history else []) + [
+        HumanMessage(content="please answer")]
+    graph = await agent.build_graph()
+    state = ToolCallAgentGraphState(**await graph.ainvoke(ToolCallAgentGraphState(messages=messages),
+                                                          config={"recursion_limit": 5}))
+    assert len(state.messages) == len(messages) + grew
+
+
+def test_a_merged_key_splits_only_before_names(error_mock_llm, mock_tool):
+    agent = _make_agent(error_mock_llm, mock_tool)
+    call = {"name": "T", "args": {"path=a,b.txt, mode": "w"}}
+    agent._repair(call)
+    assert call["args"] == {"path": "a,b.txt", "mode": "w"}
+
+
+def test_an_unchanging_answer_is_flagged_then_withheld():
+    memory = Repeats()
+    said = [memory.note("grep", {"q": "x"}, "ANSWER") for _ in range(6)]
+    assert said[:2] == ["ANSWER", "ANSWER"]
+    assert said[2].endswith("\nANSWER") and "twice already" in said[2]
+    assert "ANSWER" not in said[5] and "call 6" in said[5]
+    # Other arguments, or a new answer, start over.
+    assert memory.note("grep", {"q": "y"}, "ANSWER") == "ANSWER"
+    assert memory.note("grep", {"q": "x"}, "new") == "new"
+
+
+def test_one_call_made_circling_times_is_a_loop_whatever_it_answers():
+    memory = Repeats()
+    for i in range(CIRCLING - 1):
+        memory.note("grep", {"q": "x"}, f"answer {i}")
+    memory.note("grep", {"q": "y"}, "other")
+    assert not memory.circling
+    assert memory.note("grep", {"q": "x"}, {"not": "text"}) == {"not": "text"}
+    assert memory.circling

@@ -25,8 +25,8 @@ from langchain.agents.middleware import ClearToolUsesEdit
 from langchain_core.callbacks.base import AsyncCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
-from langchain_core.messages import HumanMessage
 from langchain_core.messages import AIMessageChunk
+from langchain_core.messages import HumanMessage
 from langchain_core.messages import SystemMessage
 from langchain_core.messages import ToolMessage
 from langchain_core.messages.ai import UsageMetadata
@@ -42,6 +42,8 @@ from pydantic import BaseModel
 from pydantic import Field
 
 from nat.llm.utils.constants import LLMFinishReason
+from nat.middleware.agent_finish.agent_finish_middleware import CIRCLING
+from nat.middleware.agent_finish.agent_finish_middleware import repeated
 from nat.plugins.langchain.agent.base import AGENT_CALL_LOG_MESSAGE
 from nat.plugins.langchain.agent.base import AGENT_LOG_PREFIX
 from nat.plugins.langchain.agent.base import AgentDecision
@@ -72,6 +74,10 @@ def clear_trigger() -> int:
 def chars_per_token(chars: float, tokens: int) -> float:
     """What the server's count says a token holds; clamped, as early on the tool schemas outweigh the history."""
     return min(4.0, max(1.0, chars / tokens))
+
+
+_EMPTY = ("Your last reply was empty. Continue the task: call the tool you need next, or write your "
+          "answer if you are done.")
 # No mid-run budget warning: gemma-4 read one as leave to stop, ending 3 of 3 runs at 100 of 249
 # turns. Only this one, at the cap, and it still ends a run with the answer written.
 _CLOSING = ("You have used all of your tool calls. Do not call any more tools. Write your "
@@ -103,6 +109,7 @@ class ToolCallAgentGraph(DualNodeAgent):
         truncation_scaling_fn: typing.Callable[[int], int] | None = None,
         max_empty_response_retries: int = 0,
         max_tool_rounds: int | None = None,
+        require_tool_use: bool = False,
     ):
         super().__init__(llm=llm,
                          tools=tools,
@@ -136,6 +143,7 @@ class ToolCallAgentGraph(DualNodeAgent):
         # gathered, and a bound tool schema is an invitation to spend a turn it does not have.
         self.closing_agent = prompt_runnable | llm
         self.max_tool_rounds = max_tool_rounds
+        self.require_tool_use = require_tool_use
         # A refused call is otherwise invisible: no step, no line. Keep the tool and the reason,
         # drop the arguments between them -- a written-out file fills the log and the window alike.
         def rejected(e):
@@ -154,7 +162,8 @@ class ToolCallAgentGraph(DualNodeAgent):
                    + ", ".join(k if f.is_required() else f"{k} (optional)" for k, f in fields.items())
                    + ".") if fields else ""
             return f"Error: {r}\n{sig}\n Please fix your mistakes."
-        self.tool_caller = ToolNode(tools, handle_tool_errors=rejected if handle_tool_errors is True else handle_tool_errors)
+        self.tool_caller = ToolNode(tools,
+                                    handle_tool_errors=rejected if handle_tool_errors is True else handle_tool_errors)
         self.return_direct = [tool.name for tool in return_direct] if return_direct else []
 
         self._max_truncation_retries: int = max_truncation_retries
@@ -166,6 +175,9 @@ class ToolCallAgentGraph(DualNodeAgent):
         # 16k means the model is rambling, and more room does not stop that.
         self._truncation_ceiling: int = int((self._current_max_tokens or 8192) * 1.25)
         self._max_empty_response_retries: int = max_empty_response_retries
+        # Per-turn baseline: one long answer must not cost later turns
+        self._base_max_tokens: int | None = self._current_max_tokens
+        self._base_agent, self._base_bound_llm = self.agent, self.bound_llm
         # 4 until the server's count corrects it: digits and CJK run far denser than prose.
         self._chars_per_token: float = 4.0
 
@@ -240,7 +252,8 @@ class ToolCallAgentGraph(DualNodeAgent):
         if any("=" in k for k in args):
             out = {}
             for k, v in args.items():
-                for part in (k.split(",") if "=" in k else [k]):
+                # Split only before a name: a value may hold commas
+                for part in (re.split(r",\s*(?=[A-Za-z_]\w*\s*(?:=|$))", k) if "=" in k else [k]):
                     name, _, val = part.partition("=")
                     out[name.strip()] = val.strip().strip("\'\"") if val else v
             args = call["args"] = out
@@ -268,18 +281,19 @@ class ToolCallAgentGraph(DualNodeAgent):
             logger.debug("%s Starting the Tool Calling Agent Node", AGENT_LOG_PREFIX)
             if len(state.messages) == 0:
                 raise RuntimeError('No input received in state: "messages"')
+            self._truncation_retries_remaining = self._max_truncation_retries
+            self._current_max_tokens = self._base_max_tokens
+            self.agent, self.bound_llm = self._base_agent, self._base_bound_llm
 
             # Out of turns is not the same as having nothing to say: asked once more with no
             # tools bound, the agent writes what it found instead of the graph raising.
             rounds = sum(1 for message in state.messages if getattr(message, "tool_calls", None))
             closing = bool(self.max_tool_rounds) and rounds >= self.max_tool_rounds
-            # Circling is running out of turns by another road: one run sent the same grep 491 times.
-            # The worst honest repeat over 125 runs is 26, so 40 catches only a loop, and it ends the
-            # way the cap does -- answer written, workspace graded.
+            # Circling ends as the cap does: answer written, workspace graded
             most = collections.Counter((c.get("name"), str(c.get("args")))
                                        for m in state.messages if isinstance(m, AIMessage)
                                        for c in (getattr(m, "tool_calls", None) or []))
-            if not closing and max(most.values(), default=0) >= 40:
+            if not closing and max(most.values(), default=0) >= CIRCLING:
                 logger.warning("%s made one call %d times over; asked it to finish instead",
                                AGENT_LOG_PREFIX, max(most.values()))
                 closing = True
@@ -296,11 +310,9 @@ class ToolCallAgentGraph(DualNodeAgent):
 
             # Answering with no tool touched is no answer to a task about changing a repo: one model
             # ended nine runs in three seconds, fencing its shell command instead of calling bash.
-            # Said once; a second bare answer stands.
-            if (not getattr(response, "tool_calls", None)
-                    and not any(isinstance(m, ToolMessage) for m in state.messages)
-                    and not any(isinstance(m, HumanMessage) and str(m.content).startswith(_NOTOOL)
-                                for m in state.messages)):
+            # Once, on the first answer, only if required; a second bare answer stands
+            if (self.require_tool_use and not getattr(response, "tool_calls", None)
+                    and not any(isinstance(m, AIMessage | ToolMessage) for m in state.messages)):
                 logger.warning("%s answered without calling a tool; asked once more", AGENT_LOG_PREFIX)
                 state.messages += [response, HumanMessage(content=_NOTOOL)]
                 response = await self._invoke_llm(state, closing=False)
@@ -503,12 +515,10 @@ class ToolCallAgentGraph(DualNodeAgent):
             first_metadata: The response_metadata from the empty response.
 
         Returns:
-            The response from the successful retry.
-
-        Raises:
-            RuntimeError: If all retries are exhausted without a non-empty response.
+            The successful retry's response, else a message saying every retry was empty.
         """
-        response: AIMessage | None = None
+        # Same prompt to a deterministic model returns the same nothing
+        nudged = ToolCallAgentGraphState(messages=state.messages + [HumanMessage(content=_EMPTY)])
         for attempt in range(1, self._max_empty_response_retries + 1):
             logger.warning(
                 "%s LLM returned an empty response. Retry %d/%d. response_metadata=%s",
@@ -517,7 +527,7 @@ class ToolCallAgentGraph(DualNodeAgent):
                 self._max_empty_response_retries,
                 first_metadata,
             )
-            response = await self._invoke_llm(state)
+            response = await self._invoke_llm(nudged)
 
             has_content: bool = bool(response.content and str(response.content).strip())
             if response.tool_calls or has_content:
@@ -530,8 +540,10 @@ class ToolCallAgentGraph(DualNodeAgent):
 
             first_metadata = getattr(response, "response_metadata", {})
 
-        raise RuntimeError(f"LLM still returning empty responses after {self._max_empty_response_retries} retries. "
-                           f"response_metadata={first_metadata}")
+        logger.warning("%s LLM still returning empty responses after %d retries; ending the turn. "
+                       "response_metadata=%s", AGENT_LOG_PREFIX, self._max_empty_response_retries, first_metadata)
+        return AIMessage(content=f"[the model returned nothing {self._max_empty_response_retries + 1} times "
+                                 "in a row, so this agent stopped here; see the workspace for what it did.]")
 
     async def conditional_edge(self, state: ToolCallAgentGraphState):
         try:
@@ -570,19 +582,14 @@ class ToolCallAgentGraph(DualNodeAgent):
                 again = sum(c.get("name") == call.get("name") and c.get("args") == call.get("args")
                             for m in state.messages if isinstance(m, AIMessage)
                             for c in (getattr(m, "tool_calls", None) or []))
-                if again >= 2 and sum(m.name == response.name and m.content.endswith(response.content)
-                                      for m in state.messages if isinstance(m, ToolMessage)) >= 2:
-                    if again >= 6:
-                        response.content = (f"[this is call {again} of the same {response.name} with the same "
-                                            "arguments, and the answer above has not changed. It is not being "
-                                            "repeated here; work from the one you already have.]")
-                        logger.warning("%s %s asked %d times over; withheld the answer",
-                                       AGENT_LOG_PREFIX, response.name, again)
-                    else:
-                        response.content = ("[you have had this exact answer twice already and it will "
-                                            f"not change; try something else.]\n{response.content}")
-                        logger.warning("%s %s gave the same answer a third time; said so",
-                                       AGENT_LOG_PREFIX, response.name)
+                # str(): content may be blocks
+                same = sum(m.name == response.name and str(m.content).endswith(str(response.content))
+                           for m in state.messages if isinstance(m, ToolMessage))
+                said = repeated(response.name, again, same, str(response.content))
+                if said != str(response.content):
+                    response.content = said
+                    logger.warning("%s %s gave the same answer again (call %d); %s", AGENT_LOG_PREFIX,
+                                   response.name, again, "withheld it" if again >= 6 else "said so")
                 if self.detailed_logs:
                     self._log_tool_response(str(tools), str(tool_input), response.content)
                 state.messages += [response]

@@ -4,6 +4,8 @@
 """Workspace file tools for benchmarks that hand an agent a directory and a brief."""
 
 import asyncio
+import base64
+import codecs
 import hashlib
 import json
 import os
@@ -11,9 +13,8 @@ import re
 import secrets
 import shlex
 import tempfile
-import urllib.request
-from collections.abc import AsyncGenerator
 from collections import OrderedDict
+from collections.abc import AsyncGenerator
 from pathlib import Path
 
 from pydantic import Field
@@ -22,8 +23,8 @@ from nat.builder.builder import Builder
 from nat.builder.function_info import FunctionInfo
 from nat.cli.register_workflow import register_function
 from nat.data_models.function import FunctionBaseConfig
+from nat.middleware.output_limit.output_limit_middleware import FIRED
 from nat.tool import workspace_ops as ops
-
 
 # Where a bridged session starts; the harness runs every container task set with this as its cwd.
 _CONTAINER_ROOT = "/app"
@@ -57,14 +58,8 @@ def _sh(command: str, timeout: float = 60.0) -> tuple[bool, str]:
     uri = _bridge()
     if not uri:
         return False, ""
-    body = json.dumps({"generated_code": f"cd {_CONTAINER_ROOT} && " + command,
-                        "language": "python", "timeout": timeout}).encode()
     try:
-        with urllib.request.urlopen(
-                urllib.request.Request(uri.rstrip("/") + "/execute", body,
-                                       {"Content-Type": "application/json"}),
-                timeout=timeout + 15) as answer:
-            got = json.loads(answer.read())
+        got = ops.execute(uri, f"cd {_CONTAINER_ROOT} && " + command, timeout)
     except Exception as exc:  # noqa: BLE001 -- unreachable and refusing mean the same thing here
         return True, f"the workspace is unreachable right now ({type(exc).__name__})."
     return True, (got.get("stdout") or "") + (got.get("stderr") or "")
@@ -105,15 +100,12 @@ def _op_here(name: str, **args):
         # Only the line carrying this nonce is the answer: the container is the agent's to write in.
         nonce = secrets.token_hex(8)
         code = _OPS_SOURCE + f"\nprint({nonce!r} + main({call!r}))\n"
-        body = json.dumps({"generated_code": code, "language": "python", "timeout": 300}).encode()
-        request = urllib.request.Request(url.rstrip("/") + "/execute", body, {"Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(request, timeout=315) as answer:
-                out = json.loads(answer.read())
+            out = ops.execute(url, code, 300)
         except Exception as exc:  # noqa: BLE001 -- unreachable and refusing mean the same thing here
             raise ValueError(f"the workspace is unreachable right now ({type(exc).__name__}); the next call "
                              "restarts the sandbox first") from None
-        line = next((l for l in (out.get("stdout") or "").splitlines() if l.startswith(nonce)), None)
+        line = next((ln for ln in (out.get("stdout") or "").splitlines() if ln.startswith(nonce)), None)
         if line is None:
             raise ValueError("the file operation died in the sandbox: " + (out.get("stderr") or "")[-300:].strip())
         got = json.loads(line[len(nonce):])
@@ -176,9 +168,6 @@ def _steps_in(text) -> list[str]:
     return [line for line in (text or "").splitlines() if line.strip()]
 
 
-# Counted where the cap middleware counts its own: a dropped match is a dropped match.
-from nat.middleware.output_limit.output_limit_middleware import FIRED
-
 class WorkspaceListConfig(FunctionBaseConfig, name="list_directory"):
     max_entries: int = Field(default=200, description="Cap on returned paths")
 
@@ -186,11 +175,28 @@ class WorkspaceListConfig(FunctionBaseConfig, name="list_directory"):
 def _put(path: str, blob: bytes) -> tuple[bool, str]:
     """Place bytes at `path` in the container. Built here and carried over as base64, because the
     xlsx, docx and pptx writers need libraries the task's own image has no reason to hold."""
-    import base64
     q = shlex.quote(path)
     encoded = base64.b64encode(blob).decode()
     return _sh(f"mkdir -p \"$(dirname {q})\" && printf %s {shlex.quote(encoded)} | base64 -d > {q} "
                f"&& echo __WROTE__")
+
+
+def _fetched(out: str, mark: str) -> bytes | None:
+    _, found, rest = out.partition(mark + "\n")
+    if not found:
+        return None
+    try:
+        return base64.b64decode(rest.split("\n", 1)[0].strip(), validate=True)
+    except ValueError:
+        return None
+
+
+def _text_head(raw: bytes) -> tuple[str, int]:
+    # Drops a char split by the cut
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    text = decoder.decode(raw, final=False)
+    used = len(raw) - len(decoder.getstate()[0])
+    return (text, used) if used else (raw.decode("utf-8", "replace"), len(raw))
 
 
 def _from_find(out: str, where: str, contains: str, max_entries: int) -> str:
@@ -198,7 +204,7 @@ def _from_find(out: str, where: str, contains: str, max_entries: int) -> str:
     pairs = []
     for line in out.splitlines():
         name, _, size = line.partition("\t")
-        pairs.append((f"{where}/{name}".lstrip("./") if where not in (".", "") else name, size))
+        pairs.append((f"{where}/{name}".removeprefix("./") if where not in (".", "") else name, size))
     return ops.formatted(_CONTAINER_ROOT, pairs, contains, max_entries)
 
 
@@ -219,7 +225,7 @@ async def list_directory(config: WorkspaceListConfig, builder: Builder) -> Async
                            f"|| find {shlex.quote(where)} -type f")
             if ran:
                 # find's stderr arrives mixed in and reads as a row: a directory of one odd file.
-                rows = "\n".join(l for l in out.splitlines() if not l.startswith("find:"))
+                rows = "\n".join(ln for ln in out.splitlines() if not ln.startswith("find:"))
                 if not rows.strip():
                     return f"no such directory: {subdir or _CONTAINER_ROOT}"
                 return _from_find(rows, where, contains, config.max_entries)
@@ -243,26 +249,28 @@ async def read_file(config: WorkspaceReadConfig, builder: Builder) -> AsyncGener
         offset = max(0, int(offset))       # a negative one means the start, not a place past the end
         if _bridge():
             q = shlex.quote(path)
+            # base64: `offset` and size must count bytes
             ran, out = _sh(f"if [ -d {q} ]; then echo __DIR__; elif [ -f {q} ]; then "
                            f"wc -c < {q}; echo __CUT__; tail -c +{offset + 1} {q} | head -c "
-                           f"{config.max_chars}; else echo __MISSING__; fi")
+                           f"{config.max_chars} | base64 | tr -d '\\n'; echo; else echo __MISSING__; fi")
             if ran:
                 if out.startswith("__DIR__"):
                     return f"{path} is a directory -- list it with list_directory, or name a file in it."
                 if out.startswith("__MISSING__"):
                     return f"no such file: {path}"
-                total, _, chunk = out.partition("__CUT__\n")
                 try:
-                    size = int(total.strip())
+                    size = int(out.partition("__CUT__")[0].strip())
                 except ValueError:
                     return out
-                if not chunk:
+                if (raw := _fetched(out, "__CUT__")) is None:
+                    return out
+                if not raw:
                     return ops.nothing_read(path, size, offset)
-                rest = size - offset - len(chunk)
+                chunk, used = _text_head(raw)
+                rest = size - offset - used
                 if rest <= 0:
                     return chunk
-                return (f"{chunk}\n... {rest} more characters, call again with "
-                        f"offset={offset + len(chunk)}")
+                return f"{chunk}\n... {rest} more bytes, call again with offset={offset + used}"
         return await _op("read", path=path, offset=offset, max_chars=config.max_chars)
 
     yield FunctionInfo.from_fn(_run, description=(
@@ -388,16 +396,25 @@ async def edit_file(config: WorkspaceEditConfig, builder: Builder) -> AsyncGener
             return f"`old` and `new` are identical, so {path} is unchanged; put the replacement in `new`."
         if _bridge():
             q = shlex.quote(path)
-            ran, body = _sh(f"if [ -f {q} ]; then cat {q}; else echo __MISSING__; fi")
+            # base64: the bridge's text pipe mangles non-UTF-8 and folds CRLF
+            ran, out = _sh(f"if [ -f {q} ]; then echo __B64__; base64 < {q} | tr -d '\\n'; echo; "
+                           f"else echo __MISSING__; fi")
             if ran:
-                if body.startswith("__MISSING__"):
+                if out.startswith("__MISSING__"):
                     return f"{path} is not a file in the workspace; list_directory shows what is."
-                seen = body.count(old)
+                raw = _fetched(out, "__B64__")
+                if raw is None:
+                    return out.strip() or f"could not read {path}"
+                try:
+                    body = raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    return f"could not read {path}: it is not UTF-8 text; change it with bash instead."
+                seen, after = ops.replaced(body, old, new)
                 if seen == 0:
                     return f"that exact text is not in {path}; read it again and copy the passage.{ops.near(body, old)}"
                 if seen > 1:
                     return f"that text appears {seen} times in {path}; include more of it."
-                done, out = _put(path, body.replace(old, new, 1).encode())
+                done, out = _put(path, after.encode())
                 if done and "__WROTE__" in out:
                     return f"edited {path} ({len(old)} chars -> {len(new)})"
                 return out.strip() or f"could not write {path}"
@@ -427,35 +444,38 @@ async def workspace_shell(config: WorkspaceShellConfig, builder: Builder) -> Asy
         # is and routes a command line to bash itself, so the host path baked in below would name a
         # directory that does not exist there. This is what run_code's own preamble check does.
         if os.environ.get("NAT_BRIDGE_READY"):
-            wrapper = command
+            wrapper, limit = command, config.timeout
         else:
-            # Run through the sandbox, never on this host: the tool exists because agents were
-            # wrapping subprocess in run_code to get here anyway, and that path had no root and no cap.
-            # The cut is caught here, not left to surface as a TimeoutExpired traceback: that reads
-            # as a crash, and it throws away what the command had already printed.
+            limit = config.timeout + 12    # outlasts the command, so its cut and output arrive first
+            # Cut caught in the sandbox: a TimeoutExpired traceback reads as a crash and drops the output.
+            # Own session: the cut ends the pipeline and its children.
             wrapper = (
-                "import subprocess, os, tempfile\n"
+                "import contextlib, subprocess, os, signal, tempfile\n"
                 f"cwd = {ops.SANDBOX_ROOT!r}\n"
                 "os.makedirs(cwd, exist_ok=True)\n"
                 "out, err = tempfile.TemporaryFile(), tempfile.TemporaryFile()\n"
+                f"p = subprocess.Popen({command!r}, shell=True, cwd=cwd, stdout=out, stderr=err,\n"
+                "                     stdin=subprocess.DEVNULL, start_new_session=True)\n"
                 "try:\n"
-                f"    r = subprocess.run({command!r}, shell=True, cwd=cwd, stdout=out, stderr=err,\n"
-                f"                       stdin=subprocess.DEVNULL, timeout={config.timeout})\n"
+                f"    p.wait(timeout={config.timeout})\n"
                 "except subprocess.TimeoutExpired:\n"
-                "    r = None\n"
+                "    with contextlib.suppress(ProcessLookupError):\n"
+                "        os.killpg(p.pid, signal.SIGKILL)\n"
+                "    p.wait()\n"
+                "    p = None\n"
                 "for f in (out, err):\n"
                 "    f.seek(0)\n"
                 "    print(f.read().decode(errors='replace'), end='')\n"
-                "if r is None:\n"
+                "if p is None:\n"
                 f"    print('\\n[stopped at the {config.timeout:g}s limit -- anything after this "
                 "was not run]', end='')\n"
-                "elif r.returncode:\n"
-                "    print(f'\\n[exit {r.returncode}]', end='')\n")
+                "elif p.returncode:\n"
+                "    print(f'\\n[exit {p.returncode}]', end='')\n")
         try:
-            async with httpx.AsyncClient(timeout=config.timeout + 15) as client:
-                answer = await client.post(config.uri.rstrip("/") + "/execute",
+            async with httpx.AsyncClient(timeout=limit + 15) as client:
+                answer = await client.post(config.uri.rstrip("/") + "/execute", headers=ops.auth_headers(),
                                            json={"generated_code": wrapper,
-                                                 "timeout": config.timeout, "language": "python"})
+                                                 "timeout": limit, "language": "python"})
                 answer.raise_for_status()
                 body = answer.json()
         except (httpx.RemoteProtocolError, httpx.ReadError):
@@ -562,7 +582,7 @@ def reset_task_plan(workspace: str = "") -> None:
 def open_steps(workspace: str = "") -> list[str]:
     """The steps still open, for a caller that must show them without spending a turn reading the list."""
     key = str(Path(workspace).resolve()) if workspace else str(_root())
-    return [l[6:].strip() for l in _PLANS.get(key, []) if l.startswith("- [ ]")]
+    return [ln[6:].strip() for ln in _PLANS.get(key, []) if ln.startswith("- [ ]")]
 
 
 class TaskListConfig(FunctionBaseConfig, name="task_list"):
@@ -593,7 +613,7 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
         if asked:
             # A closed step stays closed: each specialist rewrites this list, and a plain replace
             # reopened what the one before it had already finished.
-            shut = {l[6:].split("  (")[0].strip().lower(): l for l in lines if not l.startswith("- [ ]")}
+            shut = {ln[6:].split("  (")[0].strip().lower(): ln for ln in lines if not ln.startswith("- [ ]")}
             # Some models close a step only as {"step": ..., "done": true}; dropping the flag left
             # the plan all-open and rewritten rather than advanced -- 8 calls, 19 plans re-sent.
             ticked = {_bare(t).strip().lower() for t, raw in zip(asked, steps if isinstance(steps, list) else [])
@@ -618,14 +638,14 @@ async def task_list(config: TaskListConfig, builder: Builder) -> AsyncGenerator[
             else:
                 # Which of the two: told "closed, or never listed" an agent cannot tell it
                 # succeeded -- 15 in 100 sent the same close again.
-                (already if any(not l.startswith("- [ ]") and hits(mark, l) for l in lines)
+                (already if any(not ln.startswith("- [ ]") and hits(mark, ln) for ln in lines)
                  else missed).append(mark.strip())
         if lines:
             _PLANS[key] = lines
         if not lines:
             return "The list is empty; send `steps` to start one."
-        left = sum(l.startswith("- [ ]") for l in lines)
-        gave = sum(l.startswith("- [-]") for l in lines)
+        left = sum(ln.startswith("- [ ]") for ln in lines)
+        gave = sum(ln.startswith("- [-]") for ln in lines)
         tail = f"({left} of {len(lines)} still open" + (f", {gave} given up on)" if gave else ")")
         # Saying nothing changed is the whole point: a silent no-op reads as success and gets
         # retried -- one run sent the same plan 19 times and read back the same words every time.

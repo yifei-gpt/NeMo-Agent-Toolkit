@@ -125,3 +125,61 @@ print(5+5)
     assert resp.get("process_status") == "completed"
     assert resp.get("stdout").rstrip() == "10"
     assert resp.get("stderr") == ""
+
+
+def test_the_sandbox_server_requires_its_token(monkeypatch):
+    """/execute needs the token; status stays open."""
+    import importlib
+
+    from nat.tool.code_execution.local_sandbox import local_sandbox_server as server
+    monkeypatch.setenv("NAT_SANDBOX_TOKEN", "s3cret")
+    fresh = importlib.reload(server)
+    try:
+        client = fresh.app.test_client()
+        body = {"generated_code": "print(1)", "timeout": 10, "language": "python"}
+        assert client.post("/execute", json=body).status_code == 403
+        assert client.post("/execute", json=body, headers={"X-Sandbox-Token": "wrong"}).status_code == 403
+        assert client.get("/").status_code == 200
+        assert "NAT_SANDBOX_TOKEN" not in __import__("os").environ
+    finally:
+        monkeypatch.delenv("NAT_SANDBOX_TOKEN", raising=False)
+        importlib.reload(server)
+
+
+async def test_the_client_sends_the_token(httpserver: HTTPServer, monkeypatch):
+    monkeypatch.setenv("NAT_SANDBOX_TOKEN", "s3cret")
+    httpserver.expect_request("/execute", headers={"X-Sandbox-Token": "s3cret"}).respond_with_json(
+        {"process_status": "completed", "stdout": "1\n", "stderr": ""})
+    client = code_sandbox.get_sandbox("local", uri=httpserver.url_for("/"))
+    resp = await client.execute_code(generated_code="print(1)", timeout_seconds=5)
+    assert resp["stdout"] == "1\n"
+
+
+@pytest.mark.parametrize("code, status, shown", [
+    ("print('hi')\nimport sys\nsys.exit(0)", "completed", "hi"),
+    ("print('hi')\nimport sys\nsys.exit(3)", "error", "[exit 3]"),
+    # As run_code sends it: run as __main__, where unittest.main finds its tests
+    ("import runpy, tempfile\nf = tempfile.NamedTemporaryFile('w', suffix='.py', delete=False)\n"
+     "f.write('import unittest\\nclass T(unittest.TestCase):\\n    def test_a(self):\\n"
+     "        self.assertEqual(1, 2)\\nunittest.main(argv=[\"t\"])\\n')\nf.close()\n"
+     "runpy.run_path(f.name, run_name='__main__')\n", "error", "FAIL: test_a"),
+    ("import argparse\nargparse.ArgumentParser().parse_args(['--nope'])\n", "error", "unrecognized arguments"),
+])
+def test_an_exit_keeps_its_output(code, status, shown):
+    """sys.exit, unittest.main, argparse end the script, not the sandbox."""
+    from nat.tool.code_execution.local_sandbox.local_sandbox_server import execute_python
+    result = execute_python(code, timeout=30)
+    assert result.process_status == status
+    assert shown in result.stdout + result.stderr
+    assert "hi" in result.stdout or "hi" not in code
+
+
+def test_a_timeout_ends_what_the_code_started(tmp_path):
+    from nat.tool.code_execution.local_sandbox.local_sandbox_server import execute_python
+    marker = tmp_path / "alive"
+    code = (f"import subprocess\nsubprocess.Popen(['sh', '-c', 'sleep 3; touch {marker}'])\n"
+            "import time\ntime.sleep(30)\n")
+    assert execute_python(code, timeout=1).process_status == "timeout"
+    import time
+    time.sleep(4)
+    assert not marker.exists()
